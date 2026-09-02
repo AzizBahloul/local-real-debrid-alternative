@@ -1,0 +1,39 @@
+[package]
+name = "streaming-gateway"
+version = "0.1.0"
+edition = "2021"
+description = "Local high-performance Stremio streaming gateway (torrent engine + HTTP range streaming server)"
+license = "MIT"
+
+[lib]
+name = "streaming_gateway"
+path = "src/lib.rs"
+
+[[bin]]
+name = "streaming-gateway"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "fs", "io-util", "time", "sync"] }
+axum = { version = "0.8", features = ["json", "query"] }
+tower-http = { version = "0.6", features = ["cors", "trace", "limit", "timeout"] }
+# default-tls pulls in OpenSSL (via librqbit-core's sha1-crypto-hash feature,
+# through the `crypto-hash`/`openssl-sys` crates) which needs system
+# pkg-config + libssl-dev. rust-tls swaps both the HTTP client and the SHA1
+# backend for pure-Rust implementations (rustls + ring), so the whole binary
+# builds with just `cargo build` on a bare Ubuntu box -- no system TLS libs.
+librqbit = { version = "9", default-features = false, features = ["rust-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+local-ip-address = "0.6"
+clap = { version = "4", features = ["derive", "env"] }
+sysinfo = "0.33"
+tokio-util = { version = "0.7", features = ["io"] }
+urlencoding = "2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+tower = { version = "0.5", features = ["util"] }

@@ -1,0 +1,42 @@
+[package]
+name = "streaming-gateway-gui"
+version = "0.1.0"
+edition = "2021"
+description = "GUI launcher for the streaming gateway: start/stop the server and see its status"
+license = "MIT"
+
+[[bin]]
+name = "streaming-gateway-gui"
+path = "src/main.rs"
+
+[dependencies]
+eframe = { version = "0.29", default-features = false, features = ["glow", "default_fonts", "persistence"] }
+egui = "0.29"
+# Plain-HTTP polling of our own localhost /health -- no TLS stack needed at all.
+ureq = { version = "2", default-features = false, features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+
+[package.metadata.deb]
+name = "streaming-gateway"
+maintainer = "AfriScout"
+copyright = "2026"
+license-file = ["../../LICENSE", "0"]
+extended-description = """\
+A local, high-performance streaming gateway that turns a magnet link or \
+BitTorrent info hash into a normal HTTP video stream (with seeking) for \
+Stremio, VLC, browsers, phones, and smart TVs on the same network. This \
+package installs both the gateway server and a GUI launcher to start/stop \
+it from the desktop."""
+section = "video"
+priority = "optional"
+# Both binaries + a desktop-menu entry, bundled from one .deb. The server
+# binary is picked up from the *other* workspace member's build output --
+# `cargo deb` runs the workspace build first, so it exists by the time this
+# manifest's assets are collected.
+assets = [
+    ["target/release/streaming-gateway-gui", "usr/bin/", "755"],
+    ["target/release/streaming-gateway", "usr/bin/", "755"],
+    ["assets/streaming-gateway-gui.desktop", "usr/share/applications/", "644"],
+]

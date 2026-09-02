@@ -1,0 +1,12 @@
+[workspace]
+resolver = "2"
+members = ["crates/gateway", "crates/gateway-gui"]
+
+# Shared across every workspace member (must live at the workspace root --
+# Cargo ignores a `[profile.*]` table declared in a member's own Cargo.toml).
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "unwind"
+strip = true

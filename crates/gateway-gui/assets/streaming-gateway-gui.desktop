@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Streaming Gateway
+Comment=Start/stop the local Stremio streaming gateway
+Exec=streaming-gateway-gui
+Icon=video-x-generic
+Terminal=false
+Categories=AudioVideo;Network;Utility;
+StartupNotify=true
