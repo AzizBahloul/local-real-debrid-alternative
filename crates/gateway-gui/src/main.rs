@@ -53,9 +53,7 @@ fn human_duration(secs: u64) -> String {
 fn extract_url(line: &str) -> Option<String> {
     let start = line.find("http://")?;
     let rest = &line[start..];
-    let end = rest
-        .find(|c: char| c.is_whitespace())
-        .unwrap_or(rest.len());
+    let end = rest.find(|c: char| c.is_whitespace()).unwrap_or(rest.len());
     Some(rest[..end].to_string())
 }
 
@@ -145,6 +143,18 @@ impl Default for GatewayApp {
 }
 
 impl GatewayApp {
+    fn status(&self) -> Status {
+        if self.stopping {
+            Status::Stopping
+        } else if self.running && self.detected_url.is_none() {
+            Status::Starting
+        } else if self.running {
+            Status::Running
+        } else {
+            Status::Stopped
+        }
+    }
+
     fn push_log(&mut self, line: String) {
         if self.logs.len() >= MAX_LOG_LINES {
             self.logs.pop_front();
@@ -154,7 +164,8 @@ impl GatewayApp {
 
     fn start_server(&mut self) {
         let Some(binary) = self.binary.clone() else {
-            self.start_error = Some("streaming-gateway binary not found next to this app or on PATH".to_string());
+            self.start_error =
+                Some("streaming-gateway binary not found next to this app or on PATH".to_string());
             return;
         };
         let env = vec![
@@ -250,104 +261,183 @@ impl eframe::App for GatewayApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_background_work();
 
+        let status = self.status();
+
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("Streaming Gateway");
-            ui.label("Local Stremio streaming gateway -- start it, then connect Stremio/VLC/phones/TVs on the same Wi-Fi.");
-            ui.add_space(8.0);
+            ui.style_mut().override_text_style = Some(egui::TextStyle::Monospace);
+
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(">_")
+                        .color(ACCENT_CYAN)
+                        .size(26.0)
+                        .strong(),
+                );
+                ui.label(
+                    egui::RichText::new("STREAMING GATEWAY")
+                        .color(ACCENT_CYAN)
+                        .size(22.0)
+                        .strong(),
+                );
+            });
+            ui.label(
+                egui::RichText::new(
+                    "magnet -> local HTTP stream, for Stremio / VLC / phones / TVs",
+                )
+                .color(egui::Color32::GRAY)
+                .size(12.0),
+            );
+            ui.add_space(10.0);
 
             if let Some(err) = &self.start_error {
-                ui.colored_label(egui::Color32::from_rgb(220, 60, 60), err);
+                ui.colored_label(ACCENT_RED, format!("! {err}"));
                 ui.add_space(6.0);
             }
             if self.binary.is_none() {
                 ui.colored_label(
-                    egui::Color32::from_rgb(220, 160, 40),
-                    "streaming-gateway binary not found. It should be installed alongside this app.",
+                    ACCENT_AMBER,
+                    "! streaming-gateway binary not found next to this app or on PATH",
                 );
                 ui.add_space(6.0);
             }
 
-            ui.horizontal(|ui| {
-                let (dot, label) = if self.stopping {
-                    (egui::Color32::from_rgb(220, 160, 40), "Stopping...")
-                } else if self.running {
-                    (egui::Color32::from_rgb(60, 190, 90), "Running")
-                } else {
-                    (egui::Color32::GRAY, "Stopped")
-                };
-                ui.colored_label(dot, "\u{25CF}");
-                ui.label(label);
-            });
-
-            ui.add_space(6.0);
-            ui.add_enabled_ui(!self.running && !self.stopping, |ui| {
-                egui::Grid::new("settings_grid").num_columns(2).show(ui, |ui| {
-                    ui.label("Port:");
-                    ui.text_edit_singleline(&mut self.port);
-                    ui.end_row();
-                    ui.label("Cache directory:");
-                    ui.text_edit_singleline(&mut self.cache_dir);
-                    ui.end_row();
+            // The face: same box on every frame, only the contents change, so
+            // switching state never reflows the rest of the layout.
+            egui::Frame::none()
+                .fill(BG_PANEL)
+                .rounding(egui::Rounding::same(8.0))
+                .inner_margin(egui::Margin::symmetric(12.0, 10.0))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    let face_color = match status {
+                        Status::Stopped => egui::Color32::GRAY,
+                        Status::Starting => ACCENT_AMBER,
+                        Status::Running => ACCENT_GREEN,
+                        Status::Stopping => ACCENT_AMBER,
+                    };
+                    ui.colored_label(
+                        face_color,
+                        egui::RichText::new(ascii_face(status)).size(18.0),
+                    );
                 });
-            });
 
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                if ui
-                    .add_enabled(!self.running && !self.stopping, egui::Button::new("Start Server"))
-                    .clicked()
-                {
-                    self.start_server();
+            ui.add_space(12.0);
+
+            // The one big button: what it says and does flips with state, so
+            // there is always exactly one obvious next action.
+            let (label, color, enabled) = match status {
+                Status::Stopped => ("\u{25B6}  START GATEWAY", ACCENT_GREEN, true),
+                Status::Starting => ("\u{25CB}  STARTING...", ACCENT_AMBER, false),
+                Status::Running => ("\u{25A0}  STOP GATEWAY", ACCENT_RED, true),
+                Status::Stopping => ("\u{25CB}  STOPPING...", ACCENT_AMBER, false),
+            };
+            let width = ui.available_width();
+            let big_button = egui::Button::new(
+                egui::RichText::new(label)
+                    .size(20.0)
+                    .strong()
+                    .color(BG_DEEP),
+            )
+            .fill(color)
+            .rounding(egui::Rounding::same(8.0))
+            .min_size(egui::vec2(width, 56.0));
+            if ui
+                .add_enabled(enabled && self.binary.is_some(), big_button)
+                .clicked()
+            {
+                match status {
+                    Status::Stopped => self.start_server(),
+                    Status::Running => self.stop_server(),
+                    _ => {}
                 }
-                if ui
-                    .add_enabled(self.running && !self.stopping, egui::Button::new("Stop Server"))
-                    .clicked()
-                {
-                    self.stop_server();
-                }
+            }
+
+            ui.add_space(12.0);
+            ui.collapsing("Advanced settings", |ui| {
+                ui.add_enabled_ui(status == Status::Stopped, |ui| {
+                    egui::Grid::new("settings_grid")
+                        .num_columns(2)
+                        .show(ui, |ui| {
+                            ui.label("Port:");
+                            ui.text_edit_singleline(&mut self.port);
+                            ui.end_row();
+                            ui.label("Cache directory:");
+                            ui.text_edit_singleline(&mut self.cache_dir);
+                            ui.end_row();
+                        });
+                });
             });
 
             if let Some(url) = self.detected_url.clone() {
-                ui.add_space(8.0);
-                ui.separator();
-                ui.label("Gateway address:");
-                ui.horizontal(|ui| {
-                    ui.monospace(&url);
-                    if ui.button("Copy").clicked() {
-                        ui.output_mut(|o| o.copied_text = url.clone());
-                    }
-                });
-                ui.label(format!("Add to Stremio as: {url}/manifest.json"));
+                ui.add_space(10.0);
+                egui::Frame::none()
+                    .fill(BG_PANEL)
+                    .rounding(egui::Rounding::same(8.0))
+                    .inner_margin(egui::Margin::symmetric(12.0, 8.0))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.colored_label(ACCENT_CYAN, "GATEWAY ADDRESS");
+                        ui.horizontal(|ui| {
+                            ui.monospace(&url);
+                            if ui.small_button("copy").clicked() {
+                                ui.output_mut(|o| o.copied_text = url.clone());
+                            }
+                        });
+                        ui.label(
+                            egui::RichText::new(format!("Stremio addon: {url}/manifest.json"))
+                                .color(egui::Color32::GRAY)
+                                .size(11.0),
+                        );
+                    });
             }
 
             if let Some(health) = &self.health {
-                ui.add_space(8.0);
-                ui.separator();
-                ui.label(format!("Uptime: {}", human_duration(health.uptime_seconds)));
-                ui.label(format!("Active streams: {}", health.active_streams));
-                ui.label(format!(
-                    "Cache: {} / {}",
-                    human_bytes(health.cache_usage_bytes),
-                    human_bytes(health.cache_max_bytes)
-                ));
-                ui.label(format!(
-                    "Process: {} RAM, {:.1}% CPU",
-                    human_bytes(health.process_memory_bytes),
-                    health.process_cpu_percent
-                ));
+                ui.add_space(10.0);
+                egui::Frame::none()
+                    .fill(BG_PANEL)
+                    .rounding(egui::Rounding::same(8.0))
+                    .inner_margin(egui::Margin::symmetric(12.0, 8.0))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        egui::Grid::new("health_grid")
+                            .num_columns(2)
+                            .show(ui, |ui| {
+                                ui.label("uptime");
+                                ui.label(human_duration(health.uptime_seconds));
+                                ui.end_row();
+                                ui.label("active streams");
+                                ui.label(health.active_streams.to_string());
+                                ui.end_row();
+                                ui.label("cache");
+                                ui.label(format!(
+                                    "{} / {}",
+                                    human_bytes(health.cache_usage_bytes),
+                                    human_bytes(health.cache_max_bytes)
+                                ));
+                                ui.end_row();
+                                ui.label("process");
+                                ui.label(format!(
+                                    "{} RAM, {:.1}% CPU",
+                                    human_bytes(health.process_memory_bytes),
+                                    health.process_cpu_percent
+                                ));
+                                ui.end_row();
+                            });
+                    });
             }
 
-            ui.add_space(8.0);
-            ui.separator();
-            ui.label("Log:");
-            egui::ScrollArea::vertical()
-                .max_height(220.0)
-                .stick_to_bottom(true)
-                .show(ui, |ui| {
-                    for line in &self.logs {
-                        ui.monospace(line);
-                    }
-                });
+            ui.add_space(10.0);
+            ui.collapsing("Log", |ui| {
+                egui::ScrollArea::vertical()
+                    .max_height(200.0)
+                    .stick_to_bottom(true)
+                    .show(ui, |ui| {
+                        for line in &self.logs {
+                            ui.monospace(line);
+                        }
+                    });
+            });
         });
 
         ctx.request_repaint_after(Duration::from_millis(200));
@@ -362,12 +452,17 @@ impl eframe::App for GatewayApp {
 
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([480.0, 620.0]),
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([460.0, 560.0])
+            .with_min_inner_size([380.0, 480.0]),
         ..Default::default()
     };
     eframe::run_native(
         "Streaming Gateway",
         options,
-        Box::new(|_cc| Ok(Box::new(GatewayApp::default()))),
+        Box::new(|cc| {
+            cc.egui_ctx.set_visuals(futuristic_visuals());
+            Ok(Box::new(GatewayApp::default()))
+        }),
     )
 }

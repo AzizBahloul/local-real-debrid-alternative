@@ -5,5 +5,5 @@ Comment=Start/stop the local Stremio streaming gateway
 Exec=streaming-gateway-gui
 Icon=video-x-generic
 Terminal=false
-Categories=AudioVideo;Network;Utility;
+Categories=AudioVideo;Utility;
 StartupNotify=true

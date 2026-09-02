@@ -16,16 +16,29 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /build
 
-# Cache dependency compilation separately from source changes.
+# This is a two-member workspace (crates/gateway = the server, crates/
+# gateway-gui = a desktop launcher that needs GTK/X11 dev headers this image
+# deliberately never installs). Only `-p streaming-gateway` is ever built
+# here, so cargo never touches the GUI crate's dependency graph at all --
+# the placeholder below exists purely so cargo can parse the workspace
+# manifest, not because its contents matter.
 COPY Cargo.toml Cargo.lock ./
-RUN mkdir -p src && echo "fn main() {}" > src/main.rs && echo "" > src/lib.rs \
-    && cargo build --release --locked || true
+COPY crates/gateway/Cargo.toml crates/gateway/Cargo.toml
+COPY crates/gateway-gui/Cargo.toml crates/gateway-gui/Cargo.toml
 
-COPY src ./src
-COPY tests ./tests
+# Cache dependency compilation separately from source changes.
+RUN mkdir -p crates/gateway/src crates/gateway-gui/src \
+    && echo "fn main() {}" > crates/gateway/src/main.rs \
+    && echo "" > crates/gateway/src/lib.rs \
+    && echo "fn main() {}" > crates/gateway-gui/src/main.rs \
+    && cargo build --release --locked -p streaming-gateway || true
+
+COPY crates/gateway/src ./crates/gateway/src
+COPY crates/gateway/tests ./crates/gateway/tests
 # Force a rebuild of our own crate now that real sources are in place (the
 # dummy main.rs/lib.rs above only exists to pre-warm the dependency cache).
-RUN touch src/main.rs src/lib.rs && cargo build --release --locked
+RUN touch crates/gateway/src/main.rs crates/gateway/src/lib.rs \
+    && cargo build --release --locked -p streaming-gateway
 
 # --- Runtime stage -------------------------------------------------------
 FROM debian:bookworm-slim AS runtime

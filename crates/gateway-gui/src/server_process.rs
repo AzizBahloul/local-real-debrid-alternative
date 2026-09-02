@@ -202,7 +202,12 @@ mod tests {
         let mut lines = Vec::new();
         let deadline = Instant::now() + Duration::from_secs(2);
         while lines.len() < 2 && Instant::now() < deadline {
-            lines.extend(process.drain_logs().into_iter().map(|l| l.text().to_string()));
+            lines.extend(
+                process
+                    .drain_logs()
+                    .into_iter()
+                    .map(|l| l.text().to_string()),
+            );
             thread::sleep(Duration::from_millis(20));
         }
 
@@ -220,7 +225,11 @@ mod tests {
             std::process::id(),
             Instant::now().elapsed().as_nanos()
         ));
-        std::fs::write(&path, "#!/bin/sh\ntrap '' TERM\nwhile true; do sleep 0.05; done\n").unwrap();
+        std::fs::write(
+            &path,
+            "#!/bin/sh\ntrap '' TERM\nwhile true; do sleep 0.05; done\n",
+        )
+        .unwrap();
         let mut perms = std::fs::metadata(&path).unwrap().permissions();
         std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
         std::fs::set_permissions(&path, perms).unwrap();

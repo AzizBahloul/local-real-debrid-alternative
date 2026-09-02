@@ -2,8 +2,11 @@
 name = "streaming-gateway-gui"
 version = "0.1.0"
 edition = "2021"
-description = "GUI launcher for the streaming gateway: start/stop the server and see its status"
+description = "Local Stremio streaming gateway + GUI launcher to start/stop it"
 license = "MIT"
+repository = "https://github.com/AzizBahloul/local-real-debrid-alternative"
+keywords = ["stremio", "streaming", "gui", "egui", "bittorrent"]
+categories = ["gui", "multimedia"]
 
 [[bin]]
 name = "streaming-gateway-gui"
@@ -20,8 +23,8 @@ anyhow = "1"
 
 [package.metadata.deb]
 name = "streaming-gateway"
-maintainer = "AfriScout"
-copyright = "2026"
+maintainer = "mohamed aziz bahloul"
+copyright = "2026, mohamed aziz bahloul"
 license-file = ["../../LICENSE", "0"]
 extended-description = """\
 A local, high-performance streaming gateway that turns a magnet link or \

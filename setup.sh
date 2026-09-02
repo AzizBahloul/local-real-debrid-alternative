@@ -7,15 +7,22 @@
 # (this project needs neither).
 #
 # Usage:
-#   ./setup.sh            # install deps (asks for sudo if needed) + build + verify
-#   ./setup.sh --no-build  # only install system/Rust deps, skip compiling
+#   ./setup.sh              # install server deps (asks for sudo if needed) + build + verify
+#   ./setup.sh --gui        # also build the desktop GUI launcher and package a .deb
+#   ./setup.sh --no-build   # only install system/Rust deps, skip compiling
+#
+# The server itself has no GUI dependencies at all (it's a headless HTTP
+# service) -- --gui is separate and optional specifically so this script
+# stays usable on a headless box (NAS, home server, container host).
 
 set -euo pipefail
 
 BUILD=1
+GUI=0
 for arg in "$@"; do
   case "$arg" in
     --no-build) BUILD=0 ;;
+    --gui) GUI=1 ;;
     *)
       echo "unknown argument: $arg" >&2
       exit 1
@@ -38,7 +45,7 @@ cd "$SCRIPT_DIR"
 if [ -r /etc/os-release ]; then
   . /etc/os-release
   log "Detected: ${PRETTY_NAME:-unknown Linux} (ID=${ID:-unknown})"
-  if [ "${ID:-}" != "ubuntu" ] && [ "${ID_LIKE:-}" != *"ubuntu"* ] && [ "${ID_LIKE:-}" != *"debian"* ]; then
+  if [ "${ID:-}" != "ubuntu" ] && [[ "${ID_LIKE:-}" != *ubuntu* ]] && [[ "${ID_LIKE:-}" != *debian* ]]; then
     warn "This isn't Ubuntu/Debian -- apt-based dependency install below may not apply."
     warn "Rust itself and the build will still work on any Linux the toolchain supports."
   fi
@@ -57,10 +64,20 @@ fi
 # ---------------------------------------------------------------------------
 REQUIRED_APT_PACKAGES=(build-essential cmake pkg-config perl git ca-certificates curl)
 
+# Only needed for the GUI launcher (winit/glow's Linux windowing backend) --
+# skipped entirely unless --gui is passed, so a headless install never asks
+# for X11/GTK packages it doesn't need.
+GUI_APT_PACKAGES=(libgtk-3-dev libx11-dev libxkbcommon-dev libxrandr-dev libxi-dev libxcursor-dev libgl1-mesa-dev libwayland-dev)
+
 missing=()
 for pkg in "${REQUIRED_APT_PACKAGES[@]}"; do
   dpkg -s "$pkg" >/dev/null 2>&1 || missing+=("$pkg")
 done
+if [ "$GUI" -eq 1 ]; then
+  for pkg in "${GUI_APT_PACKAGES[@]}"; do
+    dpkg -s "$pkg" >/dev/null 2>&1 || missing+=("$pkg")
+  done
+fi
 
 if [ "${#missing[@]}" -gt 0 ]; then
   if ! command -v apt-get >/dev/null 2>&1; then
@@ -101,8 +118,13 @@ log "Using: $(rustc --version) / $(cargo --version)"
 # 4. Build.
 # ---------------------------------------------------------------------------
 if [ "$BUILD" -eq 1 ]; then
-  log "Building in release mode (this compiles ~250 crates the first time; later builds are incremental)..."
-  cargo build --release
+  if [ "$GUI" -eq 1 ]; then
+    log "Building server + GUI in release mode (this compiles ~350 crates the first time; later builds are incremental)..."
+    cargo build --release
+  else
+    log "Building the server in release mode (this compiles ~250 crates the first time; later builds are incremental)..."
+    cargo build --release -p streaming-gateway
+  fi
 
   BIN="$SCRIPT_DIR/target/release/streaming-gateway"
   [ -x "$BIN" ] || die "build finished but $BIN is missing -- something went wrong."
@@ -112,9 +134,27 @@ if [ "$BUILD" -eq 1 ]; then
   #    so this proves the binary links and starts without needing a network,
   #    a free port, or root.
   # ---------------------------------------------------------------------------
-  log "Verifying the binary starts..."
+  log "Verifying the server binary starts..."
   "$BIN" --help >/dev/null
   log "OK: $BIN runs."
+
+  if [ "$GUI" -eq 1 ]; then
+    GUI_BIN="$SCRIPT_DIR/target/release/streaming-gateway-gui"
+    [ -x "$GUI_BIN" ] || die "build finished but $GUI_BIN is missing -- something went wrong."
+    log "OK: $GUI_BIN built (a GUI app can't be verified headlessly the same way; launch it to check)."
+
+    if ! command -v cargo-deb >/dev/null 2>&1; then
+      log "Installing cargo-deb (one-time; only needed to build the .deb package)..."
+      cargo install cargo-deb
+    fi
+
+    log "Packaging the .deb (server + GUI + desktop menu entry)..."
+    DEB_PATH="$(cargo deb -p streaming-gateway-gui --no-build)"
+    log "Built: $DEB_PATH"
+    echo "  Install it with:"
+    echo "    sudo dpkg -i \"$DEB_PATH\""
+    echo "  Then launch \"Streaming Gateway\" from your applications menu, or run streaming-gateway-gui."
+  fi
 
   # Optional convenience: open the default port on ufw if it's active, so
   # phones/TVs on the LAN can actually reach the gateway. Skipped silently if
@@ -130,7 +170,7 @@ if [ "$BUILD" -eq 1 ]; then
   log "Setup complete. Start the gateway with:"
   echo "    $BIN"
   echo "  or, for development iteration:"
-  echo "    cargo run --release"
+  echo "    cargo run --release -p streaming-gateway"
 else
   log "Setup complete (--no-build passed, skipped compiling)."
 fi
