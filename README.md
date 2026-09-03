@@ -319,8 +319,9 @@ instant.
 <details>
 <summary><b>My phone can't reach the PC at all</b></summary>
 
-Use the **(remote)** stream entry — it works from any network. See
-[Watching from a different WiFi](#watching-from-a-different-wifi).
+If you're on a WiFi extender or guest network, see
+[Watching from a different WiFi](#watching-from-a-different-wifi) — you'll need
+a tunnel and the **🌍 Away** stream entry it unlocks.
 </details>
 
 ---
@@ -371,18 +372,25 @@ setup.sh   Dockerfile
 
 ### Design notes
 
-- **Manifest and video travel different paths.** Stremio's Android app refuses
-  a plain-http addon manifest but its *player* accepts one, so JSON goes through
-  the https tunnel (kilobytes) while video streams straight over the LAN
-  (gigabytes). This is what keeps tunnel bandwidth irrelevant.
+- **https is served directly from the LAN, no tunnel.** Stremio's Android addon
+  fetcher hard-refuses plain http and trusts only a public CA chain (it bundles
+  its own root store — installing a CA on the phone does nothing). No authority
+  will certify a private IP, so the gateway serves a published Let's Encrypt
+  wildcard for a hostname (`local-ip.sh`) that resolves back to the LAN address.
+  http keeps running unchanged on its own port for everything else. See the
+  `tls` module header for the full reasoning and its honest limits.
+- **The gateway recognises its own https hostname as local.** Otherwise a
+  request arriving on a public-looking name would look like a remote client and
+  get offered a needless, slower fallback route.
 - **Stream URLs carry no query string.** Stremio hands URLs to external players
   via Android intents, where a long percent-encoded magnet is easy to mangle.
   `/videos/<hash>/<idx>` survives that.
 - **`/videos` only starts hashes the gateway advertised.** Otherwise anyone who
   could reach the port could make it join arbitrary swarms.
-- **Idle torrents pause; the janitor only evicts paused ones.** Request-recency
-  alone is not a safe "in use" signal — players buffer minutes ahead and go
-  quiet, so an actively watched movie looks idle and gets deleted mid-playback.
+- **A live reader always blocks the idle reaper, not just request recency.**
+  Players buffer minutes ahead and go quiet, so recency alone reads an actively
+  watched movie as idle — and librqbit's reader has no timeout of its own, so
+  pausing under it freezes playback permanently rather than just slowing it.
 - **Responses are withheld until data exists.** Players treat "headers, then a
   stalled body" as a broken stream, but wait patiently on a slow request.
 
@@ -390,7 +398,7 @@ setup.sh   Dockerfile
 
 ```bash
 cargo build --release              # both crates
-cargo test --release               # 52 tests
+cargo test --release               # 67 tests
 cargo clippy --release --all-targets -- -D warnings
 cargo deb -p streaming-gateway-gui # .deb package
 ```
