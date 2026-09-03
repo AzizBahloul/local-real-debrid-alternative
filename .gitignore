@@ -1,1 +1,6 @@
 /target
+
+# Runtime state: downloaded torrent data and librqbit's session database.
+# Created next to the binary by default (CACHE_DIRECTORY) and grows to many
+# gigabytes -- never belongs in the repository.
+/cache

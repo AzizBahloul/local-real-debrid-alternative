@@ -4225,13 +4225,14 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "streaming-gateway"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "axum",
  "clap",
  "librqbit",
  "local-ip-address",
+ "reqwest",
  "serde",
  "serde_json",
  "sysinfo",
@@ -4246,7 +4247,7 @@ dependencies = [
 
 [[package]]
 name = "streaming-gateway-gui"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "eframe",

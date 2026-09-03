@@ -93,10 +93,21 @@ impl CacheManager {
             if total <= self.max_size_bytes {
                 break;
             }
-            if self
-                .engine
-                .is_recently_active(&entry.info_hash, ACTIVE_STREAM_GRACE_PERIOD)
-                .await
+            // Two independent protections, because either alone has a hole:
+            //
+            // * `is_running` -- the torrent is unpaused in the session. This
+            //   is the strong one. A player buffers minutes of video then goes
+            //   quiet, so request-recency alone would call an actively watched
+            //   movie idle and delete it mid-playback (observed in practice).
+            //   The idle reaper pauses genuinely-unwatched torrents, so
+            //   "unpaused" stays meaningful rather than matching everything.
+            // * request recency -- covers the window between a client's first
+            //   request and the torrent actually being registered/unpaused.
+            if self.engine.is_running(&entry.info_hash)
+                || self
+                    .engine
+                    .is_recently_active(&entry.info_hash, ACTIVE_STREAM_GRACE_PERIOD)
+                    .await
             {
                 continue;
             }
@@ -115,6 +126,20 @@ impl CacheManager {
                     "cache: failed to evict: {e}"
                 ),
             }
+        }
+
+        if total > self.max_size_bytes {
+            // Everything left is in use or a single torrent is simply bigger
+            // than the whole cap (a 4K remux against a 20 GB cap, say). Either
+            // way the janitor will keep evicting on every pass and never get
+            // under -- worth saying out loud, because the visible symptom is
+            // "my downloads keep disappearing" with no obvious cause.
+            warn!(
+                usage_bytes = total,
+                max_bytes = self.max_size_bytes,
+                "cache: still over the size cap after evicting everything not in use -- \
+                 raise MAX_CACHE_SIZE_GB or stream smaller releases"
+            );
         }
 
         Ok(())

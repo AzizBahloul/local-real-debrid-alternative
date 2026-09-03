@@ -1,9 +1,10 @@
 [Desktop Entry]
 Type=Application
-Name=Streaming Gateway
+Name=NovaStream
+GenericName=Streaming Gateway
 Comment=Start/stop the local Stremio streaming gateway
 Exec=streaming-gateway-gui
-Icon=video-x-generic
+Icon=streaming-gateway-gui
 Terminal=false
 Categories=AudioVideo;Utility;
 StartupNotify=true

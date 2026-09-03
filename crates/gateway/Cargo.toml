@@ -1,6 +1,6 @@
 [package]
 name = "streaming-gateway"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Local high-performance Stremio streaming gateway (torrent engine + HTTP range streaming server)"
 license = "MIT"
@@ -36,6 +36,10 @@ clap = { version = "4", features = ["derive", "env"] }
 sysinfo = "0.33"
 tokio-util = { version = "0.7", features = ["io"] }
 urlencoding = "2"
+# Used only to query the torrent index over HTTPS. `rustls` here resolves to
+# the same aws-lc-rs provider librqbit already pulls in, so this adds no second
+# TLS stack and keeps the zero-OpenSSL property described above.
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }

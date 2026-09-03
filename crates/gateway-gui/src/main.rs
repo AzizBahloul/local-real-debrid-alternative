@@ -275,7 +275,7 @@ impl eframe::App for GatewayApp {
                         .strong(),
                 );
                 ui.label(
-                    egui::RichText::new("STREAMING GATEWAY")
+                    egui::RichText::new("NOVASTREAM")
                         .color(ACCENT_CYAN)
                         .size(22.0)
                         .strong(),
@@ -450,15 +450,24 @@ impl eframe::App for GatewayApp {
     }
 }
 
+/// The app icon (cropped from `data/bourguiba.jpg`), embedded directly into
+/// the binary so the window/taskbar icon is correct regardless of where the
+/// binary was launched from -- no runtime dependency on an installed path.
+fn app_icon() -> egui::IconData {
+    eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon-256.png"))
+        .expect("bundled icon-256.png is a valid PNG")
+}
+
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([460.0, 560.0])
-            .with_min_inner_size([380.0, 480.0]),
+            .with_min_inner_size([380.0, 480.0])
+            .with_icon(app_icon()),
         ..Default::default()
     };
     eframe::run_native(
-        "Streaming Gateway",
+        "NovaStream",
         options,
         Box::new(|cc| {
             cc.egui_ctx.set_visuals(futuristic_visuals());

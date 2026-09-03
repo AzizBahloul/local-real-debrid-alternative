@@ -11,17 +11,41 @@
 
 pub mod resolver;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use librqbit::api::TorrentIdOrHash;
 use librqbit::{
     AddTorrent, AddTorrentOptions, Api, DhtSessionConfig, Session, SessionOptions,
     SessionPersistenceConfig,
 };
 use tokio::sync::{Mutex, Semaphore};
+use tracing::{debug, info, warn};
+
+// Cold-start budget. A first request for a torrent that is not running yet
+// does three things in sequence, and their sum must stay under the router's
+// 60s request timeout -- otherwise the client gets a 504 having waited the
+// full minute for nothing, which is strictly worse than a fast failure:
+//
+//     ADD_TORRENT_TIMEOUT (25s)  fetch metadata from DHT/trackers
+//   + INITIALIZE_TIMEOUT  (15s)  leave `Initializing` (hash-check on disk)
+//   + prebuffer timeout   (15s)  wait for real bytes (see `streaming`)
+//   = 55s worst case
+//
+/// Bounds the metadata fetch. Unbounded, a torrent with no reachable peers
+/// hangs here until the router gives up.
+const ADD_TORRENT_TIMEOUT: Duration = Duration::from_secs(25);
+
+/// How long `start_file` waits for a freshly-added torrent to become
+/// streamable.
+const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// How many recently-advertised info hashes stay startable. Generous relative
+/// to how many streams a browse session shows (15 per title by default).
+const ADVERTISED_HASH_CAPACITY: usize = 512;
 
 use crate::config::AppConfig;
 use resolver::{
@@ -54,6 +78,49 @@ pub struct ActiveTorrentSummary {
     pub peers: u32,
 }
 
+/// Info hashes this gateway has itself offered to a client, newest last.
+///
+/// `/videos/<hash>/<idx>` starts a torrent that isn't running yet, which is
+/// what lets the addon hand out a short URL. Without a gate, that endpoint
+/// would make the gateway join *any* swarm a caller names -- a stranger who
+/// can reach the port could use it to download arbitrary content in your
+/// name. So a hash is only startable if we advertised it first.
+///
+/// Bounded so a long-running session cannot grow this without limit; evicting
+/// the oldest entry only costs a re-browse to make it playable again.
+struct AdvertisedHashes {
+    order: VecDeque<String>,
+    set: HashSet<String>,
+    cap: usize,
+}
+
+impl AdvertisedHashes {
+    fn new(cap: usize) -> Self {
+        Self {
+            order: VecDeque::new(),
+            set: HashSet::new(),
+            cap,
+        }
+    }
+
+    fn remember(&mut self, hash: String) {
+        if self.set.contains(&hash) {
+            return;
+        }
+        if self.order.len() >= self.cap {
+            if let Some(oldest) = self.order.pop_front() {
+                self.set.remove(&oldest);
+            }
+        }
+        self.set.insert(hash.clone());
+        self.order.push_back(hash);
+    }
+
+    fn contains(&self, hash: &str) -> bool {
+        self.set.contains(hash)
+    }
+}
+
 pub struct TorrentEngine {
     api: Api,
     /// How an identifier turns into a magnet link. Only `MagnetSource` today;
@@ -62,6 +129,9 @@ pub struct TorrentEngine {
     source: Box<dyn TorrentSource>,
     max_concurrent: Semaphore,
     active_streams: Mutex<HashMap<String, StreamActivity>>,
+    advertised: Mutex<AdvertisedHashes>,
+    prebuffer_bytes: usize,
+    prebuffer_timeout: Duration,
 }
 
 impl TorrentEngine {
@@ -99,6 +169,9 @@ impl TorrentEngine {
             source: Box::new(MagnetSource),
             max_concurrent: Semaphore::new(config.max_concurrent_torrents.max(1)),
             active_streams: Mutex::new(HashMap::new()),
+            advertised: Mutex::new(AdvertisedHashes::new(ADVERTISED_HASH_CAPACITY)),
+            prebuffer_bytes: config.prebuffer_bytes,
+            prebuffer_timeout: Duration::from_secs(config.prebuffer_timeout_secs),
         }))
     }
 
@@ -171,16 +244,131 @@ impl TorrentEngine {
             ..Default::default()
         };
 
-        self.api
-            .api_add_torrent(AddTorrent::from_url(magnet), Some(opts))
-            .await
-            .context("failed to start torrent")?;
+        tokio::time::timeout(
+            ADD_TORRENT_TIMEOUT,
+            self.api
+                .api_add_torrent(AddTorrent::from_url(magnet), Some(opts)),
+        )
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "timed out fetching torrent metadata after {}s -- the torrent likely has no \
+                 reachable peers (try a release with more seeders)",
+                ADD_TORRENT_TIMEOUT.as_secs()
+            )
+        })?
+        .context("failed to start torrent")?;
+
+        // Adding a torrent returns before it is streamable: librqbit still has
+        // to move it out of `Initializing` (hashing/checking any data already
+        // on disk). Returning here would hand the caller a URL that 404s with
+        // "invalid state: initializing" for the first second or two -- which a
+        // player treats as a dead link rather than retrying, so playback fails
+        // outright. Waiting here makes "started" actually mean "playable".
+        self.wait_until_streamable(&info_hash, INITIALIZE_TIMEOUT)
+            .await?;
 
         Ok(info_hash)
     }
 
+    /// Makes sure `info_hash` is present in the session and streamable,
+    /// starting it from a bare info hash if it isn't.
+    ///
+    /// This is what lets the Stremio addon hand out a short, clean
+    /// `/videos/<hash>/<idx>` URL instead of a long percent-encoded
+    /// `/play?magnet=...` one. That matters because Stremio may pass the URL
+    /// to an *external* player (VLC) through an Android intent, where a long
+    /// URL full of `%` and `&` is far easier to mangle than a plain path.
+    /// Returns `Ok(false)` when the torrent is neither running nor something
+    /// this gateway advertised -- the caller turns that into a 404 without
+    /// ever touching the network. See `AdvertisedHashes` for why.
+    pub async fn ensure_started(&self, info_hash: &str, file_idx: usize) -> Result<bool> {
+        let idx = TorrentIdOrHash::parse(info_hash)
+            .map_err(|e| anyhow::anyhow!("invalid info hash {info_hash}: {e}"))?;
+
+        if let Some(handle) = self.api.session().get(idx) {
+            // Resume anything the idle reaper paused. Cheap to check, and
+            // without it a torrent you come back to would serve only the
+            // bytes already on disk and then stall forever.
+            if handle.is_paused() {
+                debug!(%info_hash, "resuming paused torrent for a new request");
+                self.api
+                    .api_torrent_action_start(idx)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("failed to resume torrent: {e}"))?;
+            }
+            // It may still be initializing if a player raced us here, so wait
+            // rather than returning immediately.
+            self.wait_until_streamable(info_hash, INITIALIZE_TIMEOUT)
+                .await?;
+            return Ok(true);
+        }
+
+        if !self.is_advertised(info_hash).await {
+            return Ok(false);
+        }
+
+        let magnet = resolver::magnet_with_trackers(info_hash, None);
+        self.start_file(&magnet, file_idx).await?;
+        Ok(true)
+    }
+
+    /// Records that we handed this info hash to a client, making it eligible
+    /// for lazy start via `ensure_started`.
+    pub async fn remember_advertised(&self, info_hash: &str) {
+        self.advertised
+            .lock()
+            .await
+            .remember(info_hash.to_ascii_lowercase());
+    }
+
+    /// Whether `/videos/<hash>/...` is allowed to *start* this torrent.
+    pub async fn is_advertised(&self, info_hash: &str) -> bool {
+        self.advertised
+            .lock()
+            .await
+            .contains(&info_hash.to_ascii_lowercase())
+    }
+
+    /// Blocks until the torrent has left `Initializing`, or `timeout` elapses.
+    ///
+    /// A timeout is not treated as fatal: the torrent stays in the session and
+    /// keeps initializing, so the caller can still hand out its URL and the
+    /// player's own retry will pick it up shortly after.
+    pub async fn wait_until_streamable(&self, info_hash: &str, timeout: Duration) -> Result<()> {
+        let idx = TorrentIdOrHash::parse(info_hash)
+            .map_err(|e| anyhow::anyhow!("invalid info hash {info_hash}: {e}"))?;
+        let handle = self
+            .api
+            .mgr_handle(idx)
+            .context("torrent vanished from the session right after being added")?;
+
+        match tokio::time::timeout(timeout, handle.wait_until_initialized()).await {
+            Ok(Ok(())) => Ok(()),
+            // The torrent itself errored out (bad metadata, storage failure) --
+            // that is worth surfacing, since no amount of retrying will help.
+            Ok(Err(e)) => Err(e).context("torrent failed while initializing"),
+            Err(_) => {
+                warn!(
+                    %info_hash,
+                    "torrent still initializing after {timeout:?}; \
+                     handing out its URL anyway, playback may need a retry"
+                );
+                Ok(())
+            }
+        }
+    }
+
     pub fn api(&self) -> &Api {
         &self.api
+    }
+
+    pub fn prebuffer_bytes(&self) -> usize {
+        self.prebuffer_bytes
+    }
+
+    pub fn prebuffer_timeout(&self) -> Duration {
+        self.prebuffer_timeout
     }
 
     pub async fn touch_stream(&self, info_hash: &str, client: IpAddr) {
@@ -263,5 +451,126 @@ impl TorrentEngine {
 
     pub fn session_uptime_secs(&self) -> u64 {
         self.api.session().stats_snapshot().uptime_seconds
+    }
+
+    /// Whether this torrent is currently running (present in the session and
+    /// not paused).
+    ///
+    /// This is the authoritative "in use" signal for the cache janitor.
+    /// Last-HTTP-request recency is not: a video player reads a large chunk,
+    /// buffers several minutes of playback, then goes silent -- so an actively
+    /// watched movie looks idle by that measure and gets evicted mid-playback.
+    /// Since the idle reaper pauses anything genuinely unwatched, "still
+    /// unpaused" is both accurate and self-maintaining.
+    pub fn is_running(&self, info_hash: &str) -> bool {
+        let Ok(idx) = TorrentIdOrHash::parse(info_hash) else {
+            return false;
+        };
+        self.api
+            .session()
+            .get(idx)
+            .is_some_and(|handle| !handle.is_paused())
+    }
+
+    /// Pauses torrents nobody has streamed from in `idle_after`.
+    ///
+    /// Every running torrent competes for the same finite upstream bandwidth.
+    /// A 23 GB 4K release someone opened once and abandoned will happily eat
+    /// most of it, starving the movie actually being watched -- which shows up
+    /// as buffering that looks like a network problem but is really
+    /// self-inflicted. Pausing idle torrents hands that bandwidth back.
+    ///
+    /// Paused torrents keep their data and resume instantly on the next
+    /// request (see `ensure_started`), so this is invisible in normal use.
+    /// Completed torrents are left alone: they cost no download bandwidth and
+    /// seeding them back is good manners.
+    pub async fn pause_idle_torrents(&self, idle_after: Duration) -> usize {
+        let candidates: Vec<(TorrentIdOrHash, String)> = self.api.session().with_torrents(|iter| {
+            iter.filter_map(|(_, handle)| {
+                if handle.is_paused() {
+                    return None;
+                }
+                let stats = handle.stats();
+                // Finished: no download bandwidth being consumed.
+                if stats.total_bytes > 0 && stats.progress_bytes >= stats.total_bytes {
+                    return None;
+                }
+                let hash = handle.info_hash().as_string();
+                Some((handle.info_hash().into(), hash))
+            })
+            .collect()
+        });
+
+        let mut paused = 0;
+        for (idx, hash) in candidates {
+            if self.is_recently_active(&hash, idle_after).await {
+                continue;
+            }
+            match self.api.api_torrent_action_pause(idx).await {
+                Ok(_) => {
+                    info!(info_hash = %hash, "paused idle torrent to free bandwidth");
+                    paused += 1;
+                }
+                // Racing a state change here is normal and harmless.
+                Err(e) => debug!(info_hash = %hash, "could not pause idle torrent: {e}"),
+            }
+        }
+        paused
+    }
+
+    /// Runs `pause_idle_torrents` on a timer for the lifetime of the process.
+    pub fn spawn_idle_reaper(self: &Arc<Self>, interval: Duration, idle_after: Duration) {
+        let engine = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            // The first tick fires immediately; skip it so a torrent started
+            // moments before startup is not paused before anyone can play it.
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                engine.pause_idle_torrents(idle_after).await;
+            }
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn advertised_set_remembers_and_rejects() {
+        let mut set = AdvertisedHashes::new(4);
+        set.remember("aaaa".into());
+        assert!(set.contains("aaaa"));
+        assert!(!set.contains("bbbb"));
+    }
+
+    #[test]
+    fn advertised_set_evicts_oldest_beyond_capacity() {
+        let mut set = AdvertisedHashes::new(2);
+        set.remember("one".into());
+        set.remember("two".into());
+        set.remember("three".into());
+
+        assert!(!set.contains("one"), "oldest entry must be evicted");
+        assert!(set.contains("two"));
+        assert!(set.contains("three"));
+        // Bookkeeping must stay consistent, or the set leaks past its cap.
+        assert_eq!(set.order.len(), 2);
+        assert_eq!(set.set.len(), 2);
+    }
+
+    #[test]
+    fn advertised_set_does_not_double_count_repeats() {
+        // Re-browsing the same title must not push other entries out.
+        let mut set = AdvertisedHashes::new(2);
+        set.remember("one".into());
+        set.remember("one".into());
+        set.remember("two".into());
+
+        assert!(set.contains("one"));
+        assert!(set.contains("two"));
+        assert_eq!(set.order.len(), 2);
     }
 }

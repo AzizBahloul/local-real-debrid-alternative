@@ -15,6 +15,31 @@ const VIDEO_EXTENSIONS: &[&str] = &[
     "mkv", "mp4", "avi", "mov", "webm", "m4v", "ts", "wmv", "flv", "m2ts", "vob",
 ];
 
+/// Trackers attached to any magnet we build ourselves from a bare info hash.
+/// An index hands us only the hash; with no trackers the torrent has nothing
+/// but DHT to find peers on, which is much slower to start and on some
+/// networks never starts at all.
+pub const DEFAULT_TRACKERS: &[&str] = &[
+    "udp://tracker.opentrackr.org:1337/announce",
+    "udp://open.demonii.com:1337/announce",
+    "udp://open.stealth.si:80/announce",
+    "udp://tracker.torrent.eu.org:451/announce",
+    "udp://exodus.desync.com:6969/announce",
+    "udp://tracker.openbittorrent.com:6969/announce",
+];
+
+/// Builds a magnet URI from a bare info hash, with `DEFAULT_TRACKERS` attached.
+pub fn magnet_with_trackers(info_hash: &str, display_name: Option<&str>) -> String {
+    let mut magnet = format!("magnet:?xt=urn:btih:{info_hash}");
+    if let Some(name) = display_name {
+        magnet.push_str(&format!("&dn={}", urlencoding::encode(name)));
+    }
+    for tracker in DEFAULT_TRACKERS {
+        magnet.push_str(&format!("&tr={}", urlencoding::encode(tracker)));
+    }
+    magnet
+}
+
 /// A single file inside a resolved torrent.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct TorrentFile {
@@ -149,6 +174,29 @@ mod tests {
         assert!(normalize_to_magnet("").is_err());
         // path-traversal-looking input must never be treated as a hash
         assert!(normalize_to_magnet("../../etc/passwd").is_err());
+    }
+
+    #[test]
+    fn magnet_with_trackers_carries_hash_name_and_trackers() {
+        let magnet = magnet_with_trackers(
+            "45fa4233ef87c58f5f8b4817e4d50c9f5363caef",
+            Some("Movie 2024"),
+        );
+        assert!(magnet.starts_with("magnet:?xt=urn:btih:45fa4233ef87c58f5f8b4817e4d50c9f5363caef"));
+        assert!(magnet.contains("&dn=Movie%202024"));
+        assert!(magnet.contains("&tr=udp%3A%2F%2Ftracker.opentrackr.org%3A1337%2Fannounce"));
+        // Must round-trip through our own parser.
+        assert_eq!(
+            info_hash_from_magnet(&magnet).unwrap(),
+            "45fa4233ef87c58f5f8b4817e4d50c9f5363caef"
+        );
+    }
+
+    #[test]
+    fn magnet_with_trackers_omits_dn_when_no_name_is_known() {
+        let magnet = magnet_with_trackers("45fa4233ef87c58f5f8b4817e4d50c9f5363caef", None);
+        assert!(!magnet.contains("&dn="));
+        assert!(normalize_to_magnet(&magnet).is_ok());
     }
 
     #[test]

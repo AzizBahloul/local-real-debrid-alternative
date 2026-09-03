@@ -148,12 +148,27 @@ if [ "$BUILD" -eq 1 ]; then
       cargo install cargo-deb
     fi
 
-    log "Packaging the .deb (server + GUI + desktop menu entry)..."
+    log "Packaging the .deb (server + GUI + desktop menu entry + icon)..."
     DEB_PATH="$(cargo deb -p streaming-gateway-gui --no-build)"
     log "Built: $DEB_PATH"
-    echo "  Install it with:"
-    echo "    sudo dpkg -i \"$DEB_PATH\""
-    echo "  Then launch \"Streaming Gateway\" from your applications menu, or run streaming-gateway-gui."
+
+    log "Installing $DEB_PATH (asks for sudo)..."
+    sudo dpkg -i "$DEB_PATH" || sudo apt-get install -f -y
+    log "OK: NovaStream installed to /usr/bin, menu entry + icon in place."
+
+    # Drop a real, clickable icon on the Desktop too, not just the app menu
+    # entry dpkg already installed to /usr/share/applications.
+    DESKTOP_DIR="$(xdg-user-dir DESKTOP 2>/dev/null || true)"
+    DESKTOP_DIR="${DESKTOP_DIR:-$HOME/Desktop}"
+    mkdir -p "$DESKTOP_DIR"
+    SHORTCUT="$DESKTOP_DIR/novastream.desktop"
+    cp "$SCRIPT_DIR/crates/gateway-gui/assets/streaming-gateway-gui.desktop" "$SHORTCUT"
+    chmod +x "$SHORTCUT"
+    # GNOME/Nautilus refuses to run a Desktop .desktop file until it's marked
+    # trusted -- otherwise double-clicking it just opens it as a text file.
+    command -v gio >/dev/null 2>&1 && gio set "$SHORTCUT" metadata::trusted true 2>/dev/null || true
+    log "OK: Desktop shortcut created at $SHORTCUT"
+    echo "  Launch \"NovaStream\" from your applications menu, the new Desktop icon, or run streaming-gateway-gui."
   fi
 
   # Optional convenience: open the default port on ufw if it's active, so

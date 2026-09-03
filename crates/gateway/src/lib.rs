@@ -1,6 +1,7 @@
 pub mod cache;
 pub mod config;
 pub mod error;
+pub mod indexer;
 pub mod monitoring;
 pub mod network;
 pub mod streaming;
@@ -33,7 +34,15 @@ pub struct AppState {
     /// This gateway's own address as reachable from the LAN, e.g.
     /// `http://192.168.1.42:11470`. Used to build absolute stream URLs for
     /// Stremio (relative URLs are not valid in a stream response).
-    pub base_url: String,
+    ///
+    /// Deliberately the LAN address even when the addon itself is reached
+    /// through an https tunnel: the manifest is kilobytes and may travel
+    /// through the tunnel, but the video is gigabytes and must not. See the
+    /// `stremio` module header.
+    pub stream_base_url: String,
+    /// Torrent discovery. `None` when `--disable-indexer` is set, in which
+    /// case the addon only answers for ids that already carry a magnet.
+    pub indexer: Option<Arc<indexer::TorrentioIndexer>>,
 }
 
 // Lets handlers ask for `State<Arc<TorrentEngine>>` directly instead of the
@@ -128,14 +137,52 @@ pub async fn run() -> anyhow::Result<()> {
     );
     cache.spawn_janitor(Duration::from_secs(config.cleanup_interval_secs));
 
+    if config.idle_pause_secs > 0 {
+        engine.spawn_idle_reaper(
+            Duration::from_secs(config.idle_check_interval_secs.max(1)),
+            Duration::from_secs(config.idle_pause_secs),
+        );
+        info!(
+            idle_after_secs = config.idle_pause_secs,
+            "idle torrents will be paused so bandwidth goes to what is being watched"
+        );
+    }
+
     let lan_ip = network::detect_lan_ip();
     let (listener, bound_port) = bind_with_fallback(&config).await?;
-    let base_url = format!("http://{lan_ip}:{bound_port}");
+    let stream_base_url = config
+        .public_stream_url
+        .clone()
+        .map(|url| url.trim_end_matches('/').to_string())
+        .unwrap_or_else(|| format!("http://{lan_ip}:{bound_port}"));
+
+    let indexer = if config.disable_indexer {
+        info!("torrent discovery disabled; addon will only answer magnet ids");
+        None
+    } else {
+        match indexer::TorrentioIndexer::new(
+            config.indexer_url.clone(),
+            config.indexer_max_results,
+            Duration::from_secs(config.indexer_timeout_secs),
+        ) {
+            Ok(ix) => {
+                info!(url = %config.indexer_url, "torrent discovery enabled");
+                Some(Arc::new(ix))
+            }
+            Err(e) => {
+                // Discovery is an enhancement -- failing to build its client
+                // must not stop the gateway from serving magnets.
+                warn!("could not initialize torrent index, discovery disabled: {e:#}");
+                None
+            }
+        }
+    };
 
     let state = AppState {
         engine,
         cache,
-        base_url,
+        stream_base_url,
+        indexer,
     };
 
     monitoring::spawn_terminal_monitor(
