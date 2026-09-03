@@ -173,7 +173,7 @@ async fn magnet_streams(state: &AppState, magnet: &str) -> Vec<Value> {
     state.engine.remember_advertised(&resolved.info_hash).await;
 
     vec![json!({
-        "name": "Local Gateway",
+        "name": stream_label(""),
         "title": format!(
             "{}\n{} \u{2022} {}",
             resolved.name.clone().unwrap_or_else(|| file.name.clone()),
@@ -244,7 +244,7 @@ async fn indexed_streams(
 
             let mut entries = vec![json!({
                 "name": stream_label(&torrent.quality),
-                "title": describe(torrent),
+                "title": format!("{}\n\u{2705} same wifi as the PC \u{2022} full speed", describe(torrent)),
                 "url": video_url(state, &torrent.info_hash, file_idx),
                 "behaviorHints": { "notWebReady": false, "bingeGroup": binge },
             })];
@@ -254,10 +254,17 @@ async fn indexed_streams(
             if let Some(url) = remote_video_url(state, forwarded_host, &torrent.info_hash, file_idx)
             {
                 entries.push(json!({
-                    "name": format!("{} (remote)", stream_label(&torrent.quality)),
-                    "title": format!("{}\nvia tunnel -- works on any network", describe(torrent)),
+                    "name": remote_stream_label(&torrent.quality),
+                    "title": format!(
+                        "{}\n\u{26A0} slow \u{2022} only when away from home",
+                        describe(torrent)
+                    ),
                     "url": url,
-                    "behaviorHints": { "notWebReady": false, "bingeGroup": binge },
+                    // Deliberately a *different* binge group from the direct
+                    // entry: Stremio auto-plays the next episode from the same
+                    // group, so sharing one would silently keep a whole series
+                    // on the slow route after a single tap on this row.
+                    "behaviorHints": { "notWebReady": false, "bingeGroup": format!("{binge}|away") },
                 }));
             }
             entries
@@ -344,9 +351,26 @@ fn is_public_host(host: &str) -> bool {
 
 fn stream_label(quality: &str) -> String {
     if quality.is_empty() {
-        "Local Gateway".to_string()
+        "\u{26A1} Direct".to_string()
     } else {
-        format!("Local Gateway\n{quality}")
+        format!("\u{26A1} Direct\n{quality}")
+    }
+}
+
+/// Label for the tunnelled copy of the same file.
+///
+/// Deliberately unappealing next to the direct entry. Both rows play the
+/// identical file, but the tunnelled one carries every byte out to a relay
+/// on the public internet and back, which measured ~2 MB/s against local
+/// disk speed over the LAN. The old wording ("works on any network") read
+/// like the safer, more capable choice, so it got picked on the home wifi
+/// where it is strictly the worse one -- and the result looked like the
+/// gateway buffering rather than a route that was never meant to carry video.
+fn remote_stream_label(quality: &str) -> String {
+    if quality.is_empty() {
+        "\u{1F30D} Away".to_string()
+    } else {
+        format!("\u{1F30D} Away\n{quality}")
     }
 }
 
@@ -518,7 +542,24 @@ mod tests {
 
     #[test]
     fn quality_label_falls_back_when_index_gave_no_tag() {
-        assert_eq!(stream_label(""), "Local Gateway");
-        assert_eq!(stream_label("1080p"), "Local Gateway\n1080p");
+        assert_eq!(stream_label(""), "\u{26A1} Direct");
+        assert_eq!(stream_label("1080p"), "\u{26A1} Direct\n1080p");
+        assert_eq!(remote_stream_label(""), "\u{1F30D} Away");
+        assert_eq!(remote_stream_label("1080p"), "\u{1F30D} Away\n1080p");
+    }
+
+    /// Both rows play the same file, but only one of them should look like
+    /// the obvious pick. Picking the tunnelled row on the home wifi routes
+    /// gigabytes through a public relay at a fraction of LAN speed, and the
+    /// symptom is indistinguishable from the gateway being slow.
+    #[test]
+    fn the_tunnelled_row_never_reads_as_the_better_choice() {
+        let direct = stream_label("1080p");
+        let away = remote_stream_label("1080p");
+        assert_ne!(direct, away, "the two routes must be tellable apart");
+        assert!(
+            !away.contains("Direct"),
+            "the tunnelled row must not borrow the direct row's wording"
+        );
     }
 }
