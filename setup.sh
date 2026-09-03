@@ -176,9 +176,9 @@ if [ "$BUILD" -eq 1 ]; then
   # ufw isn't installed or isn't enabled -- this is a nice-to-have, not a
   # requirement (plenty of desktops run without any local firewall at all).
   if command -v ufw >/dev/null 2>&1 && sudo ufw status 2>/dev/null | head -1 | grep -qi "active"; then
-    log "ufw is active -- allowing inbound TCP on 11470 and 8080 (gateway ports) from the LAN."
-    sudo ufw allow 11470/tcp >/dev/null || true
+    log "ufw is active -- allowing inbound TCP on 8080 and 11470 (gateway ports) from the LAN."
     sudo ufw allow 8080/tcp >/dev/null || true
+    sudo ufw allow 11470/tcp >/dev/null || true
   fi
 
   echo

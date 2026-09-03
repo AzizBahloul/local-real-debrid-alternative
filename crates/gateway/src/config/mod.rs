@@ -15,11 +15,11 @@ use clap::Parser;
 )]
 pub struct AppConfig {
     /// Primary port to bind the HTTP gateway on.
-    #[arg(long, env = "GATEWAY_PORT", default_value_t = 11470)]
+    #[arg(long, env = "GATEWAY_PORT", default_value_t = 8080)]
     pub port: u16,
 
     /// Fallback port used if the primary port is already taken.
-    #[arg(long, env = "GATEWAY_FALLBACK_PORT", default_value_t = 8080)]
+    #[arg(long, env = "GATEWAY_FALLBACK_PORT", default_value_t = 11470)]
     pub fallback_port: u16,
 
     /// Address to bind on. 0.0.0.0 exposes the gateway to the whole LAN.
@@ -161,5 +161,41 @@ impl AppConfig {
 
     pub fn session_state_dir(&self) -> PathBuf {
         self.cache_dir.join("session")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn defaults() -> AppConfig {
+        AppConfig::parse_from(["streaming-gateway"])
+    }
+
+    /// The port is not a free choice: the addon URL installed in Stremio, the
+    /// tunnel pointed at this machine, and any firewall rule all hard-code it,
+    /// and none of them notice if it moves. A silent change means the phone
+    /// keeps asking a port nothing is listening on, which looks like the whole
+    /// gateway being down rather than a config drift.
+    #[test]
+    fn default_ports_are_stable() {
+        let config = defaults();
+        assert_eq!(config.port, 8080);
+        assert_eq!(config.fallback_port, 11470);
+        assert_ne!(
+            config.port, config.fallback_port,
+            "the fallback must be a different port or it can never rescue a clash"
+        );
+    }
+
+    #[test]
+    fn defaults_are_usable_without_any_configuration() {
+        let config = defaults();
+        assert!(!config.disable_indexer, "search is on out of the box");
+        assert!(config.prebuffer_bytes > 0);
+        // Stall recovery and idle pausing both stop working silently at 0, and
+        // 0 is a legitimate value to set by hand -- so pin the shipped ones.
+        assert!(config.stall_timeout_secs > 0);
+        assert!(config.idle_pause_secs > config.idle_check_interval_secs);
     }
 }

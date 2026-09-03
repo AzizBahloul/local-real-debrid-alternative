@@ -32,7 +32,7 @@ pub struct AppState {
     pub engine: Arc<TorrentEngine>,
     pub cache: Arc<CacheManager>,
     /// This gateway's own address as reachable from the LAN, e.g.
-    /// `http://192.168.1.42:11470`. Used to build absolute stream URLs for
+    /// `http://192.168.1.42:8080`. Used to build absolute stream URLs for
     /// Stremio (relative URLs are not valid in a stream response).
     ///
     /// Deliberately the LAN address even when the addon itself is reached
@@ -86,7 +86,7 @@ pub fn build_router(state: AppState) -> Router {
 }
 
 /// Binds the primary port, falling back to `fallback_port` if it's already
-/// taken (e.g. another instance running, or something else on 11470).
+/// taken (e.g. another instance running, or something else on 8080).
 pub async fn bind_with_fallback(
     config: &AppConfig,
 ) -> anyhow::Result<(tokio::net::TcpListener, u16)> {

@@ -128,7 +128,7 @@ impl Default for GatewayApp {
             binary: find_server_binary(),
             process: ServerProcess::new(),
             running: false,
-            port: "11470".to_string(),
+            port: "8080".to_string(),
             cache_dir: "./cache".to_string(),
             logs: VecDeque::with_capacity(MAX_LOG_LINES),
             detected_url: None,

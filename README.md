@@ -80,7 +80,7 @@ Click the **NovaStream** icon on your desktop, then click the big green
 </tr>
 </table>
 
-The app shows an address like `http://192.168.1.67:11470`. **Write it down** —
+The app shows an address like `http://192.168.1.67:8080`. **Write it down** —
 you need it in step 4.
 
 Prefer a terminal? `./target/release/streaming-gateway` does the same thing.
@@ -94,13 +94,13 @@ address.
 Install [ngrok](https://ngrok.com/download) (free account), then run:
 
 ```bash
-ngrok http 11470
+ngrok http 8080
 ```
 
 It prints a line like:
 
 ```
-Forwarding  https://abc123.ngrok-free.app -> http://localhost:11470
+Forwarding  https://abc123.ngrok-free.app -> http://localhost:8080
 ```
 
 **Copy that `https://...` address.** That is your addon address.
@@ -134,7 +134,7 @@ You should now see **Local Streaming Gateway** in your installed addons.
 
 1. Search for a movie in Stremio
 2. Open it and look at the stream list
-3. Pick an entry that says **Local Gateway**
+3. Pick an entry marked **⚡ Direct** (not 🌍 Away — see below)
 4. Press play, then **wait about 10 seconds** for the first start
 
 <div align="center">
@@ -150,7 +150,7 @@ You should now see **Local Streaming Gateway** in your installed addons.
 Each result shows two numbers that decide whether it plays smoothly:
 
 ```
-Local Gateway 1080p
+⚡ Direct 1080p
 Movie.2026.1080p.WEB-DL.x265
 👤 1463   💾 1.56 GB
    ▲         ▲
@@ -177,10 +177,15 @@ If your phone is on a **WiFi extender**, a guest network, or mobile data, it may
 not be able to reach your PC's local address directly.
 
 The gateway handles this automatically: each movie shows a second entry marked
-**(remote)**. It plays through the tunnel instead of your local network, so it
-works from anywhere — just slower, and it uses tunnel bandwidth.
+**🌍 Away**. It plays through the tunnel instead of your local network, so it
+works from anywhere.
 
-**Use the normal entry when you can, the (remote) one when you must.**
+**Only use 🌍 Away when you are actually away.** Both entries play the identical
+file, but 🌍 Away sends every byte out to a relay on the internet and back —
+measured at roughly **2 MB/s**, against local-disk speed for ⚡ Direct. On your
+home WiFi it is strictly the worse choice, and picking it there looks exactly
+like the gateway being slow: playback limps and every seek has to refill the
+player's buffer through the relay.
 
 ---
 
@@ -189,7 +194,7 @@ works from anywhere — just slower, and it uses tunnel bandwidth.
 You don't need Stremio. Any player that opens a URL works:
 
 ```
-http://192.168.1.67:11470/play?magnet=<your-magnet-link>
+http://192.168.1.67:8080/play?magnet=<your-magnet-link>
 ```
 
 - **VLC (phone):** ☰ menu → Stream → paste the URL
@@ -205,7 +210,7 @@ Everything has a sensible default. Change these only if you need to:
 
 | Setting | Default | What it does |
 |---|---|---|
-| `GATEWAY_PORT` | `11470` | Port to listen on |
+| `GATEWAY_PORT` | `8080` | Port to listen on |
 | `MAX_CACHE_SIZE_GB` | `20` | Disk limit before old movies are deleted |
 | `IDLE_PAUSE_SECS` | `300` | Pause a movie you stopped watching, to free bandwidth |
 | `PREBUFFER_BYTES` | `4 MB` | Data to gather before playback starts |
@@ -263,7 +268,7 @@ fixes it far more often than anything else.
 
 Check what's using bandwidth:
 ```bash
-curl -s http://localhost:11470/health | python3 -m json.tool
+curl -s http://localhost:8080/health | python3 -m json.tool
 ```
 </details>
 
