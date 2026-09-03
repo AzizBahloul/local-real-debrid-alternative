@@ -292,12 +292,42 @@ fn remote_video_url(
     file_idx: usize,
 ) -> Option<String> {
     let host = forwarded_host?;
-    if host.is_empty() || state.stream_base_url.contains(host) {
-        // Reached directly over the LAN -- the fast URL already works.
+    if host.is_empty() || state.stream_base_url.contains(host) || !is_public_host(host) {
+        // Reached directly on this network -- the fast URL already works, and
+        // a second entry built from a private address would be a duplicate at
+        // best and a broken `https://192.168.x.x` link at worst.
         return None;
     }
     // Anything reaching us through a public tunnel arrived over https.
     Some(format!("https://{host}/videos/{info_hash}/{file_idx}"))
+}
+
+/// Whether a host is plausibly a public address reachable from other networks,
+/// as opposed to a LAN/loopback name that only works from here.
+///
+/// The fallback URL is only worth offering for the former: it exists precisely
+/// to cover clients that *cannot* reach our private address, so echoing a
+/// private one back would produce a link that fails in exactly the situation
+/// it was meant to rescue.
+fn is_public_host(host: &str) -> bool {
+    let name = host.split(':').next().unwrap_or(host);
+
+    if name.eq_ignore_ascii_case("localhost") {
+        return false;
+    }
+
+    // Private/loopback IPv4 ranges (RFC 1918 + loopback + link-local).
+    let octets: Vec<&str> = name.split('.').collect();
+    if octets.len() == 4 && octets.iter().all(|o| o.parse::<u8>().is_ok()) {
+        let n: Vec<u8> = octets.iter().map(|o| o.parse().unwrap()).collect();
+        return !matches!(
+            (n[0], n[1]),
+            (127, _) | (10, _) | (192, 168) | (169, 254) | (172, 16..=31)
+        );
+    }
+
+    // A real tunnel host is a dotted domain name.
+    name.contains('.')
 }
 
 fn stream_label(quality: &str) -> String {
@@ -440,13 +470,38 @@ mod tests {
     }
 
     #[test]
-    fn remote_url_is_offered_only_when_the_request_did_not_come_over_the_lan() {
-        let base = "http://192.168.1.67:8080";
-        // Reached directly on the LAN: the fast URL already works, so adding
-        // a slower tunnelled duplicate would be noise.
-        assert!(base.contains("192.168.1.67:8080"));
-        // Reached via a tunnel host: a fallback is warranted.
-        assert!(!base.contains("abc.ngrok-free.app"));
+    fn private_and_loopback_hosts_never_get_a_remote_entry() {
+        // Echoing a private address back as an https fallback would produce a
+        // link that is broken (wrong scheme) and useless in the one case the
+        // fallback exists for: a client that cannot reach our LAN.
+        for host in [
+            "127.0.0.1:8080",
+            "localhost:11470",
+            "192.168.1.67:8080",
+            "10.0.0.5",
+            "172.16.3.4",
+            "172.31.255.1",
+            "169.254.1.1",
+        ] {
+            assert!(
+                !is_public_host(host),
+                "{host} must not be treated as public"
+            );
+        }
+    }
+
+    #[test]
+    fn public_tunnel_hosts_do_get_a_remote_entry() {
+        for host in [
+            "abc123.ngrok-free.app",
+            "example.trycloudflare.com",
+            "gateway.example.com:443",
+            "8.8.8.8",
+            "172.15.0.1", // just outside the private 172.16-31 range
+            "172.32.0.1",
+        ] {
+            assert!(is_public_host(host), "{host} should be treated as public");
+        }
     }
 
     #[test]
