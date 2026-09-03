@@ -317,8 +317,29 @@ fn remote_video_url(
         // best and a broken `https://192.168.x.x` link at worst.
         return None;
     }
+    // Our own https hostname is a public *name* that resolves to a private
+    // address, so it passes every check above while still being this machine
+    // on this LAN. Offering a "you must be away from home" entry for it would
+    // label the local route as the slow one.
+    if state
+        .tls_host
+        .as_deref()
+        .is_some_and(|tls_host| host_matches(host, tls_host))
+    {
+        return None;
+    }
     // Anything reaching us through a public tunnel arrived over https.
     Some(format!("https://{host}/videos/{info_hash}/{file_idx}"))
+}
+
+/// Compares a `Host` header against a bare hostname, ignoring any port and
+/// case. `Host` carries `name:port` whenever the port is non-default, so a
+/// plain string equality would miss the very requests this needs to catch.
+fn host_matches(host: &str, name: &str) -> bool {
+    host.split(':')
+        .next()
+        .unwrap_or(host)
+        .eq_ignore_ascii_case(name)
 }
 
 /// Whether a host is plausibly a public address reachable from other networks,

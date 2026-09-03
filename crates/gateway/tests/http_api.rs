@@ -60,6 +60,15 @@ async fn test_state() -> AppState {
         // Stall recovery off: with no swarm every read stalls by definition,
         // so leaving it on would just re-open streams in a loop.
         stall_timeout_secs: 0,
+        // No https listener in tests: it would fetch a certificate over the
+        // network, which these tests must never depend on.
+        disable_https: true,
+        https_port: 0,
+        tls_host_suffix: "local-ip.sh".to_string(),
+        tls_cert_url: "https://tls.invalid/server.pem".to_string(),
+        tls_key_url: "https://tls.invalid/server.key".to_string(),
+        tls_cert_file: None,
+        tls_key_file: None,
     };
 
     let engine = TorrentEngine::new(&config).await.expect("engine starts");
@@ -73,8 +82,9 @@ async fn test_state() -> AppState {
     AppState {
         engine,
         cache,
-        stream_base_url: "http://127.0.0.1:11470".to_string(),
+        stream_base_url: "http://127.0.0.1:8080".to_string(),
         indexer: None,
+        tls_host: None,
     }
 }
 

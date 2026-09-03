@@ -138,6 +138,55 @@ pub struct AppConfig {
     #[arg(long, env = "IDLE_CHECK_INTERVAL_SECS", default_value_t = 30)]
     pub idle_check_interval_secs: u64,
 
+    /// Disable the https listener.
+    ///
+    /// https exists here for one reason: Stremio's Android app will not
+    /// install an addon from a plain `http://192.168.x.x` URL. The http
+    /// listener stays up either way and still serves the video, so turning
+    /// this off only costs the ability to add the addon without a tunnel.
+    #[arg(long, env = "DISABLE_HTTPS", default_value_t = false)]
+    pub disable_https: bool,
+
+    /// Port for the https listener. Separate from the http one so everything
+    /// that already works over http -- VLC, a browser, the desktop app's own
+    /// health checks -- keeps working untouched.
+    #[arg(long, env = "HTTPS_PORT", default_value_t = 8443)]
+    pub https_port: u16,
+
+    /// DNS suffix whose wildcard certificate this gateway serves.
+    ///
+    /// Must be a service that resolves a dash-encoded address back to itself
+    /// (`192-168-1-67.<suffix>` -> `192.168.1.67`) *and* publishes the
+    /// matching certificate. See the `tls` module for why this works.
+    #[arg(long, env = "TLS_HOST_SUFFIX", default_value = "local-ip.sh")]
+    pub tls_host_suffix: String,
+
+    /// Where the wildcard certificate and its key are published.
+    #[arg(
+        long,
+        env = "TLS_CERT_URL",
+        default_value = "https://local-ip.sh/server.pem"
+    )]
+    pub tls_cert_url: String,
+
+    #[arg(
+        long,
+        env = "TLS_KEY_URL",
+        default_value = "https://local-ip.sh/server.key"
+    )]
+    pub tls_key_url: String,
+
+    /// Serve a certificate from disk instead of fetching a published one.
+    ///
+    /// This is the option for anyone using a domain they actually control:
+    /// the published key is world-readable by design, so it cannot
+    /// authenticate this machine to anyone. Both must be given together.
+    #[arg(long, env = "TLS_CERT_FILE")]
+    pub tls_cert_file: Option<PathBuf>,
+
+    #[arg(long, env = "TLS_KEY_FILE")]
+    pub tls_key_file: Option<PathBuf>,
+
     /// Public base URL the Stremio addon should advertise for video playback.
     /// Defaults to this machine's LAN address, which is what you want: the
     /// manifest may be reached through an https tunnel, but the video itself

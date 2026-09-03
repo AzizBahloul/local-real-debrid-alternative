@@ -43,7 +43,7 @@ your phone as a normal video stream you can pause and seek.
 
 # Setup guide
 
-Follow these in order. Total time: about 10 minutes.
+Follow these in order. Total time: about 5 minutes.
 
 ## Step 1 — Install on your PC
 
@@ -80,57 +80,64 @@ Click the **NovaStream** icon on your desktop, then click the big green
 </tr>
 </table>
 
-The app shows an address like `http://192.168.1.67:8080`. **Write it down** —
-you need it in step 4.
+The app prints **two** addresses. The `https://…local-ip.sh:8443` one is what
+Stremio needs (step 3); the plain `http://192.168.1.67:8080` one is for VLC,
+browsers and TVs.
 
 Prefer a terminal? `./target/release/streaming-gateway` does the same thing.
 
-## Step 3 — Make it reachable from your phone
+## Step 3 — Add it to Stremio on your phone
 
-Stremio's Android app will not connect to a plain `http://192.168.x.x` address.
-It requires `https`. So you need a free tunnel that gives your PC an https
-address.
+**There is no tunnel step. There used to be. It's gone.**
 
-Install [ngrok](https://ngrok.com/download) (free account), then run:
-
-```bash
-ngrok http 8080
-```
-
-It prints a line like:
+When the gateway starts it prints an `https://` address of its own, like:
 
 ```
-Forwarding  https://abc123.ngrok-free.app -> http://localhost:8080
+PASTE THIS INTO STREMIO (Addons -> search bar):
+https://192-168-1-67.local-ip.sh:8443/manifest.json
 ```
 
-**Copy that `https://...` address.** That is your addon address.
-
-> [!IMPORTANT]
-> Only tiny text data goes through this tunnel — the video itself streams
-> directly over your WiFi. You will not burn through ngrok's free bandwidth
-> limit by watching movies.
-
-> [!WARNING]
-> While the tunnel runs, anyone with that exact link can reach your gateway.
-> The link is random and changes each restart. Stop ngrok (`Ctrl+C`) when done.
-
-## Step 4 — Add it to Stremio on your phone
+That address points **straight at your PC over your WiFi** — nothing is
+relayed through anyone else's server. Then:
 
 1. Install **Stremio** from the Play Store and sign in
 2. Make sure your phone is on the **same WiFi** as your PC
 3. Open **Addons** (the puzzle-piece icon at the bottom)
 4. Tap the search bar at the top
-5. Paste your address with `/manifest.json` on the end:
-
-```
-https://abc123.ngrok-free.app/manifest.json
-```
-
+5. Paste the exact address the app printed, ending in `/manifest.json`
 6. Tap **Install**
 
 You should now see **Local Streaming Gateway** in your installed addons.
 
-## Step 5 — Watch something
+<details>
+<summary><b>Why the odd-looking address, and is it safe?</b></summary>
+
+Stremio's Android app refuses to load an addon over plain `http://`, and no
+certificate authority will ever issue a certificate for `192.168.1.67` —
+private addresses have been banned from public certificates since 2015.
+
+The way around both is a hostname. `192-168-1-67.local-ip.sh` is a public DNS
+name that resolves right back to `192.168.1.67`, and
+[local-ip.sh](https://local-ip.sh) publishes a genuine Let's Encrypt
+certificate for `*.local-ip.sh`. Your PC serves that certificate, so your phone
+sees a real, trusted `https://` site — while every byte stays on your WiFi.
+Only the DNS lookup touches the internet.
+
+**The honest caveat:** that certificate's private key is published too, so
+anyone can download it. This gives you encryption but *not* proof of identity —
+someone already on your WiFi could impersonate the address. It is strictly
+better than the plain `http` it replaces, and fine for streaming films at home,
+but it is not a secret-keeping channel.
+
+Want real security? Point a domain you own at `192.168.1.67`, get a
+certificate for it via a DNS-01 challenge (works fine for a private address —
+the authority checks a DNS record, it never connects to your machine), and
+start the gateway with `--tls-cert-file` and `--tls-key-file`. A free
+[deSEC](https://desec.io) `dedyn.io` subdomain is enough; no purchase needed.
+
+</details>
+
+## Step 4 — Watch something
 
 1. Search for a movie in Stremio
 2. Open it and look at the stream list
@@ -173,12 +180,13 @@ movie length (hours). Under 2 GB/hour is comfortable on most connections.
 
 ## Watching from a different WiFi
 
-If your phone is on a **WiFi extender**, a guest network, or mobile data, it may
-not be able to reach your PC's local address directly.
+Genuinely away from home — mobile data, a friend's WiFi, a hotel — is the one
+case the local address cannot cover, because `192.168.1.67` means nothing
+outside your house. For that you still need a tunnel (ngrok, Cloudflare Tunnel)
+pointed at port 8080, and you add *its* https address to Stremio instead.
 
-The gateway handles this automatically: each movie shows a second entry marked
-**🌍 Away**. It plays through the tunnel instead of your local network, so it
-works from anywhere.
+When you reach the addon that way, every movie grows a second entry marked
+**🌍 Away** that plays through the tunnel.
 
 **Only use 🌍 Away when you are actually away.** Both entries play the identical
 file, but 🌍 Away sends every byte out to a relay on the internet and back —
@@ -186,6 +194,10 @@ measured at roughly **2 MB/s**, against local-disk speed for ⚡ Direct. On your
 home WiFi it is strictly the worse choice, and picking it there looks exactly
 like the gateway being slow: playback limps and every seek has to refill the
 player's buffer through the relay.
+
+On your own WiFi the 🌍 Away entry does not appear at all — the gateway
+recognises its own `local-ip.sh` address as a local one and does not offer a
+slow route to a device that already has a fast one.
 
 ---
 
@@ -211,6 +223,9 @@ Everything has a sensible default. Change these only if you need to:
 | Setting | Default | What it does |
 |---|---|---|
 | `GATEWAY_PORT` | `8080` | Port to listen on |
+| `HTTPS_PORT` | `8443` | Port for the https address you paste into Stremio |
+| `DISABLE_HTTPS` | `false` | Turn off https (you would then need a tunnel again) |
+| `TLS_CERT_FILE` | — | Use your own certificate instead of the published one |
 | `MAX_CACHE_SIZE_GB` | `20` | Disk limit before old movies are deleted |
 | `IDLE_PAUSE_SECS` | `300` | Pause a movie you stopped watching, to free bandwidth |
 | `PREBUFFER_BYTES` | `4 MB` | Data to gather before playback starts |
@@ -237,8 +252,19 @@ MAX_CACHE_SIZE_GB=100 ./target/release/streaming-gateway
 <details>
 <summary><b>Stremio won't install the addon / it just spins forever</b></summary>
 
-You're using an `http://` address. Stremio's Android app requires `https`.
-Go back to **Step 3** and use the ngrok address instead.
+First check you pasted the `https://…local-ip.sh:8443/manifest.json` address and
+not the plain `http://192.168.…` one. Stremio's Android app silently rewrites
+`http://` to `https://` before it even connects, so an http address can only
+ever fail — and it fails as an endless spinner with no error.
+
+If the https address also spins, your **router may be blocking it**. That
+address is a public name that points to a private one, and some routers discard
+those answers ("DNS rebinding protection"). To check, on your phone go to
+**Settings → Network & internet → Private DNS → Private DNS provider hostname**
+and enter `dns.google`. If the addon installs now, that was it. Either leave
+that setting on, or add `local-ip.sh` to your router's DNS-rebind exception list
+(FRITZ!Box: *Home Network → Network → Network Settings → DNS Rebind Protection*;
+OpenWrt: *Network → DNS → Filter → Domain whitelist*).
 </details>
 
 <details>

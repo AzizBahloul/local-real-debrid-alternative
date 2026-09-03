@@ -6,6 +6,7 @@ pub mod monitoring;
 pub mod network;
 pub mod streaming;
 pub mod stremio;
+pub mod tls;
 pub mod torrent;
 
 use std::net::SocketAddr;
@@ -43,6 +44,15 @@ pub struct AppState {
     /// Torrent discovery. `None` when `--disable-indexer` is set, in which
     /// case the addon only answers for ids that already carry a magnet.
     pub indexer: Option<Arc<indexer::TorrentioIndexer>>,
+    /// This gateway's own https hostname, when it serves one (e.g.
+    /// `192-168-1-67.local-ip.sh`).
+    ///
+    /// A request arriving on this name came over the LAN, even though the
+    /// name is a public one that resolves through public DNS. Without
+    /// knowing that, the addon would see an unfamiliar public-looking host
+    /// and offer its "you must be away from home" fallback for a request
+    /// that never left the building.
+    pub tls_host: Option<String>,
 }
 
 // Lets handlers ask for `State<Arc<TorrentEngine>>` directly instead of the
@@ -178,11 +188,18 @@ pub async fn run() -> anyhow::Result<()> {
         }
     };
 
+    // Known before the certificate is: it is derived purely from the LAN
+    // address, and the stream handler needs it to recognise its own https
+    // origin as a local one.
+    let tls_host =
+        (!config.disable_https).then(|| tls::hostname_for(lan_ip, &config.tls_host_suffix));
+
     let state = AppState {
         engine,
         cache,
         stream_base_url,
         indexer,
+        tls_host: tls_host.clone(),
     };
 
     monitoring::spawn_terminal_monitor(
@@ -192,7 +209,58 @@ pub async fn run() -> anyhow::Result<()> {
 
     let app = build_router(state);
 
-    network::print_banner(lan_ip, bound_port);
+    // The https listener is what lets Stremio's Android app add the addon
+    // without a tunnel -- see the `tls` module. It serves the same router on
+    // its own port, so http keeps working exactly as before and a failure
+    // here degrades to "no addon URL" rather than "no gateway".
+    let addon_url = if config.disable_https {
+        None
+    } else {
+        match tls::load(
+            config.tls_cert_file.as_deref(),
+            config.tls_key_file.as_deref(),
+            &config.tls_cert_url,
+            &config.tls_key_url,
+            &config.cache_dir,
+        )
+        .await
+        {
+            Ok(tls_config) => {
+                tls::spawn_refresh(
+                    tls_config.clone(),
+                    config.tls_cert_url.clone(),
+                    config.tls_key_url.clone(),
+                    config.cache_dir.clone(),
+                );
+
+                let host = tls::hostname_for(lan_ip, &config.tls_host_suffix);
+                let addr = SocketAddr::new(config.bind_addr, config.https_port);
+                let https_app = app.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = axum_server::bind_rustls(addr, tls_config)
+                        .serve(https_app.into_make_service_with_connect_info::<SocketAddr>())
+                        .await
+                    {
+                        warn!(
+                            "https listener stopped: {e:#} -- the addon URL will not work, \
+                             but http streaming is unaffected"
+                        );
+                    }
+                });
+                info!(%host, port = config.https_port, "https listening");
+                Some(format!("https://{host}:{}", config.https_port))
+            }
+            Err(e) => {
+                warn!(
+                    "could not start https ({e:#}); Stremio's Android app will not be able to \
+                     add this addon without a tunnel"
+                );
+                None
+            }
+        }
+    };
+
+    network::print_banner(lan_ip, bound_port, addon_url.as_deref());
     info!(%lan_ip, port = bound_port, "streaming gateway listening");
 
     axum::serve(
