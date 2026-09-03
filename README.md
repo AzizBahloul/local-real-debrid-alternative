@@ -207,8 +207,9 @@ Everything has a sensible default. Change these only if you need to:
 |---|---|---|
 | `GATEWAY_PORT` | `11470` | Port to listen on |
 | `MAX_CACHE_SIZE_GB` | `20` | Disk limit before old movies are deleted |
-| `IDLE_PAUSE_SECS` | `120` | Pause a movie you stopped watching, to free bandwidth |
+| `IDLE_PAUSE_SECS` | `300` | Pause a movie you stopped watching, to free bandwidth |
 | `PREBUFFER_BYTES` | `4 MB` | Data to gather before playback starts |
+| `STALL_TIMEOUT_SECS` | `20` | If playback gets no data for this long, quietly reconnect |
 | `INDEXER_URL` | Torrentio | Where movies are searched for |
 | `DISABLE_INDEXER` | `false` | Turn off search entirely |
 | `LOG_LEVEL` | `info` | Set to `debug` for troubleshooting |

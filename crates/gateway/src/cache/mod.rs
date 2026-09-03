@@ -103,7 +103,8 @@ impl CacheManager {
             //   "unpaused" stays meaningful rather than matching everything.
             // * request recency -- covers the window between a client's first
             //   request and the torrent actually being registered/unpaused.
-            if self.engine.is_running(&entry.info_hash)
+            if self.engine.has_open_stream(&entry.info_hash)
+                || self.engine.is_running(&entry.info_hash)
                 || self
                     .engine
                     .is_recently_active(&entry.info_hash, ACTIVE_STREAM_GRACE_PERIOD)

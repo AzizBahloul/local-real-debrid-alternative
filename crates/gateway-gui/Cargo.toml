@@ -1,6 +1,6 @@
 [package]
 name = "streaming-gateway-gui"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Local Stremio streaming gateway + GUI launcher to start/stop it"
 license = "MIT"

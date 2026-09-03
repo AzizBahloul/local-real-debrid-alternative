@@ -12,8 +12,9 @@
 pub mod resolver;
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::io::SeekFrom;
 use std::net::IpAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -22,8 +23,14 @@ use librqbit::{
     AddTorrent, AddTorrentOptions, Api, DhtSessionConfig, Session, SessionOptions,
     SessionPersistenceConfig,
 };
+use tokio::io::{AsyncRead, AsyncSeekExt};
 use tokio::sync::{Mutex, Semaphore};
 use tracing::{debug, info, warn};
+
+/// A boxed read side of a torrent file. `librqbit::FileStream` lives in a
+/// private module and cannot be named from outside the crate, so it is boxed
+/// behind the trait it implements. Seeking is done before boxing.
+pub type BoxedReader = Box<dyn AsyncRead + Send + Unpin>;
 
 // Cold-start budget. A first request for a torrent that is not running yet
 // does three things in sequence, and their sum must stay under the router's
@@ -46,6 +53,12 @@ const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(15);
 /// How many recently-advertised info hashes stay startable. Generous relative
 /// to how many streams a browse session shows (15 per title by default).
 const ADVERTISED_HASH_CAPACITY: usize = 512;
+
+/// Cap on how many already-known torrents a single browse will wake up. A
+/// title's stream list can name a dozen releases we have partial data for;
+/// resuming all of them would have them compete for the same upstream
+/// bandwidth, which is the exact problem the idle reaper exists to prevent.
+const MAX_WARM_ON_BROWSE: usize = 3;
 
 use crate::config::AppConfig;
 use resolver::{
@@ -121,6 +134,60 @@ impl AdvertisedHashes {
     }
 }
 
+/// Marks a torrent as "being read right now", for exactly as long as the HTTP
+/// response body that owns it is alive.
+///
+/// The idle reaper must never pause a torrent that has a live reader.
+/// librqbit's reader parks on `Poll::Pending` waiting for one specific piece
+/// and is only ever woken by *that piece completing*; pausing does not wake
+/// it, and there is no timeout. So pausing under a live reader freezes it
+/// permanently -- the video stops dead and only a fresh HTTP request (what a
+/// viewer does by hand when they skip forward) recovers it.
+///
+/// Request recency cannot stand in for this. A player fills its buffer, then
+/// reads nothing for minutes while it plays what it already holds, which is
+/// indistinguishable from an abandoned torrent by that measure.
+pub struct StreamGuard {
+    engine: Arc<TorrentEngine>,
+    info_hash: String,
+}
+
+impl Drop for StreamGuard {
+    fn drop(&mut self) {
+        self.engine.open_streams().release(&self.info_hash);
+    }
+}
+
+/// How many response bodies are reading each torrent right now.
+///
+/// Reference-counted rather than a flag because one player legitimately holds
+/// several reads at once -- a container header, an index at the end of the
+/// file, and the playback position -- and the torrent must stay protected
+/// until the last of them is done, not the first.
+#[derive(Default)]
+struct OpenStreamCounts(HashMap<String, usize>);
+
+impl OpenStreamCounts {
+    fn acquire(&mut self, info_hash: &str) {
+        *self.0.entry(info_hash.to_string()).or_insert(0) += 1;
+    }
+
+    fn release(&mut self, info_hash: &str) {
+        if let Some(count) = self.0.get_mut(info_hash) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                // Removed rather than left at zero so the map tracks live
+                // readers only, and cannot grow for the life of the process.
+                self.0.remove(info_hash);
+            }
+        }
+    }
+
+    fn is_open(&self, info_hash: &str) -> bool {
+        self.0.get(info_hash).is_some_and(|count| *count > 0)
+    }
+}
+
 pub struct TorrentEngine {
     api: Api,
     /// How an identifier turns into a magnet link. Only `MagnetSource` today;
@@ -130,8 +197,13 @@ pub struct TorrentEngine {
     max_concurrent: Semaphore,
     active_streams: Mutex<HashMap<String, StreamActivity>>,
     advertised: Mutex<AdvertisedHashes>,
+    /// Which torrents have a response body reading them right now. A plain
+    /// `std` mutex because `StreamGuard::drop` cannot await, and every
+    /// critical section here is a single map lookup.
+    open_streams: StdMutex<OpenStreamCounts>,
     prebuffer_bytes: usize,
     prebuffer_timeout: Duration,
+    stall_timeout: Duration,
 }
 
 impl TorrentEngine {
@@ -170,8 +242,10 @@ impl TorrentEngine {
             max_concurrent: Semaphore::new(config.max_concurrent_torrents.max(1)),
             active_streams: Mutex::new(HashMap::new()),
             advertised: Mutex::new(AdvertisedHashes::new(ADVERTISED_HASH_CAPACITY)),
+            open_streams: StdMutex::new(OpenStreamCounts::default()),
             prebuffer_bytes: config.prebuffer_bytes,
             prebuffer_timeout: Duration::from_secs(config.prebuffer_timeout_secs),
+            stall_timeout: Duration::from_secs(config.stall_timeout_secs),
         }))
     }
 
@@ -371,6 +445,130 @@ impl TorrentEngine {
         self.prebuffer_timeout
     }
 
+    pub fn stall_timeout(&self) -> Duration {
+        self.stall_timeout
+    }
+
+    /// A lock poisoned by a panic elsewhere still holds a perfectly usable
+    /// map -- refusing to serve video over it would be a worse outcome than
+    /// the inconsistency it guards against.
+    fn open_streams(&self) -> std::sync::MutexGuard<'_, OpenStreamCounts> {
+        self.open_streams
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Registers a live reader on `info_hash`. Hold the returned guard for as
+    /// long as the response body exists. See `StreamGuard`.
+    pub fn open_stream_guard(self: &Arc<Self>, info_hash: &str) -> StreamGuard {
+        self.open_streams().acquire(info_hash);
+        StreamGuard {
+            engine: Arc::clone(self),
+            info_hash: info_hash.to_string(),
+        }
+    }
+
+    /// Whether any response body is currently reading this torrent.
+    pub fn has_open_stream(&self, info_hash: &str) -> bool {
+        self.open_streams().is_open(info_hash)
+    }
+
+    /// Length of one file inside a torrent, without opening a read stream.
+    pub fn file_length(&self, info_hash: &str, file_idx: usize) -> Result<u64> {
+        let idx = TorrentIdOrHash::parse(info_hash)
+            .map_err(|e| anyhow::anyhow!("invalid info hash {info_hash}: {e}"))?;
+        let details = self
+            .api
+            .api_torrent_details(idx)
+            .map_err(|e| anyhow::anyhow!("torrent details unavailable: {e}"))?;
+        details
+            .files
+            .unwrap_or_default()
+            .get(file_idx)
+            .map(|f| f.length)
+            .context("fileIdx out of range for this torrent")
+    }
+
+    /// Opens a fresh read stream positioned at `pos`, resuming the torrent
+    /// first if the reaper paused it.
+    ///
+    /// Opening a stream is also the only thing that makes librqbit look for
+    /// peers holding this particular file, and the only thing that puts the
+    /// new read position into its piece-priority set. That makes re-opening
+    /// the correct response to a stream that has stopped producing bytes:
+    /// it is not merely a retry, it actively re-drives peer discovery and
+    /// re-points the download at where the viewer actually is.
+    pub async fn open_stream_at(
+        &self,
+        info_hash: &str,
+        file_idx: usize,
+        pos: u64,
+    ) -> Result<BoxedReader> {
+        let idx = TorrentIdOrHash::parse(info_hash)
+            .map_err(|e| anyhow::anyhow!("invalid info hash {info_hash}: {e}"))?;
+
+        if !self.ensure_started(info_hash, file_idx).await? {
+            anyhow::bail!("torrent {info_hash} is no longer startable");
+        }
+
+        let mut stream = self
+            .api
+            .api_stream(idx, file_idx)
+            .await
+            .map_err(|e| anyhow::anyhow!("could not open torrent stream: {e}"))?;
+
+        if pos > 0 {
+            stream
+                .seek(SeekFrom::Start(pos))
+                .await
+                .with_context(|| format!("seeking to byte {pos}"))?;
+        }
+
+        Ok(Box::new(stream))
+    }
+
+    /// Resumes torrents we already have partial data for, so they are already
+    /// connected to peers by the time the viewer picks one.
+    ///
+    /// Called when Stremio lists the streams for a title. Resuming a paused
+    /// torrent drops it back to zero peers and it must rediscover them over
+    /// DHT/trackers, which is most of what "it took 30 seconds to start"
+    /// actually is. Doing that while the viewer is still reading the stream
+    /// list spends that time where nobody is waiting on it.
+    ///
+    /// Only touches torrents already in the session, so browsing never joins
+    /// a swarm on its own.
+    pub async fn warm_known_torrents(&self, info_hashes: &[String]) {
+        let mut warmed = 0usize;
+        for hash in info_hashes {
+            if warmed >= MAX_WARM_ON_BROWSE {
+                break;
+            }
+            let Ok(idx) = TorrentIdOrHash::parse(hash) else {
+                continue;
+            };
+            let Some(handle) = self.api.session().get(idx) else {
+                continue; // never played -- nothing to warm
+            };
+            if !handle.is_paused() {
+                continue;
+            }
+            let stats = handle.stats();
+            // Finished torrents need no peers, and ones with no data yet gain
+            // nothing from a head start they would only spend on metadata.
+            if stats.progress_bytes == 0 || stats.progress_bytes >= stats.total_bytes {
+                continue;
+            }
+            match self.api.api_torrent_action_start(idx).await {
+                Ok(_) => {
+                    debug!(info_hash = %hash, "pre-warming previously watched torrent");
+                    warmed += 1;
+                }
+                Err(e) => debug!(info_hash = %hash, "could not pre-warm: {e}"),
+            }
+        }
+    }
+
     pub async fn touch_stream(&self, info_hash: &str, client: IpAddr) {
         let mut guard = self.active_streams.lock().await;
         guard.insert(
@@ -503,7 +701,11 @@ impl TorrentEngine {
 
         let mut paused = 0;
         for (idx, hash) in candidates {
-            if self.is_recently_active(&hash, idle_after).await {
+            // Two independent checks, because request recency alone is not
+            // enough. A live reader is parked inside librqbit waiting for a
+            // piece and issues no HTTP requests at all; pausing it there
+            // freezes it permanently with no timeout. See `StreamGuard`.
+            if self.has_open_stream(&hash) || self.is_recently_active(&hash, idle_after).await {
                 continue;
             }
             match self.api.api_torrent_action_pause(idx).await {
@@ -559,6 +761,70 @@ mod tests {
         // Bookkeeping must stay consistent, or the set leaks past its cap.
         assert_eq!(set.order.len(), 2);
         assert_eq!(set.set.len(), 2);
+    }
+
+    #[test]
+    fn open_stream_counts_track_a_single_reader() {
+        let mut counts = OpenStreamCounts::default();
+        assert!(!counts.is_open("aaaa"));
+
+        counts.acquire("aaaa");
+        assert!(
+            counts.is_open("aaaa"),
+            "a live reader must protect its torrent"
+        );
+
+        counts.release("aaaa");
+        assert!(!counts.is_open("aaaa"));
+        assert!(counts.0.is_empty(), "released entries must not linger");
+    }
+
+    #[test]
+    fn open_stream_counts_protect_until_the_last_reader_finishes() {
+        // A player opens several reads at once (header, index, playback
+        // position). Releasing one must not expose the torrent to the reaper
+        // while the others are still going -- that is the freeze this whole
+        // mechanism exists to prevent.
+        let mut counts = OpenStreamCounts::default();
+        counts.acquire("aaaa");
+        counts.acquire("aaaa");
+        counts.acquire("aaaa");
+
+        counts.release("aaaa");
+        assert!(counts.is_open("aaaa"));
+        counts.release("aaaa");
+        assert!(counts.is_open("aaaa"));
+
+        counts.release("aaaa");
+        assert!(!counts.is_open("aaaa"));
+    }
+
+    #[test]
+    fn open_stream_counts_ignore_unbalanced_releases() {
+        // Must not underflow into a huge count, which would pin a torrent
+        // as "in use" forever and defeat both the reaper and the janitor.
+        let mut counts = OpenStreamCounts::default();
+        counts.release("never-acquired");
+        assert!(!counts.is_open("never-acquired"));
+
+        counts.acquire("aaaa");
+        counts.release("aaaa");
+        counts.release("aaaa");
+        assert!(!counts.is_open("aaaa"));
+    }
+
+    #[test]
+    fn open_stream_counts_keep_torrents_independent() {
+        let mut counts = OpenStreamCounts::default();
+        counts.acquire("aaaa");
+        counts.acquire("bbbb");
+        counts.release("aaaa");
+
+        assert!(!counts.is_open("aaaa"));
+        assert!(
+            counts.is_open("bbbb"),
+            "one torrent's reader must not release another's"
+        );
     }
 
     #[test]

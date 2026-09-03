@@ -22,6 +22,8 @@
 //! network. That is what makes the tunnel's bandwidth cap irrelevant and
 //! keeps playback at wifi speed instead of upload speed.
 
+use std::sync::Arc;
+
 use axum::extract::{Path, State};
 use axum::Json;
 use serde_json::{json, Value};
@@ -219,6 +221,16 @@ async fn indexed_streams(
     for torrent in &found {
         state.engine.remember_advertised(&torrent.info_hash).await;
     }
+
+    // Reaching this list is the earliest reliable sign that someone is about
+    // to play one of these. Waking the ones already half-downloaded now means
+    // their peer connections are re-established while the viewer is still
+    // reading the list, instead of after they press play -- rediscovering
+    // peers is most of what a slow start actually is. Detached because the
+    // stream list must not wait on it.
+    let hashes: Vec<String> = found.iter().map(|t| t.info_hash.clone()).collect();
+    let engine = Arc::clone(&state.engine);
+    tokio::spawn(async move { engine.warm_known_torrents(&hashes).await });
 
     found
         .iter()

@@ -104,13 +104,34 @@ pub struct AppConfig {
     #[arg(long, env = "PREBUFFER_TIMEOUT_SECS", default_value_t = 15)]
     pub prebuffer_timeout_secs: u64,
 
-    /// Pause a torrent after this many seconds with no playback request.
+    /// How long a video response may produce no bytes at all before the
+    /// gateway re-opens its read stream underneath the player.
+    ///
+    /// A torrent read that is waiting on a piece has no timeout of its own and
+    /// nothing wakes it if the swarm goes quiet, so without this a stalled
+    /// stream stays stalled forever and the picture simply freezes. Re-opening
+    /// restarts peer discovery for the file and re-points the download at the
+    /// current playback position -- the same recovery a viewer triggers by
+    /// hand when they skip forward, done automatically and invisibly.
+    ///
+    /// Must stay comfortably above the time to fetch one piece (4-16 MB) or
+    /// healthy slow downloads get re-opened needlessly. Set to 0 to disable.
+    #[arg(long, env = "STALL_TIMEOUT_SECS", default_value_t = 20)]
+    pub stall_timeout_secs: u64,
+
+    /// Pause a torrent after this many seconds with nobody watching it.
     ///
     /// Every running torrent competes for the same upstream bandwidth, so an
-    /// abandoned 4K release starves the one you are actually watching. Paused
-    /// torrents keep their data and resume instantly when played again.
-    /// Set to 0 to never pause.
-    #[arg(long, env = "IDLE_PAUSE_SECS", default_value_t = 120)]
+    /// abandoned 4K release starves the one you are actually watching. A
+    /// torrent with a live reader is never paused regardless of this value.
+    ///
+    /// Pausing is not free: it drops every peer connection, and they have to
+    /// be rediscovered over DHT/trackers next time, which is most of the wait
+    /// when a title is slow to start. So this errs on the patient side --
+    /// reclaiming bandwidth from something genuinely abandoned is worth a few
+    /// minutes, but paying the peer-rediscovery cost on a title someone
+    /// stepped away from briefly is not. Set to 0 to never pause.
+    #[arg(long, env = "IDLE_PAUSE_SECS", default_value_t = 300)]
     pub idle_pause_secs: u64,
 
     /// How often (seconds) to look for idle torrents to pause.

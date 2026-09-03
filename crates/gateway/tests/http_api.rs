@@ -57,6 +57,9 @@ async fn test_state() -> AppState {
         // that can never arrive would just add the timeout to every case.
         prebuffer_bytes: 0,
         prebuffer_timeout_secs: 1,
+        // Stall recovery off: with no swarm every read stalls by definition,
+        // so leaving it on would just re-open streams in a loop.
+        stall_timeout_secs: 0,
     };
 
     let engine = TorrentEngine::new(&config).await.expect("engine starts");

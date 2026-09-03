@@ -4,22 +4,21 @@
 //! (see `TorrentEngine::api`); this module owns the public URL surface,
 //! input validation, and translating byte ranges into HTTP status/headers.
 
-use std::io::SeekFrom;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use axum::body::Body;
+use axum::body::{Body, Bytes};
 use axum::extract::{ConnectInfo, Path, Query, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Redirect, Response};
 use librqbit::api::TorrentIdOrHash;
 use serde::Deserialize;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt};
-use tracing::debug;
+use tokio::io::{AsyncRead, AsyncReadExt};
+use tracing::{debug, warn};
 
 use crate::error::ApiErrorResponse;
-use crate::torrent::TorrentEngine;
+use crate::torrent::{BoxedReader, StreamGuard, TorrentEngine};
 
 /// Bytes the pre-buffer will actually *wait* for. Everything above this is
 /// only taken if it is already downloaded -- see `prebuffer`. Deliberately
@@ -30,6 +29,19 @@ const PREBUFFER_MIN_BYTES: usize = 512 * 1024;
 /// How long "is more data already available?" is allowed to take before the
 /// pre-buffer stops topping up and sends what it has.
 const READY_DATA_POLL: Duration = Duration::from_millis(50);
+
+/// Size of each chunk handed to the HTTP layer while streaming.
+const STREAM_CHUNK_BYTES: usize = 64 * 1024;
+
+/// How many times in a row a stalled stream may be re-opened before the body
+/// gives up. Past this the swarm is genuinely dead, and ending the response
+/// lets the player surface a real error instead of spinning forever.
+const MAX_CONSECUTIVE_REOPENS: u32 = 5;
+
+/// How often a long-running response refreshes its "still being watched"
+/// timestamp, so the cache janitor's own grace period stays accurate during
+/// playback that issues no further HTTP requests.
+const TOUCH_INTERVAL: Duration = Duration::from_secs(20);
 
 #[derive(Deserialize)]
 pub struct PlayQuery {
@@ -128,13 +140,9 @@ pub async fn stream_video(
         ));
     }
 
-    let mut file_stream = engine
-        .api()
-        .api_stream(idx, file_idx)
-        .await
-        .map_err(|e| ApiErrorResponse::not_found(format!("stream unavailable: {e}")))?;
-
-    let file_len = file_stream.len();
+    let file_len = engine
+        .file_length(&info_hash, file_idx)
+        .map_err(|e| ApiErrorResponse::not_found(format!("stream unavailable: {e:#}")))?;
 
     let mut status = StatusCode::OK;
     let mut resp_headers = HeaderMap::new();
@@ -148,45 +156,182 @@ pub async fn stream_video(
         .and_then(|v| v.to_str().ok())
         .and_then(parse_range_header);
 
-    let boxed: Box<dyn AsyncRead + Send + Unpin> = if let Some((start, end)) = range {
-        if start >= file_len || end.is_some_and(|e| e <= start || e > file_len) {
-            return Err(ApiErrorResponse::range_not_satisfiable(format!(
-                "range {start}-{end:?} outside file of length {file_len}"
-            )));
+    let (start, end) = match range {
+        Some((start, end)) => {
+            if start >= file_len || end.is_some_and(|e| e <= start || e > file_len) {
+                return Err(ApiErrorResponse::range_not_satisfiable(format!(
+                    "range {start}-{end:?} outside file of length {file_len}"
+                )));
+            }
+            let end = end.unwrap_or(file_len);
+            status = StatusCode::PARTIAL_CONTENT;
+            resp_headers.insert(
+                header::CONTENT_RANGE,
+                HeaderValue::from_str(&format!(
+                    "bytes {start}-{}/{file_len}",
+                    end.saturating_sub(1)
+                ))
+                .expect("ascii digits only"),
+            );
+            (start, end)
         }
-        status = StatusCode::PARTIAL_CONTENT;
-        let end = end.unwrap_or(file_len);
-
-        file_stream
-            .seek(SeekFrom::Start(start))
-            .await
-            .map_err(|e| ApiErrorResponse::internal(format!("seek failed: {e}")))?;
-
-        let to_take = end - start;
-        insert_len_header(&mut resp_headers, to_take);
-        resp_headers.insert(
-            header::CONTENT_RANGE,
-            HeaderValue::from_str(&format!(
-                "bytes {start}-{}/{file_len}",
-                end.saturating_sub(1)
-            ))
-            .expect("ascii digits only"),
-        );
-        Box::new(file_stream.take(to_take))
-    } else {
-        insert_len_header(&mut resp_headers, file_len);
-        Box::new(file_stream)
+        None => (0, file_len),
     };
 
-    // Hold the response until some real data is in hand -- see `prebuffer`.
-    let boxed = prebuffer(boxed, engine.prebuffer_bytes(), engine.prebuffer_timeout()).await;
+    insert_len_header(&mut resp_headers, end - start);
 
-    let byte_stream = tokio_util::io::ReaderStream::with_capacity(boxed, 64 * 1024);
-    Ok((status, resp_headers, Body::from_stream(byte_stream)).into_response())
+    let reader = engine
+        .open_stream_at(&info_hash, file_idx, start)
+        .await
+        .map_err(|e| ApiErrorResponse::not_found(format!("stream unavailable: {e:#}")))?;
+
+    // Held for the entire response body: this is what keeps the idle reaper
+    // from pausing the torrent out from under a viewer. See `StreamGuard`.
+    let guard = engine.open_stream_guard(&info_hash);
+
+    // Hold the response until some real data is in hand -- see `prebuffer`.
+    let wanted = usize::try_from(end - start).unwrap_or(usize::MAX);
+    let (head, reader) = prebuffer(
+        reader,
+        engine.prebuffer_bytes().min(wanted),
+        engine.prebuffer_timeout(),
+    )
+    .await;
+
+    let body = healing_body(BodyContext {
+        position: start + head.len() as u64,
+        end,
+        engine: Arc::clone(&engine),
+        info_hash,
+        file_idx,
+        client: addr.ip(),
+        head,
+        reader,
+        guard,
+    });
+
+    Ok((status, resp_headers, body).into_response())
 }
 
-/// Reads up to `max_bytes` from `reader` before the response is sent, then
-/// returns a reader that replays those bytes followed by the rest.
+/// Everything the streaming body needs to keep going, and to rebuild its own
+/// reader if the torrent stops feeding it.
+struct BodyContext {
+    engine: Arc<TorrentEngine>,
+    info_hash: String,
+    file_idx: usize,
+    client: IpAddr,
+    /// Absolute file offset of the next byte to send.
+    position: u64,
+    /// Absolute file offset one past the last byte to send.
+    end: u64,
+    /// Already-read bytes from the pre-buffer, sent before anything else.
+    head: Vec<u8>,
+    reader: BoxedReader,
+    guard: StreamGuard,
+}
+
+/// Builds the response body, re-opening the underlying torrent read whenever
+/// it stops producing bytes.
+///
+/// A torrent read parks waiting for one specific piece, is woken only by that
+/// piece arriving, and has no timeout -- so if the swarm goes quiet, or the
+/// torrent is paused, or its internal stream registry is replaced (which
+/// happens on resume), the read hangs forever and playback freezes with no
+/// error anywhere. Re-opening is the cure rather than merely a retry: it
+/// re-runs peer discovery for this file and re-registers the current playback
+/// position in the piece-priority set. It is the same recovery a viewer
+/// performs by hand when they skip forward to unstick a frozen video, done
+/// automatically and without interrupting the response.
+fn healing_body(ctx: BodyContext) -> Body {
+    let BodyContext {
+        engine,
+        info_hash,
+        file_idx,
+        client,
+        mut position,
+        end,
+        head,
+        mut reader,
+        guard,
+    } = ctx;
+
+    let stall_timeout = engine.stall_timeout();
+
+    Body::from_stream(async_stream::stream! {
+        // Moved in so it lives exactly as long as the body: dropping the
+        // response releases the torrent back to the idle reaper.
+        let _guard = guard;
+        let mut stalls = 0u32;
+        let mut last_touch = Instant::now();
+
+        if !head.is_empty() {
+            yield Ok::<Bytes, std::io::Error>(Bytes::from(head));
+        }
+
+        let mut chunk = vec![0u8; STREAM_CHUNK_BYTES];
+        while position < end {
+            let want = usize::try_from(end - position)
+                .unwrap_or(usize::MAX)
+                .min(chunk.len());
+
+            // `Ok(None)` means "produced nothing in time", which is the
+            // signal to rebuild the reader rather than an error.
+            let outcome = if stall_timeout.is_zero() {
+                reader.read(&mut chunk[..want]).await.map(Some)
+            } else {
+                match tokio::time::timeout(stall_timeout, reader.read(&mut chunk[..want])).await {
+                    Ok(result) => result.map(Some),
+                    Err(_) => Ok(None),
+                }
+            };
+
+            match outcome {
+                Ok(Some(0)) => break, // end of file
+                Ok(Some(n)) => {
+                    position += n as u64;
+                    stalls = 0;
+                    if last_touch.elapsed() >= TOUCH_INTERVAL {
+                        engine.touch_stream(&info_hash, client).await;
+                        last_touch = Instant::now();
+                    }
+                    yield Ok(Bytes::copy_from_slice(&chunk[..n]));
+                }
+                Ok(None) => {
+                    stalls += 1;
+                    if stalls > MAX_CONSECUTIVE_REOPENS {
+                        warn!(
+                            %info_hash, position,
+                            "stream stalled and did not recover after {MAX_CONSECUTIVE_REOPENS} \
+                             re-opens; ending the response so the player can retry"
+                        );
+                        break;
+                    }
+                    warn!(
+                        %info_hash, position, attempt = stalls,
+                        "no data for {}s; re-opening the torrent stream",
+                        stall_timeout.as_secs()
+                    );
+                    engine.touch_stream(&info_hash, client).await;
+                    last_touch = Instant::now();
+                    match engine.open_stream_at(&info_hash, file_idx, position).await {
+                        Ok(fresh) => reader = fresh,
+                        Err(e) => {
+                            warn!(%info_hash, "could not re-open stalled stream: {e:#}");
+                            break;
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!(%info_hash, position, "torrent read failed: {e}");
+                    break;
+                }
+            }
+        }
+    })
+}
+
+/// Reads up to `max_bytes` from `reader` before the response is sent, and
+/// returns those bytes alongside the reader for the remainder.
 ///
 /// This exists because of how players react to a *cold* torrent. Serving
 /// headers immediately and letting the body trickle looks like a broken
@@ -198,13 +343,17 @@ pub async fn stream_video(
 /// this read completes at memory speed -- so the wait only ever happens when
 /// there genuinely is nothing to send yet. A timeout bounds the worst case:
 /// on expiry the response goes out with whatever arrived rather than hanging.
+///
+/// The consumed bytes are returned rather than chained back onto the reader
+/// because the body has to know the exact file offset it has reached, so it
+/// can re-open at that offset if the stream stalls.
 async fn prebuffer(
-    mut reader: Box<dyn AsyncRead + Send + Unpin>,
+    mut reader: BoxedReader,
     max_bytes: usize,
     timeout: Duration,
-) -> Box<dyn AsyncRead + Send + Unpin> {
+) -> (Vec<u8>, BoxedReader) {
     if max_bytes == 0 {
-        return reader;
+        return (Vec::new(), reader);
     }
 
     let min_bytes = PREBUFFER_MIN_BYTES.min(max_bytes);
@@ -233,9 +382,7 @@ async fn prebuffer(
         let _ = tokio::time::timeout(READY_DATA_POLL, fill(&mut reader, &mut buf, max_bytes)).await;
     }
 
-    // Cursor replays the bytes we consumed, then hands over to the live
-    // stream -- the client sees one continuous body either way.
-    Box::new(std::io::Cursor::new(buf).chain(reader))
+    (buf, reader)
 }
 
 /// Reads until `buf` holds `target` bytes or the stream ends. A read error is
@@ -349,11 +496,13 @@ mod tests {
     async fn prebuffer_returns_all_requested_bytes_when_data_is_available() {
         let data = vec![7u8; 8192];
         let reader = Box::new(std::io::Cursor::new(data.clone()));
-        let mut out = prebuffer(reader, 4096, Duration::from_secs(5)).await;
+        let (head, mut rest) = prebuffer(reader, 4096, Duration::from_secs(5)).await;
 
-        // Every byte must survive the buffer/replay round trip, in order.
-        let mut got = Vec::new();
-        out.read_to_end(&mut got).await.unwrap();
+        // Every byte must survive the split, in order: the body sends `head`
+        // first and then continues from `rest`.
+        assert_eq!(head.len(), 4096, "should have taken the full pre-buffer");
+        let mut got = head;
+        rest.read_to_end(&mut got).await.unwrap();
         assert_eq!(got, data, "pre-buffering must not drop or reorder bytes");
     }
 
@@ -366,24 +515,44 @@ mod tests {
             sent: false,
         });
         let started = std::time::Instant::now();
-        let mut out = prebuffer(reader, 4 * 1024 * 1024, Duration::from_millis(200)).await;
+        let (head, _rest) = prebuffer(reader, 4 * 1024 * 1024, Duration::from_millis(200)).await;
 
         assert!(
             started.elapsed() < Duration::from_secs(2),
             "must return promptly on timeout, not block"
         );
-
-        let mut got = vec![0u8; 512];
-        out.read_exact(&mut got).await.unwrap();
-        assert_eq!(got, vec![1u8; 512], "partial data must still be served");
+        assert_eq!(head, vec![1u8; 512], "partial data must still be served");
     }
 
     #[tokio::test]
-    async fn prebuffer_disabled_passes_the_reader_through_untouched() {
+    async fn prebuffer_disabled_takes_nothing_and_hands_the_reader_back() {
         let reader = Box::new(std::io::Cursor::new(vec![9u8; 100]));
-        let mut out = prebuffer(reader, 0, Duration::from_secs(5)).await;
+        let (head, mut rest) = prebuffer(reader, 0, Duration::from_secs(5)).await;
+        assert!(
+            head.is_empty(),
+            "disabled pre-buffer must not consume bytes"
+        );
+
         let mut got = Vec::new();
-        out.read_to_end(&mut got).await.unwrap();
+        rest.read_to_end(&mut got).await.unwrap();
         assert_eq!(got, vec![9u8; 100]);
+    }
+
+    /// The offset the body will re-open at is `range start + prebuffered
+    /// bytes`. If that arithmetic is wrong the stream silently resumes at the
+    /// wrong place after a stall, which corrupts playback rather than fixing
+    /// it -- so pin the exact relationship the handler relies on.
+    #[tokio::test]
+    async fn prebuffered_length_is_the_offset_the_body_resumes_from() {
+        let range_start = 1_000_000u64;
+        let reader = Box::new(std::io::Cursor::new(vec![3u8; 8192]));
+        let (head, _rest) = prebuffer(reader, 2048, Duration::from_secs(5)).await;
+
+        assert_eq!(head.len(), 2048);
+        assert_eq!(
+            range_start + head.len() as u64,
+            1_002_048,
+            "body must resume exactly where the pre-buffer stopped"
+        );
     }
 }

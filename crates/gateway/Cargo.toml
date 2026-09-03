@@ -1,6 +1,6 @@
 [package]
 name = "streaming-gateway"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Local high-performance Stremio streaming gateway (torrent engine + HTTP range streaming server)"
 license = "MIT"
@@ -35,6 +35,11 @@ local-ip-address = "0.6"
 clap = { version = "4", features = ["derive", "env"] }
 sysinfo = "0.33"
 tokio-util = { version = "0.7", features = ["io"] }
+# Lets the video response body be written as ordinary async code. The body has
+# to recover from a stalled torrent read mid-stream (re-opening the underlying
+# stream without the player noticing), which is painful to express as a
+# hand-written `Stream`/`AsyncRead` state machine.
+async-stream = "0.3"
 urlencoding = "2"
 # Used only to query the torrent index over HTTPS. `rustls` here resolves to
 # the same aws-lc-rs provider librqbit already pulls in, so this adds no second
