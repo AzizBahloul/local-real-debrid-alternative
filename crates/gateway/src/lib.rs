@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::FromRef;
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::Router;
 use tower_http::cors::CorsLayer;
 use tower_http::limit::RequestBodyLimitLayer;
@@ -75,6 +75,8 @@ pub fn build_router(state: AppState) -> Router {
             get(streaming::stream_video),
         )
         .route("/health", get(monitoring::health))
+        // Loopback-only; see the handler. The desktop app's "clear" button.
+        .route("/cache/clear", post(monitoring::clear_cache))
         .layer(TraceLayer::new_for_http())
         // Required by the Stremio addon protocol ("all routes must serve
         // CORS headers permitting all origins"); also what lets a phone's

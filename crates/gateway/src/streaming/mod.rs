@@ -189,6 +189,11 @@ pub async fn stream_video(
     // from pausing the torrent out from under a viewer. See `StreamGuard`.
     let guard = engine.open_stream_guard(&info_hash);
 
+    // Starting a different title pauses the previous one immediately, rather
+    // than leaving it to compete for the line until the idle reaper gets to
+    // it minutes later. No-op when this is the same torrent (a seek).
+    engine.focus_stream(&info_hash);
+
     // Hold the response until some real data is in hand -- see `prebuffer`.
     let wanted = usize::try_from(end - start).unwrap_or(usize::MAX);
     let (head, reader) = prebuffer(

@@ -2,9 +2,11 @@
 //! (for a human watching the gateway run), both reading from the same
 //! `TorrentEngine`/`CacheManager` state so the two views never disagree.
 
+use std::net::SocketAddr;
 use std::time::Duration;
 
-use axum::extract::State;
+use axum::extract::{ConnectInfo, State};
+use axum::http::StatusCode;
 use axum::Json;
 use serde::Serialize;
 use sysinfo::{Pid, ProcessesToUpdate, System};
@@ -42,6 +44,30 @@ pub async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
         process_memory_bytes,
         process_cpu_percent,
     })
+}
+
+#[derive(Serialize)]
+pub struct ClearResponse {
+    deleted: usize,
+}
+
+/// `POST /cache/clear` — delete every torrent and all of its data.
+///
+/// **Loopback only.** Every other route here is deliberately reachable from
+/// the whole LAN, because that is the product: a phone streams from the PC.
+/// This one destroys data, and the gateway has no authentication of any kind,
+/// so exposing it to the WiFi would let any device on the network wipe the
+/// cache. The desktop app runs on this machine and calls it over 127.0.0.1;
+/// anything else has no business asking.
+pub async fn clear_cache(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+) -> Result<Json<ClearResponse>, StatusCode> {
+    if !addr.ip().is_loopback() {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let deleted = state.engine.discard_everything().await;
+    Ok(Json(ClearResponse { deleted }))
 }
 
 fn self_process_usage() -> (u64, f32) {

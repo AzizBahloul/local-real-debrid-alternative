@@ -14,6 +14,7 @@ pub mod resolver;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::SeekFrom;
 use std::net::IpAddr;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
@@ -116,6 +117,19 @@ impl AdvertisedHashes {
         }
     }
 
+    /// Rebuilds the set from what was on disk, newest last, honouring the cap.
+    fn seed(cap: usize, hashes: Vec<String>) -> Self {
+        let mut set = Self::new(cap);
+        for hash in hashes {
+            set.remember(hash);
+        }
+        set
+    }
+
+    fn snapshot(&self) -> Vec<String> {
+        self.order.iter().cloned().collect()
+    }
+
     fn remember(&mut self, hash: String) {
         if self.set.contains(&hash) {
             return;
@@ -197,13 +211,62 @@ pub struct TorrentEngine {
     max_concurrent: Semaphore,
     active_streams: Mutex<HashMap<String, StreamActivity>>,
     advertised: Mutex<AdvertisedHashes>,
+    /// Where the advertised set is kept between runs.
+    advertised_path: PathBuf,
     /// Which torrents have a response body reading them right now. A plain
     /// `std` mutex because `StreamGuard::drop` cannot await, and every
     /// critical section here is a single map lookup.
     open_streams: StdMutex<OpenStreamCounts>,
+    /// The torrent the viewer is watching *now*.
+    ///
+    /// Every other unfinished torrent is paused the moment this changes, so
+    /// the whole line goes to the thing on screen. Without it the previous
+    /// title kept downloading until the idle reaper noticed, which is up to
+    /// `idle_pause_secs` (five minutes) of a finished-with title competing
+    /// with the one that just started.
+    focused: StdMutex<Option<String>>,
     prebuffer_bytes: usize,
     prebuffer_timeout: Duration,
     stall_timeout: Duration,
+}
+
+/// What to do with a torrent that is not the one being watched.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub(crate) enum UnfocusedAction {
+    /// Leave it exactly as it is.
+    Leave,
+    /// Stop downloading and delete the partial file.
+    Discard,
+}
+
+/// What should happen to the title the viewer just switched away from.
+///
+/// Starting a different title means that one has been abandoned — nobody
+/// changes episode intending to come back to a half-downloaded file — so its
+/// partial data is dead weight in a cache that sits permanently at its cap.
+/// It is deleted rather than paused, which is the only thing here that
+/// actually frees space.
+///
+/// This applies to *the previous focus only*, never to the whole session. An
+/// earlier version swept every unfinished torrent on each switch, which wiped
+/// eight queued titles the first time anything was played — the viewer's
+/// backlog is not the same thing as the title they just left.
+///
+/// Two exemptions, and they are not stylistic:
+///
+/// * an **open stream** means some response body is still reading those bytes
+///   (a second device, or this player's own header/index reads). Deleting
+///   underneath it truncates a video someone is watching — see `StreamGuard`.
+/// * a **finished** torrent is a complete file. It costs no download
+///   bandwidth, and throwing away a fully-downloaded movie because the viewer
+///   started the next episode is destructive in a way nobody asks for. The
+///   cache janitor already reclaims those, oldest-first, once the cap forces
+///   it.
+fn action_for_abandoned(has_open_stream: bool, finished: bool) -> UnfocusedAction {
+    if has_open_stream || finished {
+        return UnfocusedAction::Leave;
+    }
+    UnfocusedAction::Discard
 }
 
 impl TorrentEngine {
@@ -236,13 +299,27 @@ impl TorrentEngine {
 
         let api = Api::new(session, None);
 
+        let advertised_path = config.session_state_dir().join("advertised.json");
+        let remembered_advertised = Self::load_advertised(&advertised_path).await;
+        if !remembered_advertised.is_empty() {
+            info!(
+                count = remembered_advertised.len(),
+                "restored advertised info hashes, so links already in a client keep working"
+            );
+        }
+
         Ok(Arc::new(Self {
             api,
             source: Box::new(MagnetSource),
             max_concurrent: Semaphore::new(config.max_concurrent_torrents.max(1)),
             active_streams: Mutex::new(HashMap::new()),
-            advertised: Mutex::new(AdvertisedHashes::new(ADVERTISED_HASH_CAPACITY)),
+            advertised: Mutex::new(AdvertisedHashes::seed(
+                ADVERTISED_HASH_CAPACITY,
+                remembered_advertised,
+            )),
+            advertised_path,
             open_streams: StdMutex::new(OpenStreamCounts::default()),
+            focused: StdMutex::new(None),
             prebuffer_bytes: config.prebuffer_bytes,
             prebuffer_timeout: Duration::from_secs(config.prebuffer_timeout_secs),
             stall_timeout: Duration::from_secs(config.stall_timeout_secs),
@@ -389,11 +466,48 @@ impl TorrentEngine {
 
     /// Records that we handed this info hash to a client, making it eligible
     /// for lazy start via `ensure_started`.
+    ///
+    /// Persisted immediately. The set used to live only in memory, so every
+    /// restart invalidated every link already sitting in a Stremio client:
+    /// the phone kept requesting a perfectly good hash and kept getting
+    /// "this gateway has not offered that info hash", with no way to tell
+    /// that re-picking the stream would fix it.
     pub async fn remember_advertised(&self, info_hash: &str) {
-        self.advertised
-            .lock()
-            .await
-            .remember(info_hash.to_ascii_lowercase());
+        let snapshot = {
+            let mut advertised = self.advertised.lock().await;
+            advertised.remember(info_hash.to_ascii_lowercase());
+            advertised.snapshot()
+        };
+        self.save_advertised(snapshot).await;
+    }
+
+    /// Writes the advertised set out. Best effort: failing to persist costs a
+    /// re-pick after the next restart, which is not worth failing a request.
+    async fn save_advertised(&self, hashes: Vec<String>) {
+        let path = self.advertised_path.clone();
+        if let Some(parent) = path.parent() {
+            if let Err(e) = tokio::fs::create_dir_all(parent).await {
+                debug!("could not create state dir for advertised hashes: {e}");
+                return;
+            }
+        }
+        match serde_json::to_vec(&hashes) {
+            Ok(bytes) => {
+                if let Err(e) = tokio::fs::write(&path, bytes).await {
+                    debug!("could not persist advertised hashes: {e}");
+                }
+            }
+            Err(e) => debug!("could not encode advertised hashes: {e}"),
+        }
+    }
+
+    /// Reads the advertised set back, or an empty list if it is absent or
+    /// unreadable — a corrupt file must not stop the gateway from starting.
+    async fn load_advertised(path: &Path) -> Vec<String> {
+        let Ok(bytes) = tokio::fs::read(path).await else {
+            return Vec::new();
+        };
+        serde_json::from_slice::<Vec<String>>(&bytes).unwrap_or_default()
     }
 
     /// Whether `/videos/<hash>/...` is allowed to *start* this torrent.
@@ -471,6 +585,134 @@ impl TorrentEngine {
     /// Whether any response body is currently reading this torrent.
     pub fn has_open_stream(&self, info_hash: &str) -> bool {
         self.open_streams().is_open(info_hash)
+    }
+
+    /// Declares `info_hash` the thing being watched, discarding what was
+    /// being watched before it.
+    ///
+    /// Called on every stream open, but only does work when the focus
+    /// actually moves — a seek re-opens the reader on the same torrent dozens
+    /// of times and must not re-sweep each time.
+    ///
+    /// The sweep runs detached: it makes one API call per torrent and the
+    /// viewer's first byte should not wait on any of them.
+    pub fn focus_stream(self: &Arc<Self>, info_hash: &str) {
+        let previous = {
+            let mut focused = self
+                .focused
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if focused.as_deref() == Some(info_hash) {
+                return;
+            }
+            focused.replace(info_hash.to_string())
+        };
+
+        // Nothing was playing before, so nothing has been abandoned. This is
+        // what keeps the first play of a session from touching the backlog.
+        let Some(previous) = previous else {
+            return;
+        };
+
+        let engine = Arc::clone(self);
+        let focus = info_hash.to_string();
+        tokio::spawn(async move {
+            if engine.discard_abandoned(&previous).await {
+                info!(
+                    focused = %focus,
+                    abandoned = %previous,
+                    "switched title: dropped the one left behind and freed its partial data"
+                );
+            }
+        });
+    }
+
+    /// Deletes the abandoned torrent and its partial data. Returns whether it
+    /// actually went.
+    ///
+    /// Uses librqbit's delete (torrent *and* files) rather than forget: a
+    /// forgotten torrent leaves its partial file on disk with nothing
+    /// tracking it, which is exactly the orphaned bulk the cache cap is
+    /// already fighting.
+    pub async fn discard_abandoned(&self, info_hash: &str) -> bool {
+        let matches: Vec<(TorrentIdOrHash, bool)> = self.api.session().with_torrents(|iter| {
+            iter.filter_map(|(_, handle)| {
+                if handle.info_hash().as_string() != info_hash {
+                    return None;
+                }
+                let stats = handle.stats();
+                let finished = stats.total_bytes > 0 && stats.progress_bytes >= stats.total_bytes;
+                Some((handle.info_hash().into(), finished))
+            })
+            .collect()
+        });
+
+        let Some((idx, finished)) = matches.into_iter().next() else {
+            return false;
+        };
+        if action_for_abandoned(self.has_open_stream(info_hash), finished)
+            != UnfocusedAction::Discard
+        {
+            return false;
+        }
+
+        match self.api.api_torrent_action_delete(idx).await {
+            Ok(_) => {
+                info!(info_hash = %info_hash, "discarded abandoned torrent and its partial data");
+                self.forget_activity(info_hash).await;
+                true
+            }
+            // Racing a state change here is normal and harmless.
+            Err(e) => {
+                debug!(info_hash = %info_hash, "could not discard abandoned torrent: {e}");
+                false
+            }
+        }
+    }
+
+    /// Deletes every torrent and all of its data. Returns how many went.
+    ///
+    /// Unlike the automatic paths this spares nothing — not a finished
+    /// download, not one being streamed right now. It only ever runs from an
+    /// explicit "clear everything" click, where second-guessing the operator
+    /// would be the surprising behaviour. A stream in flight dies with it,
+    /// which is the honest consequence of wiping the file underneath it.
+    pub async fn discard_everything(&self) -> usize {
+        let all: Vec<(TorrentIdOrHash, String)> = self.api.session().with_torrents(|iter| {
+            iter.map(|(_, handle)| {
+                let hash = handle.info_hash().as_string();
+                (handle.info_hash().into(), hash)
+            })
+            .collect()
+        });
+
+        let mut deleted = 0;
+        for (idx, hash) in all {
+            match self.api.api_torrent_action_delete(idx).await {
+                Ok(_) => {
+                    self.forget_activity(&hash).await;
+                    deleted += 1;
+                }
+                Err(e) => warn!(info_hash = %hash, "could not delete torrent: {e}"),
+            }
+        }
+
+        // Nothing is playing any more, so the next stream is a first play and
+        // must not be treated as a switch away from a torrent that is gone.
+        *self
+            .focused
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+
+        info!(deleted, "cleared every torrent and its data on request");
+        deleted
+    }
+
+    /// Drops the bookkeeping for a torrent that no longer exists, so a later
+    /// request for the same title starts clean instead of matching a stale
+    /// activity record.
+    async fn forget_activity(&self, info_hash: &str) {
+        self.active_streams.lock().await.remove(info_hash);
     }
 
     /// Length of one file inside a torrent, without opening a read stream.
@@ -777,6 +1019,31 @@ mod tests {
         counts.release("aaaa");
         assert!(!counts.is_open("aaaa"));
         assert!(counts.0.is_empty(), "released entries must not linger");
+    }
+
+    #[test]
+    fn switching_title_discards_the_one_the_viewer_left() {
+        // The whole point: starting a new episode abandons the old one, so
+        // its half-downloaded file is deleted rather than kept forever in a
+        // cache that is permanently at its cap.
+        assert_eq!(action_for_abandoned(false, false), UnfocusedAction::Discard);
+    }
+
+    #[test]
+    fn a_torrent_another_reader_still_holds_is_never_deleted() {
+        // A second device watching something else, or this player's own
+        // header/index reads. Deleting underneath a live reader truncates a
+        // video someone is watching -- see `StreamGuard`.
+        assert_eq!(action_for_abandoned(true, false), UnfocusedAction::Leave);
+    }
+
+    #[test]
+    fn a_finished_download_survives_the_switch() {
+        // A complete file costs no download bandwidth, and deleting a movie
+        // that finished downloading because the viewer started the next
+        // episode is destructive. The cache janitor reclaims it under
+        // pressure, oldest-first.
+        assert_eq!(action_for_abandoned(false, true), UnfocusedAction::Leave);
     }
 
     #[test]

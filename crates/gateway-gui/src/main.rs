@@ -120,6 +120,13 @@ struct GatewayApp {
     stop_done_rx: Option<Receiver<()>>,
 
     start_error: Option<String>,
+
+    /// True once "clear everything" has been clicked and is waiting for the
+    /// confirming second click. Deleting every download is not undoable, so
+    /// it does not hang off a single mis-tap next to the stop button.
+    clear_armed: bool,
+    clear_rx: Option<Receiver<Result<usize, String>>>,
+    clear_result: Option<String>,
 }
 
 impl Default for GatewayApp {
@@ -138,6 +145,9 @@ impl Default for GatewayApp {
             stopping: false,
             stop_done_rx: None,
             start_error: None,
+            clear_armed: false,
+            clear_rx: None,
+            clear_result: None,
         }
     }
 }
@@ -183,6 +193,33 @@ impl GatewayApp {
         }
     }
 
+    /// Asks the running server to delete every torrent and all of its data.
+    ///
+    /// Goes through the server rather than deleting files here: the engine
+    /// holds open handles to what is on disk, so removing the directory
+    /// underneath it would leave the session pointing at files that no longer
+    /// exist. The endpoint is loopback-only, which is why this works from the
+    /// desktop app and from nowhere else.
+    fn clear_cache(&mut self) {
+        let (tx, rx) = mpsc::channel();
+        let port = self.port.clone();
+        thread::spawn(move || {
+            let url = format!("http://127.0.0.1:{port}/cache/clear");
+            let outcome = match ureq::post(&url).timeout(Duration::from_secs(30)).call() {
+                Ok(resp) => resp
+                    .into_json::<serde_json::Value>()
+                    .ok()
+                    .and_then(|v| v.get("deleted").and_then(|d| d.as_u64()))
+                    .map(|n| n as usize)
+                    .ok_or_else(|| "server gave an unreadable reply".to_string()),
+                Err(e) => Err(format!("{e}")),
+            };
+            let _ = tx.send(outcome);
+        });
+        self.clear_rx = Some(rx);
+        self.clear_result = None;
+    }
+
     fn stop_server(&mut self) {
         if self.stopping {
             return;
@@ -222,6 +259,21 @@ impl GatewayApp {
             self.push_log(text);
         }
 
+        if let Some(rx) = &self.clear_rx {
+            if let Ok(outcome) = rx.try_recv() {
+                self.clear_result = Some(match outcome {
+                    Ok(0) => "Nothing to clear.".to_string(),
+                    Ok(1) => "Cleared 1 download.".to_string(),
+                    Ok(n) => format!("Cleared {n} downloads."),
+                    Err(e) => format!("Could not clear: {e}"),
+                });
+                self.clear_rx = None;
+                // Force the next health poll so the freed space shows at once
+                // rather than after the regular interval.
+                self.next_health_poll = Instant::now();
+            }
+        }
+
         if let Some(rx) = &self.stop_done_rx {
             if rx.try_recv().is_ok() {
                 self.stopping = false;
@@ -232,7 +284,11 @@ impl GatewayApp {
             }
         }
 
-        if self.running {
+        // Polled whether or not this app started the server. A gateway
+        // launched from a terminal is just as real, and without this the
+        // window sat blank next to a perfectly healthy server -- and the
+        // clear button, which needs a server to talk to, stayed disabled.
+        {
             if let Some(rx) = &self.health_rx {
                 if let Ok(result) = rx.try_recv() {
                     self.health = result;
@@ -351,6 +407,66 @@ impl eframe::App for GatewayApp {
                     Status::Running => self.stop_server(),
                     _ => {}
                 }
+            }
+
+            // Clear-everything. Only offered while the server is up, because
+            // it works by asking the server: with nothing running there is no
+            // one to ask, and a button that silently does nothing is worse
+            // than one that is plainly unavailable.
+            ui.add_space(8.0);
+            let clearing = self.clear_rx.is_some();
+            let clear_label = if clearing {
+                "\u{25CB}  CLEARING...".to_string()
+            } else if self.clear_armed {
+                "\u{26A0}  TAP AGAIN TO DELETE EVERYTHING".to_string()
+            } else {
+                "\u{1F5D1}  CLEAR ALL DOWNLOADS".to_string()
+            };
+            let clear_button = egui::Button::new(
+                egui::RichText::new(clear_label)
+                    .size(14.0)
+                    .strong()
+                    .color(if self.clear_armed { BG_DEEP } else { ACCENT_RED }),
+            )
+            .fill(if self.clear_armed {
+                ACCENT_RED
+            } else {
+                BG_PANEL
+            })
+            .rounding(egui::Rounding::same(8.0))
+            .min_size(egui::vec2(ui.available_width(), 34.0));
+
+            // Enabled on "a server answered /health", not on "this app
+            // started it" -- the gateway is often launched outside the app.
+            if ui
+                .add_enabled(self.health.is_some() && !clearing, clear_button)
+                .clicked()
+            {
+                if self.clear_armed {
+                    self.clear_armed = false;
+                    self.clear_cache();
+                } else {
+                    self.clear_armed = true;
+                }
+            }
+            if self.clear_armed {
+                ui.label(
+                    egui::RichText::new(
+                        "Deletes every download, finished or not. Cannot be undone.",
+                    )
+                    .color(ACCENT_AMBER)
+                    .size(11.0),
+                );
+                if ui.small_button("cancel").clicked() {
+                    self.clear_armed = false;
+                }
+            }
+            if let Some(msg) = &self.clear_result {
+                ui.label(
+                    egui::RichText::new(msg)
+                        .color(egui::Color32::GRAY)
+                        .size(11.0),
+                );
             }
 
             ui.add_space(12.0);
