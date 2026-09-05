@@ -52,6 +52,20 @@ const ADD_TORRENT_TIMEOUT: Duration = Duration::from_secs(25);
 /// streamable.
 const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// How long a hash that just failed to find any peers is refused a second
+/// full search.
+///
+/// A release with no reachable seeders is not a transient failure that a
+/// retry fixes -- it fails the same way every time, for the same
+/// `ADD_TORRENT_TIMEOUT` (25s), and a player that auto-retries a dead stream
+/// (resuming "continue watching", or its own error-recovery) does so roughly
+/// every 25-30s on its own. Without this, every one of those retries pays the
+/// full 25-second search again, which is indistinguishable from the gateway
+/// hanging even though it is doing exactly what was asked. Longer than
+/// `ADD_TORRENT_TIMEOUT` so the very next automatic retry is the one that
+/// gets the fast, honest "still no peers" instead of another full wait.
+const START_FAILURE_COOLDOWN: Duration = Duration::from_secs(45);
+
 /// How long a resumed torrent gets to reconnect at least one peer before
 /// `ensure_started` gives up waiting and hands the stream back anyway.
 ///
@@ -201,6 +215,21 @@ impl AdvertisedHashes {
     }
 }
 
+/// How much of `cooldown` is left since `info_hash` was marked in `failures`,
+/// or `None` if it was never marked or the cooldown already elapsed. Prunes
+/// every expired entry it passes over, so the map cannot grow for the life of
+/// the process. `cooldown` is a parameter (rather than reading the module
+/// constant directly) so this logic is testable without waiting out a real
+/// 45-second window.
+fn remaining_cooldown(
+    failures: &mut HashMap<String, Instant>,
+    info_hash: &str,
+    cooldown: Duration,
+) -> Option<Duration> {
+    failures.retain(|_, at| at.elapsed() < cooldown);
+    failures.get(info_hash).map(|at| cooldown - at.elapsed())
+}
+
 /// Hands out the start lock for one info hash, creating it on first use.
 ///
 /// Every caller for the same hash must get the *same* `Arc`, or the lock
@@ -333,6 +362,8 @@ pub struct TorrentEngine {
     /// One lock per info hash being started, so the same torrent is never
     /// added twice at once. See `start_lock`.
     starts: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    /// When a hash last failed to find any peers. See `START_FAILURE_COOLDOWN`.
+    failed_starts: StdMutex<HashMap<String, Instant>>,
 }
 
 /// What to do with a torrent that is not the one being watched.
@@ -485,6 +516,7 @@ impl TorrentEngine {
             stall_timeout: Duration::from_secs(config.stall_timeout_secs),
             browse_prefetch: config.browse_prefetch_count,
             starts: Mutex::new(HashMap::new()),
+            failed_starts: StdMutex::new(HashMap::new()),
         }))
     }
 
@@ -572,6 +604,20 @@ impl TorrentEngine {
             return Ok(info_hash);
         }
 
+        // A hash that just failed to find any peers fails the same way every
+        // time, for the same 25 seconds -- so a client auto-retrying a dead
+        // stream (a resumed "continue watching", or its own error recovery)
+        // gets an instant, honest failure instead of paying that wait again
+        // on every retry. See `START_FAILURE_COOLDOWN`.
+        if let Some(remaining) = self.recent_start_failure(&info_hash) {
+            anyhow::bail!(
+                "no reachable peers as of {}s ago; not searching again for another {}s -- \
+                 try a release with more seeders",
+                (START_FAILURE_COOLDOWN - remaining).as_secs(),
+                remaining.as_secs()
+            );
+        }
+
         // Throttles how many torrents can be *added* concurrently (each add
         // does a burst of tracker/DHT/peer-handshake work) -- not how many
         // can stream at once, so the permit is dropped as soon as add returns.
@@ -593,20 +639,31 @@ impl TorrentEngine {
             ..Default::default()
         };
 
-        tokio::time::timeout(
+        let added = tokio::time::timeout(
             ADD_TORRENT_TIMEOUT,
             self.api
                 .api_add_torrent(AddTorrent::from_url(magnet), Some(opts)),
         )
-        .await
-        .map_err(|_| {
-            anyhow::anyhow!(
-                "timed out fetching torrent metadata after {}s -- the torrent likely has no \
-                 reachable peers (try a release with more seeders)",
-                ADD_TORRENT_TIMEOUT.as_secs()
-            )
-        })?
-        .context("failed to start torrent")?;
+        .await;
+
+        if added.is_err() {
+            self.record_start_failure(&info_hash);
+        }
+
+        added
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "timed out fetching torrent metadata after {}s -- the torrent likely has no \
+                     reachable peers (try a release with more seeders)",
+                    ADD_TORRENT_TIMEOUT.as_secs()
+                )
+            })?
+            .context("failed to start torrent")?;
+
+        // Reaching here means peers answered, so any earlier failure is
+        // stale -- a later retry must not be judged by a search that no
+        // longer reflects the swarm.
+        self.clear_start_failure(&info_hash);
 
         // Adding a torrent returns before it is streamable: librqbit still has
         // to move it out of `Initializing` (hashing/checking any data already
@@ -618,6 +675,35 @@ impl TorrentEngine {
             .await?;
 
         Ok(info_hash)
+    }
+
+    /// How much of `START_FAILURE_COOLDOWN` is left for this hash, or `None`
+    /// if it never failed or the cooldown has already elapsed. Also prunes
+    /// every expired entry it passes over, so this map cannot grow for the
+    /// life of the process.
+    fn recent_start_failure(&self, info_hash: &str) -> Option<Duration> {
+        remaining_cooldown(
+            &mut self
+                .failed_starts
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            info_hash,
+            START_FAILURE_COOLDOWN,
+        )
+    }
+
+    fn record_start_failure(&self, info_hash: &str) {
+        self.failed_starts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(info_hash.to_string(), Instant::now());
+    }
+
+    fn clear_start_failure(&self, info_hash: &str) {
+        self.failed_starts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(info_hash);
     }
 
     /// The lock guarding starts of one particular torrent, creating it on
@@ -1466,6 +1552,46 @@ mod tests {
         );
 
         assert!(Arc::ptr_eq(&lock_for(&mut starts, "held"), &held));
+    }
+
+    /// A hash that just failed a peer search must refuse a second one until
+    /// the cooldown elapses -- this is the whole point: a client
+    /// auto-retrying a dead stream gets an instant failure instead of paying
+    /// the full search again on every retry.
+    #[test]
+    fn a_hash_that_just_failed_is_on_cooldown() {
+        let mut failures = HashMap::new();
+        let cooldown = Duration::from_millis(50);
+        failures.insert("dead".to_string(), Instant::now());
+
+        let remaining = remaining_cooldown(&mut failures, "dead", cooldown);
+        assert!(
+            remaining.is_some_and(|r| r <= cooldown && r > Duration::ZERO),
+            "a fresh failure must report time left, not none and not the full window"
+        );
+        assert_eq!(
+            remaining_cooldown(&mut failures, "healthy", cooldown),
+            None,
+            "a hash that never failed must search normally"
+        );
+    }
+
+    #[test]
+    fn cooldown_expires_and_is_pruned() {
+        let mut failures = HashMap::new();
+        let cooldown = Duration::from_millis(20);
+        failures.insert("dead".to_string(), Instant::now());
+        std::thread::sleep(Duration::from_millis(40));
+
+        assert_eq!(
+            remaining_cooldown(&mut failures, "dead", cooldown),
+            None,
+            "an expired cooldown must allow a fresh search, not refuse forever"
+        );
+        assert!(
+            failures.is_empty(),
+            "checking must prune the expired entry, or this map grows without bound"
+        );
     }
 
     /// A pre-0.9 `advertised.json` is a bare list of hashes. It must load as
