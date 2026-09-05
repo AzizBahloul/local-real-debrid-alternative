@@ -114,20 +114,27 @@ pub struct AppConfig {
     pub disable_upnp: bool,
 
     /// How many not-yet-known torrents to start fetching while the viewer is
-    /// still reading the stream list. 0 disables prefetching.
+    /// still reading the stream list. 0 (the default) disables prefetching.
     ///
-    /// This is the single biggest lever on how long "press play" takes.
-    /// Fetching a torrent's metadata over DHT/trackers is most of the cold
-    /// start, and doing it when the list is *shown* rather than when a row is
-    /// *tapped* moves that whole wait to where nobody is watching a spinner.
+    /// **Off by default, from experience rather than caution.** The idea is
+    /// sound -- fetching a torrent's metadata over DHT/trackers is most of a
+    /// cold start, and doing it while the list is on screen moves that wait
+    /// to where nobody is staring at a spinner. It measured beautifully in
+    /// isolation: 3/3 cold starts under 2ms against 2.7-16.4s.
     ///
-    /// One, not several, and that is a measured figure rather than caution:
-    /// concurrent metadata fetches compete for the same DHT and tracker
-    /// capacity, so prefetching the top two made the row the viewer actually
-    /// tapped resolve *slower* than fetching it alone would have. Warming
-    /// only the top row -- the highest-seeded one, which is what the list
-    /// shows first -- is never worse than not prefetching at all.
-    #[arg(long, env = "BROWSE_PREFETCH_COUNT", default_value_t = 1)]
+    /// In real use it made things worse three separate ways, because a
+    /// speculative download is competing for the same scarce things a real
+    /// viewer needs. It pulled file bytes and diluted piece priority away
+    /// from the stream actually being watched; parking it instead to avoid
+    /// that dropped its peers, so tapping it paid a full reconnect; and
+    /// warming more than one candidate split DHT capacity so the row that
+    /// *was* tapped resolved slower than if nothing had been warmed at all.
+    /// Each fix moved the cost somewhere else rather than removing it.
+    ///
+    /// Set it to 1 to try it. The wins that came out of that work and are
+    /// unambiguous -- the incoming peer listener, the tracker lists, the
+    /// per-hash start lock -- are all still on and are not affected by this.
+    #[arg(long, env = "BROWSE_PREFETCH_COUNT", default_value_t = 0)]
     pub browse_prefetch_count: usize,
 
     /// How often (seconds) to print the terminal monitoring status.
@@ -317,24 +324,27 @@ mod tests {
         );
     }
 
-    /// Every one of these is a cold-start lever whose "off" value is a
-    /// perfectly ordinary-looking number, and turning any of them off costs
-    /// only latency -- nothing errors, nothing logs, playback still works. So
-    /// the shipped values are pinned here, because the way this regresses is
-    /// silently.
+    /// The peer listener is a cold-start lever whose "off" value is a
+    /// perfectly ordinary-looking flag, and turning it off costs only speed
+    /// -- nothing errors, nothing logs, playback still works, there are just
+    /// far fewer peers. So the shipped value is pinned here, because the way
+    /// this regresses is silently.
     #[test]
-    fn cold_start_defaults_stay_on() {
-        let config = defaults();
+    fn incoming_peers_stay_reachable_by_default() {
         assert!(
-            config.browse_prefetch_count > 0,
-            "prefetching while the stream list is on screen is what keeps the \
-             metadata fetch out of the request the player makes after the tap"
-        );
-        assert!(
-            !config.disable_upnp,
+            !defaults().disable_upnp,
             "without the port forward the peer listener only reaches this LAN, \
              where a public swarm has no peers at all"
         );
+    }
+
+    /// Prefetching is off because it repeatedly made real playback worse by
+    /// competing with it (see the field docs). This pins that decision so it
+    /// is turned back on deliberately, with measurement, rather than because
+    /// a default looked conservative.
+    #[test]
+    fn browse_prefetch_stays_off_by_default() {
+        assert_eq!(defaults().browse_prefetch_count, 0);
     }
 
     #[test]

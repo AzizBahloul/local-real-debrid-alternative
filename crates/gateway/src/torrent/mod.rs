@@ -66,15 +66,6 @@ const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(15);
 /// gets the fast, honest "still no peers" instead of another full wait.
 const START_FAILURE_COOLDOWN: Duration = Duration::from_secs(45);
 
-/// How long a resumed torrent gets to reconnect at least one peer before
-/// `ensure_started` gives up waiting and hands the stream back anyway.
-///
-/// Not fatal on timeout, same as `wait_until_streamable`: a slow swarm still
-/// gets played, just with the stall/re-open path doing the work instead of a
-/// clean start. What this guards against is the common case -- a healthy
-/// swarm that just needs a few seconds to rediscover peers after a pause --
-/// being served as if it were already live.
-const RESUME_PEER_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// How many recently-advertised info hashes stay startable. Generous relative
 /// to how many streams a browse session shows (15 per title by default).
@@ -742,18 +733,16 @@ impl TorrentEngine {
                     .api_torrent_action_start(idx)
                     .await
                     .map_err(|e| anyhow::anyhow!("failed to resume torrent: {e}"))?;
-                // Pausing drops every peer connection, so resuming starts
-                // from zero and has to rediscover them over DHT/trackers --
-                // exactly like a fresh add, just without the metadata fetch.
-                // Handing the stream back the instant `action_start` returns
-                // (as this used to) serves whatever was already on disk, then
-                // stalls hard the moment playback catches up to it, and stays
-                // stalled-then-recovers in a loop until the swarm reconnects
-                // on its own: repeated buffering that looks like a broken
-                // stream. Waiting here for real peers first converts that
-                // into one slightly longer wait up front, the same principle
-                // `prebuffer` already applies to a stream's first bytes.
-                self.wait_for_peers(info_hash, RESUME_PEER_TIMEOUT).await;
+                // Deliberately does NOT wait for peers to reconnect here. An
+                // earlier version did, reasoning that a resumed torrent has
+                // zero peers and would stall the moment playback caught up to
+                // what was on disk. But most resumes are of a torrent that
+                // *has* data on disk -- a part-watched episode, or a finished
+                // one -- and those start playing instantly from that data
+                // while peers reconnect in the background. Blocking here made
+                // every one of them wait seconds for bytes it already had.
+                // A genuinely empty resume is handled where it belongs, by
+                // the pre-buffer and the stall/re-open path.
             }
             // It may still be initializing if a player raced us here, so wait
             // rather than returning immediately.
@@ -840,31 +829,6 @@ impl TorrentEngine {
             .contains(&info_hash.to_ascii_lowercase())
     }
 
-    /// Polls a torrent's connected-peer count until it is above zero, or
-    /// `timeout` elapses. Returns immediately if the torrent already has one
-    /// or has vanished from the session.
-    async fn wait_for_peers(&self, info_hash: &str, timeout: Duration) {
-        let Ok(idx) = TorrentIdOrHash::parse(info_hash) else {
-            return;
-        };
-        const POLL: Duration = Duration::from_millis(200);
-        let deadline = tokio::time::Instant::now() + timeout;
-        loop {
-            let Some(handle) = self.api.session().get(idx) else {
-                return;
-            };
-            let peers = handle
-                .stats()
-                .live
-                .as_ref()
-                .map(|l| l.snapshot.peer_stats.live)
-                .unwrap_or(0);
-            if peers > 0 || tokio::time::Instant::now() >= deadline {
-                return;
-            }
-            tokio::time::sleep(POLL).await;
-        }
-    }
 
     /// Blocks until the torrent has left `Initializing`, or `timeout` elapses.
     ///
