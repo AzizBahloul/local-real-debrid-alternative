@@ -216,90 +216,17 @@ pub async fn run() -> anyhow::Result<()> {
 
     let app = build_router(state);
 
-    // The https listener is what lets Stremio's Android app add the addon
-    // without a tunnel -- see the `tls` module. It serves the same router on
-    // its own port, so http keeps working exactly as before and a failure
-    // here degrades to "no addon URL" rather than "no gateway".
-    let addon_url = if config.disable_https {
-        None
+    // The banner prints *before* the https setup: fetching the certificate
+    // can take up to 15 seconds against a slow provider, and holding the
+    // whole gateway (and the http address everyone copies) hostage to it
+    // made every cold start feel broken. The https task announces the addon
+    // URL itself the moment it is actually servable.
+    if config.disable_https {
+        network::print_banner(lan_ip, bound_port, network::AddonStatus::Disabled);
     } else {
-        match tls::load(
-            config.tls_cert_file.as_deref(),
-            config.tls_key_file.as_deref(),
-            &config.tls_cert_url,
-            &config.tls_key_url,
-            &config.cache_dir,
-        )
-        .await
-        {
-            Ok(tls_config) => {
-                tls::spawn_refresh(
-                    tls_config.clone(),
-                    config.tls_cert_url.clone(),
-                    config.tls_key_url.clone(),
-                    config.cache_dir.clone(),
-                );
-
-                let host = tls::hostname_for(lan_ip, &config.tls_host_suffix);
-                let addr = SocketAddr::new(config.bind_addr, config.https_port);
-                let https_app = app.clone();
-
-                // Bound here rather than letting `bind_rustls` do it, purely so
-                // the same client timeout can be applied to this socket too.
-                // Video does travel over https in some setups (a tunnelled
-                // client, or VLC simply pointed at this port), and a wedged
-                // connection pins its torrent exactly as it would over http.
-                match std::net::TcpListener::bind(addr)
-                    .and_then(|l| l.set_nonblocking(true).map(|()| l))
-                {
-                    Ok(https_listener) => {
-                        network::harden_listener(&https_listener, client_timeout);
-                        tokio::spawn(async move {
-                            let served = match axum_server::from_tcp_rustls(
-                                https_listener,
-                                tls_config,
-                            ) {
-                                Ok(server) => {
-                                    server
-                                        .serve(
-                                            https_app
-                                                .into_make_service_with_connect_info::<SocketAddr>(),
-                                        )
-                                        .await
-                                }
-                                Err(e) => Err(e),
-                            };
-                            if let Err(e) = served {
-                                warn!(
-                                    "https listener stopped: {e:#} -- the addon URL will not \
-                                     work, but http streaming is unaffected"
-                                );
-                            }
-                        });
-                        info!(%host, port = config.https_port, "https listening");
-                        Some(format!("https://{host}:{}", config.https_port))
-                    }
-                    Err(e) => {
-                        warn!(
-                            port = config.https_port,
-                            "could not bind the https port ({e}); Stremio's Android app will \
-                             not be able to add this addon without a tunnel"
-                        );
-                        None
-                    }
-                }
-            }
-            Err(e) => {
-                warn!(
-                    "could not start https ({e:#}); Stremio's Android app will not be able to \
-                     add this addon without a tunnel"
-                );
-                None
-            }
-        }
-    };
-
-    network::print_banner(lan_ip, bound_port, addon_url.as_deref());
+        network::print_banner(lan_ip, bound_port, network::AddonStatus::Preparing);
+        spawn_https(&config, lan_ip, client_timeout, app.clone());
+    }
     info!(%lan_ip, port = bound_port, "streaming gateway listening");
 
     axum::serve(
@@ -310,6 +237,90 @@ pub async fn run() -> anyhow::Result<()> {
     .await?;
 
     Ok(())
+}
+
+/// Brings the https listener up in the background -- see the `tls` module for
+/// why https exists at all. It serves the same router on its own port, so
+/// http works from the first moment either way and a failure here degrades to
+/// "no addon URL" rather than "no gateway".
+fn spawn_https(
+    config: &AppConfig,
+    lan_ip: std::net::IpAddr,
+    client_timeout: Duration,
+    app: Router,
+) {
+    let config = config.clone();
+    tokio::spawn(async move {
+        let tls_config = match tls::load(
+            config.tls_cert_file.as_deref(),
+            config.tls_key_file.as_deref(),
+            &config.tls_cert_url,
+            &config.tls_key_url,
+            &config.cache_dir,
+        )
+        .await
+        {
+            Ok(tls_config) => tls_config,
+            Err(e) => {
+                warn!(
+                    "could not start https ({e:#}); Stremio's Android app will not be able to \
+                     add this addon without a tunnel"
+                );
+                return;
+            }
+        };
+
+        tls::spawn_refresh(
+            tls_config.clone(),
+            config.tls_cert_url.clone(),
+            config.tls_key_url.clone(),
+            config.cache_dir.clone(),
+        );
+
+        let host = tls::hostname_for(lan_ip, &config.tls_host_suffix);
+        let addr = SocketAddr::new(config.bind_addr, config.https_port);
+
+        // Bound here rather than letting `bind_rustls` do it, purely so the
+        // same client timeout can be applied to this socket too. Video does
+        // travel over https in some setups (a tunnelled client, or VLC simply
+        // pointed at this port), and a wedged connection pins its torrent
+        // exactly as it would over http.
+        let https_listener = match std::net::TcpListener::bind(addr)
+            .and_then(|l| l.set_nonblocking(true).map(|()| l))
+        {
+            Ok(listener) => listener,
+            Err(e) => {
+                warn!(
+                    port = config.https_port,
+                    "could not bind the https port ({e}); Stremio's Android app will not be \
+                     able to add this addon without a tunnel"
+                );
+                return;
+            }
+        };
+        network::harden_listener(&https_listener, client_timeout);
+
+        let server = match axum_server::from_tcp_rustls(https_listener, tls_config) {
+            Ok(server) => server,
+            Err(e) => {
+                warn!("could not start the https server: {e:#}");
+                return;
+            }
+        };
+
+        info!(%host, port = config.https_port, "https listening");
+        network::print_addon_ready(&format!("https://{host}:{}", config.https_port));
+
+        if let Err(e) = server
+            .serve(app.into_make_service_with_connect_info::<SocketAddr>())
+            .await
+        {
+            warn!(
+                "https listener stopped: {e:#} -- the addon URL will not work, but http \
+                 streaming is unaffected"
+            );
+        }
+    });
 }
 
 async fn shutdown_signal() {

@@ -87,8 +87,11 @@ pub async fn play(
         ));
     }
 
+    // The resolve above just talked to the swarm; hand those peers straight
+    // to the download so it connects immediately instead of re-discovering
+    // the same swarm over DHT/trackers a second time.
     let info_hash = engine
-        .start_file(&query.magnet, file_idx)
+        .start_file(&query.magnet, file_idx, resolved.seen_peers.clone())
         .await
         .map_err(|e| ApiErrorResponse::internal(format!("failed to start streaming: {e:#}")))?;
 

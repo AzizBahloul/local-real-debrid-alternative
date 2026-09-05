@@ -87,34 +87,55 @@ pub fn detect_lan_ip() -> IpAddr {
     local_ip_address::local_ip().unwrap_or_else(|_| IpAddr::from([127, 0, 0, 1]))
 }
 
+/// What the banner can say about the https addon URL at the moment it prints.
+///
+/// The banner used to wait for the certificate fetch (up to 15s against a
+/// slow provider) purely so it could print the https address -- during which
+/// the http listener, the only thing the GUI health-checks, was not serving
+/// at all. Printing immediately with `Preparing` and letting the https task
+/// announce itself when ready is what makes startup feel instant.
+pub enum AddonStatus<'a> {
+    /// The https listener is up at this URL.
+    Ready(&'a str),
+    /// The certificate is being fetched in the background; the URL is
+    /// printed by `print_addon_ready` the moment it is servable.
+    Preparing,
+    /// https was disabled by configuration.
+    Disabled,
+}
+
 /// Prints the startup banner.
 ///
-/// `addon_url` is the https address, when one could be served. It is printed
-/// separately and first because it is the only one that can be pasted into
-/// Stremio on Android -- the plain http address below it is what players and
-/// browsers use, and handing someone the wrong one of the two is the single
-/// most common way this ends up looking broken.
-pub fn print_banner(lan_ip: IpAddr, port: u16, addon_url: Option<&str>) {
+/// The https addon URL is printed separately and first because it is the only
+/// one that can be pasted into Stremio on Android -- the plain http address
+/// below it is what players and browsers use, and handing someone the wrong
+/// one of the two is the single most common way this ends up looking broken.
+pub fn print_banner(lan_ip: IpAddr, port: u16, addon: AddonStatus<'_>) {
     let url = format!("http://{lan_ip}:{port}");
-    let width = addon_url
-        .map(|a| a.len() + 16)
-        .unwrap_or(0)
-        .max(url.len() + 4)
-        .max(32);
+    let width = match &addon {
+        AddonStatus::Ready(a) => a.len() + 16,
+        _ => 0,
+    }
+    .max(url.len() + 4)
+    .max(32);
     let bar = "=".repeat(width);
 
     println!("\n{bar}");
     println!("   Streaming Gateway Running");
     println!("{bar}");
     println!();
-    match addon_url {
-        Some(addon) => {
+    match addon {
+        AddonStatus::Ready(addon) => {
             println!("   PASTE THIS INTO STREMIO (Addons -> search bar):");
             println!("   {addon}/manifest.json");
             println!();
             println!("   No tunnel needed. Works from any device on this wifi.");
         }
-        None => {
+        AddonStatus::Preparing => {
+            println!("   The Stremio addon URL (https) is being prepared and");
+            println!("   will be printed below in a few seconds.");
+        }
+        AddonStatus::Disabled => {
             println!("   https is not available, so Stremio on Android cannot");
             println!("   add this addon directly -- you still need a tunnel.");
         }
@@ -124,6 +145,19 @@ pub fn print_banner(lan_ip: IpAddr, port: u16, addon_url: Option<&str>) {
     println!("   {url}");
     println!("   e.g. {url}/play?magnet=<magnet-link>");
     println!();
+    println!("{bar}\n");
+}
+
+/// Printed by the background https task once the certificate is loaded and
+/// the listener is actually serving -- the deferred half of the banner.
+pub fn print_addon_ready(addon_url: &str) {
+    let line = format!("   {addon_url}/manifest.json");
+    let bar = "=".repeat(line.len().max(32));
+    println!("\n{bar}");
+    println!("   PASTE THIS INTO STREMIO (Addons -> search bar):");
+    println!("{line}");
+    println!();
+    println!("   No tunnel needed. Works from any device on this wifi.");
     println!("{bar}\n");
 }
 

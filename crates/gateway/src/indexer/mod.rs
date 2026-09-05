@@ -26,6 +26,11 @@ pub struct IndexedTorrent {
     pub quality: String,
     pub size_bytes: Option<u64>,
     pub seeders: Option<u32>,
+    /// Tracker URLs the index reported for this exact release (Torrentio's
+    /// `sources` field, `tracker:` entries). These are where this torrent's
+    /// seeders actually announce, so starting with them beats starting from
+    /// a bare hash and hoping DHT finds the swarm quickly.
+    pub trackers: Vec<String>,
 }
 
 /// Anything that can turn a content id into candidate torrents.
@@ -89,6 +94,21 @@ struct TorrentioStream {
     /// Release name plus a stats line (`"Name\n👤 42 💾 2.1 GB ⚙️ Source"`).
     #[serde(default)]
     title: String,
+    /// Peer sources, e.g. `["tracker:udp://x:1337/announce", "dht:<hash>"]`.
+    #[serde(default)]
+    sources: Vec<String>,
+}
+
+/// Extracts the tracker URLs out of Torrentio's `sources` list. The `dht:`
+/// entries carry nothing a client does not already know (the info hash), so
+/// only `tracker:` entries matter.
+fn tracker_sources(sources: &[String]) -> Vec<String> {
+    sources
+        .iter()
+        .filter_map(|s| s.strip_prefix("tracker:"))
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+        .collect()
 }
 
 impl StreamIndexer for TorrentioIndexer {
@@ -142,6 +162,7 @@ impl StreamIndexer for TorrentioIndexer {
                     quality: clean_quality(&s.name),
                     size_bytes: parse_size(&stats),
                     seeders: parse_seeders(&stats),
+                    trackers: tracker_sources(&s.sources),
                 })
             })
             .collect();
@@ -272,6 +293,25 @@ mod tests {
         let (name, stats) = split_once_newline("Just.A.Name");
         assert_eq!(name, "Just.A.Name");
         assert_eq!(stats, "");
+    }
+
+    #[test]
+    fn extracts_only_tracker_entries_from_sources() {
+        let sources = vec![
+            "tracker:udp://tracker.example:1337/announce".to_string(),
+            "tracker: udp://spaced.example:80/announce ".to_string(),
+            "dht:45fa4233ef87c58f5f8b4817e4d50c9f5363caef".to_string(),
+            "tracker:".to_string(),
+        ];
+        assert_eq!(
+            tracker_sources(&sources),
+            vec![
+                "udp://tracker.example:1337/announce".to_string(),
+                "udp://spaced.example:80/announce".to_string(),
+            ],
+            "dht/empty entries carry nothing a client does not already know"
+        );
+        assert!(tracker_sources(&[]).is_empty());
     }
 
     #[test]

@@ -170,7 +170,18 @@ async fn magnet_streams(state: &AppState, magnet: &str) -> Vec<Value> {
         return Vec::new();
     };
 
-    state.engine.remember_advertised(&resolved.info_hash).await;
+    // A raw magnet may carry its own trackers -- remember them so a later
+    // lazy start (after a restart, say) announces to the same places.
+    let trackers: Vec<String> = resolved
+        .magnet
+        .split('&')
+        .filter_map(|part| part.strip_prefix("tr="))
+        .filter_map(|t| urlencoding::decode(t).ok().map(|d| d.into_owned()))
+        .collect();
+    state
+        .engine
+        .remember_advertised(&resolved.info_hash, &trackers)
+        .await;
 
     vec![json!({
         "name": stream_label(""),
@@ -217,9 +228,14 @@ async fn indexed_streams(
     debug!(%content_type, %id, count = found.len(), "index returned candidates");
 
     // Anything we list here must become startable when the user picks it --
-    // `/videos/...` refuses hashes the gateway never offered.
+    // `/videos/...` refuses hashes the gateway never offered. The trackers
+    // ride along so that pick starts against this release's own swarm
+    // instead of a bare info hash (see `AdvertisedHashes`).
     for torrent in &found {
-        state.engine.remember_advertised(&torrent.info_hash).await;
+        state
+            .engine
+            .remember_advertised(&torrent.info_hash, &torrent.trackers)
+            .await;
     }
 
     // Reaching this list is the earliest reliable sign that someone is about
@@ -444,6 +460,7 @@ mod tests {
             quality: "1080p".into(),
             size_bytes: Some(2 * 1024 * 1024 * 1024),
             seeders: Some(42),
+            trackers: vec!["udp://tracker.example:1337/announce".into()],
         }
     }
 

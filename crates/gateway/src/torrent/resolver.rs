@@ -15,26 +15,44 @@ const VIDEO_EXTENSIONS: &[&str] = &[
     "mkv", "mp4", "avi", "mov", "webm", "m4v", "ts", "wmv", "flv", "m2ts", "vob",
 ];
 
-/// Trackers attached to any magnet we build ourselves from a bare info hash.
-/// An index hands us only the hash; with no trackers the torrent has nothing
-/// but DHT to find peers on, which is much slower to start and on some
-/// networks never starts at all.
+/// Trackers announced for *every* torrent, via `SessionOptions::trackers`
+/// (librqbit merges them into each torrent's peer discovery, metadata fetch
+/// included). Without them a bare info hash has nothing but DHT to find peers
+/// on, which is much slower to start and on some networks never starts at
+/// all. Refreshed 2026-09 from the maintained `ngosang/trackerslist` "best"
+/// set, keeping the long-lived ones the previous list already trusted.
 pub const DEFAULT_TRACKERS: &[&str] = &[
     "udp://tracker.opentrackr.org:1337/announce",
     "udp://open.demonii.com:1337/announce",
     "udp://open.stealth.si:80/announce",
     "udp://tracker.torrent.eu.org:451/announce",
     "udp://exodus.desync.com:6969/announce",
-    "udp://tracker.openbittorrent.com:6969/announce",
+    "udp://zer0day.ch:1337/announce",
+    "udp://tracker.therarbg.to:6969/announce",
+    "udp://tracker.qu.ax:6969/announce",
+    "udp://tracker.bittor.pw:1337/announce",
+    "udp://tracker.dler.org:6969/announce",
+    "udp://tracker.auctor.tv:6969/announce",
+    "udp://tracker.publictracker.xyz:6969/announce",
 ];
 
-/// Builds a magnet URI from a bare info hash, with `DEFAULT_TRACKERS` attached.
-pub fn magnet_with_trackers(info_hash: &str, display_name: Option<&str>) -> String {
+/// Builds a magnet URI from a bare info hash, attaching the given trackers.
+///
+/// These are the *torrent-specific* trackers (the ones the index reported for
+/// exactly this release). `DEFAULT_TRACKERS` deliberately do not ride along:
+/// they are announced session-wide for every torrent already, and librqbit
+/// only reads trackers out of the magnet itself on a magnet add -- so the
+/// magnet is the one place per-torrent trackers *must* travel.
+pub fn magnet_with_trackers(
+    info_hash: &str,
+    display_name: Option<&str>,
+    trackers: &[String],
+) -> String {
     let mut magnet = format!("magnet:?xt=urn:btih:{info_hash}");
     if let Some(name) = display_name {
         magnet.push_str(&format!("&dn={}", urlencoding::encode(name)));
     }
-    for tracker in DEFAULT_TRACKERS {
+    for tracker in trackers {
         magnet.push_str(&format!("&tr={}", urlencoding::encode(tracker)));
     }
     magnet
@@ -58,6 +76,13 @@ pub struct ResolvedTorrent {
     pub files: Vec<TorrentFile>,
     /// Best-guess file index to play, when the torrent contains any video file.
     pub suggested_file_idx: Option<usize>,
+    /// Peers that answered during the metadata fetch. Fetching metadata means
+    /// the swarm was *just* discovered; handing these to the subsequent start
+    /// call (`initial_peers`) skips re-discovering the very same peers over
+    /// DHT/trackers, which was most of the wait between "resolved" and
+    /// "first byte".
+    #[serde(skip)]
+    pub seen_peers: Vec<std::net::SocketAddr>,
 }
 
 impl ResolvedTorrent {
@@ -181,6 +206,7 @@ mod tests {
         let magnet = magnet_with_trackers(
             "45fa4233ef87c58f5f8b4817e4d50c9f5363caef",
             Some("Movie 2024"),
+            &["udp://tracker.opentrackr.org:1337/announce".to_string()],
         );
         assert!(magnet.starts_with("magnet:?xt=urn:btih:45fa4233ef87c58f5f8b4817e4d50c9f5363caef"));
         assert!(magnet.contains("&dn=Movie%202024"));
@@ -194,9 +220,24 @@ mod tests {
 
     #[test]
     fn magnet_with_trackers_omits_dn_when_no_name_is_known() {
-        let magnet = magnet_with_trackers("45fa4233ef87c58f5f8b4817e4d50c9f5363caef", None);
+        let magnet = magnet_with_trackers("45fa4233ef87c58f5f8b4817e4d50c9f5363caef", None, &[]);
         assert!(!magnet.contains("&dn="));
+        assert!(!magnet.contains("&tr="), "no trackers given, none emitted");
         assert!(normalize_to_magnet(&magnet).is_ok());
+    }
+
+    /// The defaults feed `SessionOptions::trackers`, which wants parsed URLs
+    /// -- a typo here would be silently dropped at session startup, quietly
+    /// degrading every cold start back to DHT-only discovery.
+    #[test]
+    fn default_trackers_are_nonempty_and_parse_as_urls() {
+        assert!(DEFAULT_TRACKERS.len() >= 6);
+        for tracker in DEFAULT_TRACKERS {
+            assert!(
+                url::Url::parse(tracker).is_ok(),
+                "default tracker is not a valid URL: {tracker}"
+            );
+        }
     }
 
     #[test]

@@ -11,7 +11,7 @@
 
 pub mod resolver;
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::io::SeekFrom;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
@@ -93,6 +93,15 @@ pub struct ActiveTorrentSummary {
     pub peers: u32,
 }
 
+/// One advertised info hash and the trackers the index reported for exactly
+/// that release. Persisted so both survive a restart.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct AdvertisedEntry {
+    hash: String,
+    #[serde(default)]
+    trackers: Vec<String>,
+}
+
 /// Info hashes this gateway has itself offered to a client, newest last.
 ///
 /// `/videos/<hash>/<idx>` starts a torrent that isn't running yet, which is
@@ -101,11 +110,18 @@ pub struct ActiveTorrentSummary {
 /// can reach the port could use it to download arbitrary content in your
 /// name. So a hash is only startable if we advertised it first.
 ///
+/// Each hash also remembers the trackers the index reported for that
+/// specific release. A lazy start otherwise begins from a bare info hash
+/// with nothing but DHT and the generic default trackers to find peers on --
+/// the release's own trackers are where its seeders actually announce, so
+/// carrying them to the start call is a large part of "press play, get
+/// bytes" being fast the first time.
+///
 /// Bounded so a long-running session cannot grow this without limit; evicting
 /// the oldest entry only costs a re-browse to make it playable again.
 struct AdvertisedHashes {
     order: VecDeque<String>,
-    set: HashSet<String>,
+    trackers: HashMap<String, Vec<String>>,
     cap: usize,
 }
 
@@ -113,40 +129,77 @@ impl AdvertisedHashes {
     fn new(cap: usize) -> Self {
         Self {
             order: VecDeque::new(),
-            set: HashSet::new(),
+            trackers: HashMap::new(),
             cap,
         }
     }
 
     /// Rebuilds the set from what was on disk, newest last, honouring the cap.
-    fn seed(cap: usize, hashes: Vec<String>) -> Self {
+    fn seed(cap: usize, entries: Vec<AdvertisedEntry>) -> Self {
         let mut set = Self::new(cap);
-        for hash in hashes {
-            set.remember(hash);
+        for entry in entries {
+            set.remember(entry.hash, entry.trackers);
         }
         set
     }
 
-    fn snapshot(&self) -> Vec<String> {
-        self.order.iter().cloned().collect()
+    fn snapshot(&self) -> Vec<AdvertisedEntry> {
+        self.order
+            .iter()
+            .map(|hash| AdvertisedEntry {
+                hash: hash.clone(),
+                trackers: self.trackers.get(hash).cloned().unwrap_or_default(),
+            })
+            .collect()
     }
 
-    fn remember(&mut self, hash: String) {
-        if self.set.contains(&hash) {
+    fn remember(&mut self, hash: String, trackers: Vec<String>) {
+        if let Some(known) = self.trackers.get_mut(&hash) {
+            // Re-advertised: keep the entry, but adopt trackers if this
+            // sighting knows some and the stored one does not (a legacy
+            // entry, or a magnet-path advert that carried none).
+            if known.is_empty() && !trackers.is_empty() {
+                *known = trackers;
+            }
             return;
         }
         if self.order.len() >= self.cap {
             if let Some(oldest) = self.order.pop_front() {
-                self.set.remove(&oldest);
+                self.trackers.remove(&oldest);
             }
         }
-        self.set.insert(hash.clone());
+        self.trackers.insert(hash.clone(), trackers);
         self.order.push_back(hash);
     }
 
     fn contains(&self, hash: &str) -> bool {
-        self.set.contains(hash)
+        self.trackers.contains_key(hash)
     }
+
+    fn trackers_for(&self, hash: &str) -> Vec<String> {
+        self.trackers.get(hash).cloned().unwrap_or_default()
+    }
+}
+
+/// Decodes a persisted advertised set, accepting both the current format
+/// (entries with trackers) and the pre-0.9 one (a bare list of hashes).
+/// A file written by the previous version must keep every already-installed
+/// Stremio link startable, not silently reset the whole set.
+fn parse_advertised(bytes: &[u8]) -> Vec<AdvertisedEntry> {
+    if let Ok(entries) = serde_json::from_slice::<Vec<AdvertisedEntry>>(bytes) {
+        return entries;
+    }
+    serde_json::from_slice::<Vec<String>>(bytes)
+        .map(|hashes| {
+            hashes
+                .into_iter()
+                .map(|hash| AdvertisedEntry {
+                    hash,
+                    trackers: Vec::new(),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Marks a torrent as "being read right now", for exactly as long as the HTTP
@@ -319,6 +372,15 @@ impl TorrentEngine {
                 upload_bps: bytes_per_second(config.max_upload_mb_s),
                 download_bps: bytes_per_second(config.max_download_mb_s),
             },
+            // Announced for every torrent, metadata fetch included. This is
+            // what makes a cold start fast on networks where DHT is slow or
+            // blocked: a magnet add only reads `tr=` params out of the magnet
+            // itself, but these session-wide trackers are merged into every
+            // torrent's peer discovery regardless of how it was added.
+            trackers: resolver::DEFAULT_TRACKERS
+                .iter()
+                .filter_map(|t| url::Url::parse(t).ok())
+                .collect(),
             ..Default::default()
         };
 
@@ -394,13 +456,24 @@ impl TorrentEngine {
             magnet,
             files,
             suggested_file_idx,
+            seen_peers: response.seen_peers.unwrap_or_default(),
         })
     }
 
     /// Starts (or resumes) downloading a single file from a torrent, restricted
     /// to that file only so the rest of a multi-file torrent is never touched.
     /// Returns the info hash, used to address the torrent for streaming/monitoring.
-    pub async fn start_file(&self, input: &str, file_idx: usize) -> Result<String> {
+    ///
+    /// `initial_peers` seeds the swarm with peers already known to be alive
+    /// (typically the ones a preceding metadata resolve just talked to), so
+    /// the download connects immediately instead of re-running the same
+    /// DHT/tracker discovery a second time. Empty means "discover normally".
+    pub async fn start_file(
+        &self,
+        input: &str,
+        file_idx: usize,
+        initial_peers: Vec<std::net::SocketAddr>,
+    ) -> Result<String> {
         let magnet = self.source.to_magnet(input)?;
         let info_hash = info_hash_from_magnet(&magnet)?;
 
@@ -421,6 +494,7 @@ impl TorrentEngine {
             // module) an unambiguous, collision-free way to map a directory
             // on disk back to the torrent it belongs to.
             sub_folder: Some(info_hash.clone()),
+            initial_peers: (!initial_peers.is_empty()).then_some(initial_peers),
             ..Default::default()
         };
 
@@ -488,31 +562,46 @@ impl TorrentEngine {
             return Ok(false);
         }
 
-        let magnet = resolver::magnet_with_trackers(info_hash, None);
-        self.start_file(&magnet, file_idx).await?;
+        // The release's own trackers (remembered from the index) travel in
+        // the magnet -- a magnet add reads trackers only from the URI itself.
+        // The generic defaults are announced session-wide and need no ride.
+        let trackers = self.advertised_trackers(info_hash).await;
+        let magnet = resolver::magnet_with_trackers(info_hash, None, &trackers);
+        self.start_file(&magnet, file_idx, Vec::new()).await?;
         Ok(true)
     }
 
     /// Records that we handed this info hash to a client, making it eligible
-    /// for lazy start via `ensure_started`.
+    /// for lazy start via `ensure_started` -- along with the trackers the
+    /// index reported for this specific release, so that lazy start announces
+    /// where this torrent's seeders actually are (see `AdvertisedHashes`).
     ///
     /// Persisted immediately. The set used to live only in memory, so every
     /// restart invalidated every link already sitting in a Stremio client:
     /// the phone kept requesting a perfectly good hash and kept getting
     /// "this gateway has not offered that info hash", with no way to tell
     /// that re-picking the stream would fix it.
-    pub async fn remember_advertised(&self, info_hash: &str) {
+    pub async fn remember_advertised(&self, info_hash: &str, trackers: &[String]) {
         let snapshot = {
             let mut advertised = self.advertised.lock().await;
-            advertised.remember(info_hash.to_ascii_lowercase());
+            advertised.remember(info_hash.to_ascii_lowercase(), trackers.to_vec());
             advertised.snapshot()
         };
         self.save_advertised(snapshot).await;
     }
 
+    /// The trackers remembered for an advertised hash (empty when none were
+    /// ever reported for it).
+    pub async fn advertised_trackers(&self, info_hash: &str) -> Vec<String> {
+        self.advertised
+            .lock()
+            .await
+            .trackers_for(&info_hash.to_ascii_lowercase())
+    }
+
     /// Writes the advertised set out. Best effort: failing to persist costs a
     /// re-pick after the next restart, which is not worth failing a request.
-    async fn save_advertised(&self, hashes: Vec<String>) {
+    async fn save_advertised(&self, entries: Vec<AdvertisedEntry>) {
         let path = self.advertised_path.clone();
         if let Some(parent) = path.parent() {
             if let Err(e) = tokio::fs::create_dir_all(parent).await {
@@ -520,7 +609,7 @@ impl TorrentEngine {
                 return;
             }
         }
-        match serde_json::to_vec(&hashes) {
+        match serde_json::to_vec(&entries) {
             Ok(bytes) => {
                 if let Err(e) = tokio::fs::write(&path, bytes).await {
                     debug!("could not persist advertised hashes: {e}");
@@ -532,11 +621,11 @@ impl TorrentEngine {
 
     /// Reads the advertised set back, or an empty list if it is absent or
     /// unreadable — a corrupt file must not stop the gateway from starting.
-    async fn load_advertised(path: &Path) -> Vec<String> {
+    async fn load_advertised(path: &Path) -> Vec<AdvertisedEntry> {
         let Ok(bytes) = tokio::fs::read(path).await else {
             return Vec::new();
         };
-        serde_json::from_slice::<Vec<String>>(&bytes).unwrap_or_default()
+        parse_advertised(&bytes)
     }
 
     /// Whether `/videos/<hash>/...` is allowed to *start* this torrent.
@@ -1025,7 +1114,7 @@ mod tests {
     #[test]
     fn advertised_set_remembers_and_rejects() {
         let mut set = AdvertisedHashes::new(4);
-        set.remember("aaaa".into());
+        set.remember("aaaa".into(), Vec::new());
         assert!(set.contains("aaaa"));
         assert!(!set.contains("bbbb"));
     }
@@ -1033,16 +1122,69 @@ mod tests {
     #[test]
     fn advertised_set_evicts_oldest_beyond_capacity() {
         let mut set = AdvertisedHashes::new(2);
-        set.remember("one".into());
-        set.remember("two".into());
-        set.remember("three".into());
+        set.remember("one".into(), Vec::new());
+        set.remember("two".into(), Vec::new());
+        set.remember("three".into(), Vec::new());
 
         assert!(!set.contains("one"), "oldest entry must be evicted");
         assert!(set.contains("two"));
         assert!(set.contains("three"));
         // Bookkeeping must stay consistent, or the set leaks past its cap.
         assert_eq!(set.order.len(), 2);
-        assert_eq!(set.set.len(), 2);
+        assert_eq!(set.trackers.len(), 2);
+    }
+
+    #[test]
+    fn advertised_set_keeps_trackers_per_hash() {
+        let mut set = AdvertisedHashes::new(4);
+        set.remember(
+            "aaaa".into(),
+            vec!["udp://a.example:1337/announce".into()],
+        );
+        set.remember("bbbb".into(), Vec::new());
+
+        assert_eq!(
+            set.trackers_for("aaaa"),
+            vec!["udp://a.example:1337/announce".to_string()],
+            "a lazy start must announce where this release's seeders are"
+        );
+        assert!(set.trackers_for("bbbb").is_empty());
+        assert!(set.trackers_for("unknown").is_empty());
+    }
+
+    #[test]
+    fn re_advertising_upgrades_a_trackerless_entry_but_never_downgrades() {
+        let mut set = AdvertisedHashes::new(4);
+        set.remember("aaaa".into(), Vec::new());
+        set.remember("aaaa".into(), vec!["udp://a.example:1337/announce".into()]);
+        assert_eq!(
+            set.trackers_for("aaaa"),
+            vec!["udp://a.example:1337/announce".to_string()],
+            "a later sighting that knows trackers must fill in an empty entry"
+        );
+
+        // A later sighting with none must not wipe what is known.
+        set.remember("aaaa".into(), Vec::new());
+        assert!(!set.trackers_for("aaaa").is_empty());
+    }
+
+    /// A pre-0.9 `advertised.json` is a bare list of hashes. It must load as
+    /// entries (with no trackers) rather than parse-fail into an empty set --
+    /// an empty set silently 404s every link already installed in Stremio.
+    #[test]
+    fn legacy_advertised_file_still_loads() {
+        let legacy = br#"["aaaa","bbbb"]"#;
+        let entries = parse_advertised(legacy);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].hash, "aaaa");
+        assert!(entries[0].trackers.is_empty());
+
+        let current = br#"[{"hash":"cccc","trackers":["udp://t.example:80/announce"]}]"#;
+        let entries = parse_advertised(current);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].trackers.len(), 1);
+
+        assert!(parse_advertised(b"not json").is_empty());
     }
 
     #[test]
@@ -1138,9 +1280,9 @@ mod tests {
     fn advertised_set_does_not_double_count_repeats() {
         // Re-browsing the same title must not push other entries out.
         let mut set = AdvertisedHashes::new(2);
-        set.remember("one".into());
-        set.remember("one".into());
-        set.remember("two".into());
+        set.remember("one".into(), Vec::new());
+        set.remember("one".into(), Vec::new());
+        set.remember("two".into(), Vec::new());
 
         assert!(set.contains("one"));
         assert!(set.contains("two"));

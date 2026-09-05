@@ -287,7 +287,7 @@ async fn videos_endpoint_accepts_a_hash_the_gateway_advertised() {
     .expect("refusal is not an error");
     assert!(!unknown, "an unadvertised hash must be refused");
 
-    state.engine.remember_advertised(hash).await;
+    state.engine.remember_advertised(hash, &[]).await;
     let advertised = tokio::time::timeout(
         std::time::Duration::from_secs(1),
         state.engine.ensure_started(hash, 0),
