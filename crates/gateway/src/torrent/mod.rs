@@ -25,7 +25,7 @@ use librqbit::{
     AddTorrent, AddTorrentOptions, Api, DhtSessionConfig, ListenerMode, ListenerOptions, Session,
     SessionOptions, SessionPersistenceConfig,
 };
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt};
+use tokio::io::{AsyncRead, AsyncSeekExt};
 use tokio::sync::{Mutex, Semaphore};
 use tracing::{debug, info, warn};
 
@@ -66,16 +66,6 @@ const RESUME_PEER_TIMEOUT: Duration = Duration::from_secs(8);
 /// to how many streams a browse session shows (15 per title by default).
 const ADVERTISED_HASH_CAPACITY: usize = 512;
 
-/// Least the head-prefetch will pull, when `prebuffer_bytes` is small or
-/// disabled. A player still opens by reading the container header, so there
-/// is a floor worth having on disk even when the response pre-buffer is off.
-const PREBUFFER_HEAD_FLOOR: usize = 2 * 1024 * 1024;
-
-/// Bounds the head-prefetch read. Past this the swarm is too slow for the
-/// head start to land before the viewer taps, and holding the read open only
-/// keeps a torrent exempt from the reaper for no gain.
-const PREFETCH_HEAD_TIMEOUT: Duration = Duration::from_secs(45);
-
 /// Cap on how many already-known torrents a single browse will wake up. A
 /// title's stream list can name a dozen releases we have partial data for;
 /// resuming all of them would have them compete for the same upstream
@@ -107,10 +97,6 @@ pub struct BrowseCandidate {
     pub file_idx: usize,
     /// Trackers the index reported for this exact release.
     pub trackers: Vec<String>,
-    /// Whether to pull the start of the file as well as the metadata. Set on
-    /// the row the viewer is most likely to tap, and only that one -- see
-    /// `prefetch_candidate`.
-    pub fetch_head: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -1140,10 +1126,6 @@ impl TorrentEngine {
     /// Fetches one unknown torrent's metadata and joins its swarm, ahead of
     /// the viewer picking it.
     async fn prefetch_candidate(self: &Arc<Self>, candidate: BrowseCandidate) {
-        // Whether a video is on screen right now, read *before* this function
-        // opens a read of its own below (which would otherwise count itself).
-        let watching = self.open_stream_count() > 0;
-
         let magnet =
             resolver::magnet_with_trackers(&candidate.info_hash, None, &candidate.trackers);
         if let Err(e) = self
@@ -1154,93 +1136,27 @@ impl TorrentEngine {
             return;
         }
 
-        // Metadata only, in two cases:
-        //
-        // * something is being watched -- this prefetch has already bought
-        //   the expensive part (metadata survives pausing) and must not go on
-        //   competing for the line with the video on screen;
-        // * this is not the row the viewer is most likely to tap. Bytes are a
-        //   zero-sum resource on one link: pulling the head of three
-        //   candidates at once means the one actually chosen arrives at a
-        //   third of the speed. Metadata for breadth, bytes for the top pick.
+        // Metadata only, deliberately never bytes. An earlier version also
+        // opened an unguarded read to pull the head of the file onto disk --
+        // but librqbit splits piece-download priority evenly across every
+        // *open read* on a file (`iter_next_pieces` interleaves them), guard
+        // or no guard. That read has no timeout on an individual `read()`
+        // call, so it could still be sitting there, priority slot and all,
+        // when the viewer's own request opened a second one a moment later --
+        // silently halving the bandwidth going to the stream someone was
+        // actually waiting on. Measured live: switching to a freshly-tapped
+        // title stalled hard while a candidate nobody was watching anymore
+        // kept a read open. Metadata + connected peers (this) is the part
+        // that is safe to want ahead of time; bytes are not, because getting
+        // them requires holding exactly the resource a real viewer needs
+        // undiluted.
         //
         // Parking here rather than waiting for the idle reaper's next tick is
-        // what keeps that bandwidth with the viewer.
-        if watching || !candidate.fetch_head {
-            if let Ok(idx) = TorrentIdOrHash::parse(&candidate.info_hash) {
-                let _ = self.api.api_torrent_action_pause(idx).await;
-            }
-            debug!(info_hash = %candidate.info_hash, "prefetched metadata only");
-            return;
+        // what keeps that bandwidth with the viewer once one exists.
+        if let Ok(idx) = TorrentIdOrHash::parse(&candidate.info_hash) {
+            let _ = self.api.api_torrent_action_pause(idx).await;
         }
-
-        self.prefetch_head(&candidate).await;
-    }
-
-    /// Pulls the first bytes of the file a prefetched candidate would play.
-    ///
-    /// Metadata alone is only half a head start. librqbit derives its piece
-    /// priorities purely from open read streams, so a torrent that is running
-    /// with nobody reading it downloads in whatever order it likes -- and the
-    /// one thing a player asks for first, the head of the file, is as likely
-    /// as not to be last. That is why a prefetched title could still stall on
-    /// the opening request: the swarm was found, peers were connected, and
-    /// none of the bytes on disk were the ones being asked for.
-    ///
-    /// Opening a read here points the download at exactly those bytes and
-    /// leaves them on disk, which is what turns the viewer's first request
-    /// into a local file read. Bounded by the same figure that request will
-    /// want, and by a timeout, because a swarm that cannot deliver this in
-    /// time is one the viewer is about to wait on anyway.
-    async fn prefetch_head(self: &Arc<Self>, candidate: &BrowseCandidate) {
-        let wanted = self.prebuffer_bytes.max(PREBUFFER_HEAD_FLOOR);
-        let mut reader = match self
-            .open_stream_at(&candidate.info_hash, candidate.file_idx, 0)
-            .await
-        {
-            Ok(reader) => reader,
-            Err(e) => {
-                debug!(info_hash = %candidate.info_hash, "could not open a prefetch read: {e:#}");
-                return;
-            }
-        };
-
-        // Deliberately *no* `StreamGuard`. A guard means "a viewer is reading
-        // this, do not touch it", and every bandwidth protection in this
-        // module asks for exactly that before pausing anything. Claiming it
-        // for a speculative read makes the prefetch immune to the protections
-        // that exist to keep it out of a real viewer's way -- so a candidate
-        // nobody chose goes on competing with the video on screen. Being
-        // paused mid-read is the correct outcome here: the read then simply
-        // times out below, with the head it managed to fetch already on disk.
-        let read = tokio::time::timeout(PREFETCH_HEAD_TIMEOUT, async {
-            let mut buf = vec![0u8; 64 * 1024];
-            let mut total = 0usize;
-            while total < wanted {
-                // A viewer just started watching something. Whatever they
-                // picked needs the line more than this guess does.
-                if self.open_stream_count() > 0 {
-                    break;
-                }
-                match reader.read(&mut buf).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => total += n,
-                }
-            }
-            total
-        })
-        .await;
-
-        match read {
-            Ok(bytes) => debug!(
-                info_hash = %candidate.info_hash, bytes,
-                "prefetched the head of a candidate; playing it is now a local read"
-            ),
-            Err(_) => debug!(
-                info_hash = %candidate.info_hash,
-                "prefetch head read timed out; the swarm is slow, playback will wait on it"
-            ),
-        }
+        debug!(info_hash = %candidate.info_hash, "prefetched metadata only");
     }
 
     /// Pauses every unfinished torrent that is not the one being watched and

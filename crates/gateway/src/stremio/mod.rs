@@ -246,17 +246,12 @@ async fn indexed_streams(
     // reading the list, rather than inside the request their player makes
     // afterwards -- that fetch is most of what a slow start actually is.
     // Detached because the stream list must not wait on it.
-    // `found` is sorted best-first (seeders, then size), and that first row
-    // is what Stremio puts at the top of the list -- so it is the one worth
-    // spending bytes on, not just metadata.
     let candidates: Vec<BrowseCandidate> = found
         .iter()
-        .enumerate()
-        .map(|(rank, t)| BrowseCandidate {
+        .map(|t| BrowseCandidate {
             info_hash: t.info_hash.clone(),
             file_idx: t.file_idx.unwrap_or(0),
             trackers: t.trackers.clone(),
-            fetch_head: rank == 0,
         })
         .collect();
     let engine = Arc::clone(&state.engine);
