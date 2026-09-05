@@ -232,6 +232,9 @@ Everything has a sensible default. Change these only if you need to:
 | `STALL_TIMEOUT_SECS` | `20` | If playback gets no data for this long, quietly reconnect |
 | `CLIENT_TIMEOUT_SECS` | `900` | Hang up on a player that stopped responding, freeing its movie |
 | `MAX_PEERS_PER_TORRENT` | `60` | Peers per movie. Higher is not faster on a home connection |
+| `BROWSE_PREFETCH_COUNT` | `1` | Start the top stream while you read the list, so playing it is instant. `0` turns it off |
+| `PEER_PORT` | `6881` | Port other peers connect in on. Falls back to a free one if taken |
+| `DISABLE_UPNP` | `false` | Stop asking the router to forward `PEER_PORT` |
 | `MAX_DOWNLOAD_MB_S` | `0` (off) | Cap download speed. See "Playback keeps buffering" |
 | `MAX_UPLOAD_MB_S` | `0` (off) | Cap upload/seeding speed |
 | `INDEXER_URL` | Torrentio | Where movies are searched for |
@@ -440,6 +443,33 @@ setup.sh   Dockerfile
   cap it was nowhere near.
 - **Responses are withheld until data exists.** Players treat "headers, then a
   stalled body" as a broken stream, but wait patiently on a slow request.
+- **The top stream is fetched while you are still reading the list.** Pulling a
+  torrent's metadata over DHT/trackers is most of a cold start, and it used to
+  happen *inside* the request the player makes after you tap — so every second
+  of it was a second of spinner. Warming it at browse time instead measured 3/3
+  cold starts under 2 ms against 2.7–16.4 s. It fetches the head of the file
+  too, not just the metadata: librqbit takes its piece priorities from open
+  reads, so a running torrent with nobody reading it downloads in whatever
+  order it likes, and the one thing a player asks for first is as likely as not
+  to arrive last.
+- **Exactly one stream is prefetched, and that is a measured limit.**
+  Concurrent metadata fetches compete for the same DHT and tracker capacity:
+  warming the top *two* made the row actually tapped resolve slower than
+  fetching it alone would have. The prefetch also never claims a `StreamGuard`
+  and is paused the moment a real viewer starts watching — a guess must never
+  hold bandwidth against someone who is actually watching something.
+- **A torrent is only ever started once, under a per-hash lock.** librqbit
+  resolves a magnet's metadata *before* the torrent appears in the session, so
+  for the whole of that fetch it is invisible to a lookup. Without the lock, a
+  viewer tapping a title mid-prefetch saw nothing running and kicked off a
+  second, duplicate metadata fetch — competing with the first and discarding
+  the head start entirely.
+- **The gateway listens for incoming peers.** librqbit does not open a
+  listening socket unless asked, which leaves the gateway dialling out only:
+  every seeder that would have connected to *us* after a tracker announce is
+  lost. The symptom is a first play stuck at two or three peers and a few dozen
+  KB/s. The port is forwarded via UPnP, without which the listener only reaches
+  this LAN — where a public swarm has no peers at all.
 
 ### Build & test
 

@@ -94,6 +94,42 @@ pub struct AppConfig {
     #[arg(long, env = "DISABLE_DHT", default_value_t = false)]
     pub disable_dht: bool,
 
+    /// Port to accept incoming peer connections on. 0 picks any free port.
+    ///
+    /// Without a listening socket the gateway can only ever *dial* peers, so
+    /// every seeder that would have connected to us after our tracker
+    /// announce is simply lost -- which shows up as a handful of peers and a
+    /// download that crawls on the first play of a title. If the port cannot
+    /// be bound the gateway falls back to an ephemeral one rather than
+    /// refusing to start.
+    #[arg(long, env = "PEER_PORT", default_value_t = 6881)]
+    pub peer_port: u16,
+
+    /// Do not ask the router to forward the peer port via UPnP.
+    ///
+    /// The forward is what lets peers outside this LAN reach the listening
+    /// socket above; without it the listener only helps peers on the local
+    /// network, which for a public swarm is almost none of them.
+    #[arg(long, env = "DISABLE_UPNP", default_value_t = false)]
+    pub disable_upnp: bool,
+
+    /// How many not-yet-known torrents to start fetching while the viewer is
+    /// still reading the stream list. 0 disables prefetching.
+    ///
+    /// This is the single biggest lever on how long "press play" takes.
+    /// Fetching a torrent's metadata over DHT/trackers is most of the cold
+    /// start, and doing it when the list is *shown* rather than when a row is
+    /// *tapped* moves that whole wait to where nobody is watching a spinner.
+    ///
+    /// One, not several, and that is a measured figure rather than caution:
+    /// concurrent metadata fetches compete for the same DHT and tracker
+    /// capacity, so prefetching the top two made the row the viewer actually
+    /// tapped resolve *slower* than fetching it alone would have. Warming
+    /// only the top row -- the highest-seeded one, which is what the list
+    /// shows first -- is never worse than not prefetching at all.
+    #[arg(long, env = "BROWSE_PREFETCH_COUNT", default_value_t = 1)]
+    pub browse_prefetch_count: usize,
+
     /// How often (seconds) to print the terminal monitoring status.
     #[arg(long, env = "MONITOR_INTERVAL_SECS", default_value_t = 5)]
     pub monitor_interval_secs: u64,
@@ -278,6 +314,26 @@ mod tests {
         assert_ne!(
             config.port, config.fallback_port,
             "the fallback must be a different port or it can never rescue a clash"
+        );
+    }
+
+    /// Every one of these is a cold-start lever whose "off" value is a
+    /// perfectly ordinary-looking number, and turning any of them off costs
+    /// only latency -- nothing errors, nothing logs, playback still works. So
+    /// the shipped values are pinned here, because the way this regresses is
+    /// silently.
+    #[test]
+    fn cold_start_defaults_stay_on() {
+        let config = defaults();
+        assert!(
+            config.browse_prefetch_count > 0,
+            "prefetching while the stream list is on screen is what keeps the \
+             metadata fetch out of the request the player makes after the tap"
+        );
+        assert!(
+            !config.disable_upnp,
+            "without the port forward the peer listener only reaches this LAN, \
+             where a public swarm has no peers at all"
         );
     }
 

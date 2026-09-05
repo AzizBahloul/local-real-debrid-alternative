@@ -30,6 +30,7 @@ use serde_json::{json, Value};
 use tracing::{debug, warn};
 
 use crate::indexer::{IndexedTorrent, StreamIndexer};
+use crate::torrent::BrowseCandidate;
 use crate::AppState;
 
 pub const ADDON_ID: &str = "com.localgateway.streaminggateway";
@@ -239,14 +240,27 @@ async fn indexed_streams(
     }
 
     // Reaching this list is the earliest reliable sign that someone is about
-    // to play one of these. Waking the ones already half-downloaded now means
-    // their peer connections are re-established while the viewer is still
-    // reading the list, instead of after they press play -- rediscovering
-    // peers is most of what a slow start actually is. Detached because the
-    // stream list must not wait on it.
-    let hashes: Vec<String> = found.iter().map(|t| t.info_hash.clone()).collect();
+    // to play one of these, and it is the last moment before the tap when
+    // waiting costs nobody anything. So the top candidates start fetching
+    // metadata and connecting to peers now, while the viewer is still
+    // reading the list, rather than inside the request their player makes
+    // afterwards -- that fetch is most of what a slow start actually is.
+    // Detached because the stream list must not wait on it.
+    // `found` is sorted best-first (seeders, then size), and that first row
+    // is what Stremio puts at the top of the list -- so it is the one worth
+    // spending bytes on, not just metadata.
+    let candidates: Vec<BrowseCandidate> = found
+        .iter()
+        .enumerate()
+        .map(|(rank, t)| BrowseCandidate {
+            info_hash: t.info_hash.clone(),
+            file_idx: t.file_idx.unwrap_or(0),
+            trackers: t.trackers.clone(),
+            fetch_head: rank == 0,
+        })
+        .collect();
     let engine = Arc::clone(&state.engine);
-    tokio::spawn(async move { engine.warm_known_torrents(&hashes).await });
+    tokio::spawn(async move { engine.warm_for_browse(&candidates).await });
 
     found
         .iter()

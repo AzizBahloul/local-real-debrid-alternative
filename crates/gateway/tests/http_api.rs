@@ -49,6 +49,12 @@ async fn test_state() -> AppState {
         max_download_mb_s: 0,
         client_timeout_secs: 0,
         disable_dht: true, // tests must not depend on the public DHT network
+        // An ephemeral peer port so concurrent test sessions never clash over
+        // one, and no UPnP: a test must not reconfigure the developer's
+        // router. Prefetch off -- it would join real swarms.
+        peer_port: 0,
+        disable_upnp: true,
+        browse_prefetch_count: 0,
         monitor_interval_secs: 3600,
         log_level: "error".to_string(),
         // Discovery off: these tests must not reach out to a public index.

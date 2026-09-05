@@ -24,7 +24,14 @@ use crate::torrent::{BoxedReader, StreamGuard, TorrentEngine};
 /// only taken if it is already downloaded -- see `prebuffer`. Deliberately
 /// small: it is a floor that prevents an empty response, not a playback
 /// buffer, and the player does its own buffering on top.
-const PREBUFFER_MIN_BYTES: usize = 512 * 1024;
+///
+/// It is a *latency* figure, not a throughput one: whatever this is set to,
+/// the viewer waits for it before a single byte of the response goes out. At
+/// the trickle a torrent runs at in its first seconds, 512 KB was on its own
+/// worth more than ten seconds of staring at a spinner, for no benefit -- a
+/// player needs enough bytes to start parsing the container, not half a
+/// megabyte of it.
+const PREBUFFER_MIN_BYTES: usize = 128 * 1024;
 
 /// How long "is more data already available?" is allowed to take before the
 /// pre-buffer stops topping up and sends what it has.

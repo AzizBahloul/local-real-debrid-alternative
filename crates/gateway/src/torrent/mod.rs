@@ -22,10 +22,10 @@ use anyhow::{Context, Result};
 use librqbit::api::TorrentIdOrHash;
 use librqbit::limits::LimitsConfig;
 use librqbit::{
-    AddTorrent, AddTorrentOptions, Api, DhtSessionConfig, Session, SessionOptions,
-    SessionPersistenceConfig,
+    AddTorrent, AddTorrentOptions, Api, DhtSessionConfig, ListenerMode, ListenerOptions, Session,
+    SessionOptions, SessionPersistenceConfig,
 };
-use tokio::io::{AsyncRead, AsyncSeekExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt};
 use tokio::sync::{Mutex, Semaphore};
 use tracing::{debug, info, warn};
 
@@ -56,6 +56,16 @@ const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(15);
 /// to how many streams a browse session shows (15 per title by default).
 const ADVERTISED_HASH_CAPACITY: usize = 512;
 
+/// Least the head-prefetch will pull, when `prebuffer_bytes` is small or
+/// disabled. A player still opens by reading the container header, so there
+/// is a floor worth having on disk even when the response pre-buffer is off.
+const PREBUFFER_HEAD_FLOOR: usize = 2 * 1024 * 1024;
+
+/// Bounds the head-prefetch read. Past this the swarm is too slow for the
+/// head start to land before the viewer taps, and holding the read open only
+/// keeps a torrent exempt from the reaper for no gain.
+const PREFETCH_HEAD_TIMEOUT: Duration = Duration::from_secs(45);
+
 /// Cap on how many already-known torrents a single browse will wake up. A
 /// title's stream list can name a dozen releases we have partial data for;
 /// resuming all of them would have them compete for the same upstream
@@ -77,6 +87,20 @@ use resolver::{
 pub struct StreamActivity {
     pub last_access: Instant,
     pub last_client: IpAddr,
+}
+
+/// One row of a title's stream list, as far as pre-warming cares.
+#[derive(Debug, Clone)]
+pub struct BrowseCandidate {
+    pub info_hash: String,
+    /// Which file inside the torrent the viewer would play.
+    pub file_idx: usize,
+    /// Trackers the index reported for this exact release.
+    pub trackers: Vec<String>,
+    /// Whether to pull the start of the file as well as the metadata. Set on
+    /// the row the viewer is most likely to tap, and only that one -- see
+    /// `prefetch_candidate`.
+    pub fetch_head: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -179,6 +203,22 @@ impl AdvertisedHashes {
     fn trackers_for(&self, hash: &str) -> Vec<String> {
         self.trackers.get(hash).cloned().unwrap_or_default()
     }
+}
+
+/// Hands out the start lock for one info hash, creating it on first use.
+///
+/// Every caller for the same hash must get the *same* `Arc`, or the lock
+/// guards nothing. Entries whose only remaining owner is the map are dropped
+/// as we pass over them, so a long browsing session cannot grow this without
+/// bound -- while a lock somebody is currently holding or waiting on (strong
+/// count above one) is never removed.
+fn lock_for(starts: &mut HashMap<String, Arc<Mutex<()>>>, info_hash: &str) -> Arc<Mutex<()>> {
+    starts.retain(|hash, lock| hash == info_hash || Arc::strong_count(lock) > 1);
+    Arc::clone(
+        starts
+            .entry(info_hash.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(()))),
+    )
 }
 
 /// Decodes a persisted advertised set, accepting both the current format
@@ -291,6 +331,12 @@ pub struct TorrentEngine {
     prebuffer_bytes: usize,
     prebuffer_timeout: Duration,
     stall_timeout: Duration,
+    /// How many unknown torrents a single browse may start fetching metadata
+    /// for. See `warm_for_browse`.
+    browse_prefetch: usize,
+    /// One lock per info hash being started, so the same torrent is never
+    /// added twice at once. See `start_lock`.
+    starts: Mutex<HashMap<String, Arc<Mutex<()>>>>,
 }
 
 /// What to do with a torrent that is not the one being watched.
@@ -349,17 +395,27 @@ impl TorrentEngine {
             .await
             .context("creating session state directory")?;
 
-        let dht = if config.disable_dht {
-            None
-        } else {
-            Some(DhtSessionConfig::default())
-        };
-
-        let opts = SessionOptions {
-            dht,
+        // Rebuilt per attempt: `SessionOptions` is consumed by the call and
+        // is not `Clone`, and the peer port needs a second try (see below).
+        let make_opts = |peer_port: u16| SessionOptions {
+            dht: (!config.disable_dht).then(DhtSessionConfig::default),
             fastresume: true,
             persistence: Some(SessionPersistenceConfig::Json {
                 folder: Some(config.session_state_dir()),
+            }),
+            // Accepting incoming peer connections is not optional for a fast
+            // start. librqbit does not listen at all unless told to, which
+            // leaves the gateway dialling out only: every seeder that would
+            // have connected to *us* after our tracker announce -- a large
+            // share of a healthy swarm -- can never arrive. The symptom is a
+            // first play stuck at a handful of peers and a few dozen KB/s.
+            listen: Some(ListenerOptions {
+                mode: ListenerMode::TcpOnly,
+                listen_addr: (std::net::Ipv6Addr::UNSPECIFIED, peer_port).into(),
+                // What makes that listener reachable from outside this LAN,
+                // which for a public swarm is where nearly every peer is.
+                enable_upnp_port_forwarding: !config.disable_upnp,
+                ..Default::default()
             }),
             // Both of these are left at librqbit's defaults by most callers,
             // and both of those defaults are wrong for this gateway --
@@ -384,9 +440,26 @@ impl TorrentEngine {
             ..Default::default()
         };
 
-        let session = Session::new_with_opts(config.downloads_dir(), opts)
+        // A peer port already in use is fatal inside librqbit, and the
+        // default is a well-known one that another torrent client may well
+        // hold. Falling back to an ephemeral port keeps the listener (and so
+        // the incoming peers it exists for) rather than refusing to start.
+        let session = match Session::new_with_opts(config.downloads_dir(), make_opts(config.peer_port))
             .await
-            .context("failed to start torrent session")?;
+        {
+            Ok(session) => session,
+            Err(e) if config.peer_port != 0 => {
+                warn!(
+                    port = config.peer_port,
+                    "could not start the torrent session on that peer port ({e:#}); \
+                     retrying on an ephemeral one"
+                );
+                Session::new_with_opts(config.downloads_dir(), make_opts(0))
+                    .await
+                    .context("failed to start torrent session")?
+            }
+            Err(e) => return Err(e).context("failed to start torrent session"),
+        };
 
         let api = Api::new(session, None);
 
@@ -414,6 +487,8 @@ impl TorrentEngine {
             prebuffer_bytes: config.prebuffer_bytes,
             prebuffer_timeout: Duration::from_secs(config.prebuffer_timeout_secs),
             stall_timeout: Duration::from_secs(config.stall_timeout_secs),
+            browse_prefetch: config.browse_prefetch_count,
+            starts: Mutex::new(HashMap::new()),
         }))
     }
 
@@ -477,6 +552,30 @@ impl TorrentEngine {
         let magnet = self.source.to_magnet(input)?;
         let info_hash = info_hash_from_magnet(&magnet)?;
 
+        // Serializes starts of *this* torrent. librqbit resolves a magnet's
+        // metadata before the torrent appears in the session, so for the
+        // whole of that fetch -- the slowest part of a cold start -- the
+        // torrent is invisible to `session.get()`. Without this lock a viewer
+        // tapping a title whose prefetch is still resolving looks it up, sees
+        // nothing, and kicks off a *second* metadata fetch alongside the
+        // first: two fetches competing for the same peers, and the head start
+        // the prefetch bought thrown away. Waiting here instead means the tap
+        // joins the fetch already in flight and returns the moment it lands.
+        let start_lock = self.start_lock(&info_hash).await;
+        let _start_guard = start_lock.lock().await;
+
+        // Whoever held the lock may have finished the job while we waited.
+        let idx = TorrentIdOrHash::parse(&info_hash)
+            .map_err(|e| anyhow::anyhow!("invalid info hash {info_hash}: {e}"))?;
+        if let Some(handle) = self.api.session().get(idx) {
+            if handle.is_paused() {
+                let _ = self.api.api_torrent_action_start(idx).await;
+            }
+            self.wait_until_streamable(&info_hash, INITIALIZE_TIMEOUT)
+                .await?;
+            return Ok(info_hash);
+        }
+
         // Throttles how many torrents can be *added* concurrently (each add
         // does a burst of tracker/DHT/peer-handshake work) -- not how many
         // can stream at once, so the permit is dropped as soon as add returns.
@@ -523,6 +622,16 @@ impl TorrentEngine {
             .await?;
 
         Ok(info_hash)
+    }
+
+    /// The lock guarding starts of one particular torrent, creating it on
+    /// first use.
+    ///
+    /// Entries whose only remaining owner is the map itself are dropped as we
+    /// pass over them, so a long browsing session cannot grow this without
+    /// bound while a lock currently being waited on is never removed.
+    async fn start_lock(&self, info_hash: &str) -> Arc<Mutex<()>> {
+        lock_for(&mut *self.starts.lock().await, info_hash)
     }
 
     /// Makes sure `info_hash` is present in the session and streamable,
@@ -737,21 +846,28 @@ impl TorrentEngine {
             focused.replace(info_hash.to_string())
         };
 
-        // Nothing was playing before, so nothing has been abandoned. This is
-        // what keeps the first play of a session from touching the backlog.
-        let Some(previous) = previous else {
-            return;
-        };
-
         let engine = Arc::clone(self);
         let focus = info_hash.to_string();
         tokio::spawn(async move {
-            if engine.discard_abandoned(&previous).await {
-                info!(
-                    focused = %focus,
-                    abandoned = %previous,
-                    "switched title: dropped the one left behind and freed its partial data"
-                );
+            // Nothing was playing before means nothing has been abandoned --
+            // this is what keeps the first play of a session from touching
+            // the backlog. Candidates prefetched for this browse still get
+            // parked below, since those were never watched at all.
+            if let Some(previous) = previous {
+                if engine.discard_abandoned(&previous).await {
+                    info!(
+                        focused = %focus,
+                        abandoned = %previous,
+                        "switched title: dropped the one left behind and freed its partial data"
+                    );
+                }
+            }
+            // Everything else that is still running was prefetched or left
+            // over, and is now competing with the video on screen for the
+            // same line.
+            let parked = engine.pause_unfocused(&focus).await;
+            if parked > 0 {
+                debug!(focused = %focus, parked, "gave the line to the stream being watched");
             }
         });
     }
@@ -898,46 +1014,225 @@ impl TorrentEngine {
         Ok(Box::new(stream))
     }
 
-    /// Resumes torrents we already have partial data for, so they are already
-    /// connected to peers by the time the viewer picks one.
+    /// One row of a stream list, as far as warming is concerned.
     ///
-    /// Called when Stremio lists the streams for a title. Resuming a paused
-    /// torrent drops it back to zero peers and it must rediscover them over
-    /// DHT/trackers, which is most of what "it took 30 seconds to start"
-    /// actually is. Doing that while the viewer is still reading the stream
-    /// list spends that time where nobody is waiting on it.
+    /// Prepares the torrents behind a title's stream list while the viewer is
+    /// still reading it, so that pressing play is not where the waiting
+    /// happens.
     ///
-    /// Only touches torrents already in the session, so browsing never joins
-    /// a swarm on its own.
-    pub async fn warm_known_torrents(&self, info_hashes: &[String]) {
-        let mut warmed = 0usize;
-        for hash in info_hashes {
-            if warmed >= MAX_WARM_ON_BROWSE {
-                break;
-            }
-            let Ok(idx) = TorrentIdOrHash::parse(hash) else {
+    /// Two different jobs, because a candidate is in one of two states:
+    ///
+    /// * **already in the session but paused** -- resume it. Pausing drops
+    ///   every peer connection and they have to be rediscovered over
+    ///   DHT/trackers, which is most of what "it took 30 seconds to start"
+    ///   actually is.
+    /// * **never seen** -- fetch its metadata and join its swarm now. This is
+    ///   the expensive half of a cold start (a magnet carries only an info
+    ///   hash; the file list has to be pulled from a peer that has it), and
+    ///   until this existed *all* of it happened inside the request the
+    ///   player made after the tap, where the viewer watches a spinner for
+    ///   every second of it.
+    ///
+    /// Deliberately bounded (`browse_prefetch` new torrents, three resumes):
+    /// each prefetch joins a swarm the viewer may never pick, and every
+    /// running torrent competes for the same line as the one being watched.
+    pub async fn warm_for_browse(self: &Arc<Self>, candidates: &[BrowseCandidate]) {
+        let mut resumed = 0usize;
+        let mut prefetch: Vec<BrowseCandidate> = Vec::new();
+
+        for candidate in candidates {
+            let Ok(idx) = TorrentIdOrHash::parse(&candidate.info_hash) else {
                 continue;
             };
-            let Some(handle) = self.api.session().get(idx) else {
-                continue; // never played -- nothing to warm
-            };
-            if !handle.is_paused() {
-                continue;
-            }
-            let stats = handle.stats();
-            // Finished torrents need no peers, and ones with no data yet gain
-            // nothing from a head start they would only spend on metadata.
-            if stats.progress_bytes == 0 || stats.progress_bytes >= stats.total_bytes {
-                continue;
-            }
-            match self.api.api_torrent_action_start(idx).await {
-                Ok(_) => {
-                    debug!(info_hash = %hash, "pre-warming previously watched torrent");
-                    warmed += 1;
+            match self.api.session().get(idx) {
+                Some(handle) => {
+                    if resumed >= MAX_WARM_ON_BROWSE || !handle.is_paused() {
+                        continue;
+                    }
+                    let stats = handle.stats();
+                    // Finished torrents need no peers, and ones with no data
+                    // yet gain nothing from a head start they would only
+                    // spend on metadata.
+                    if stats.progress_bytes == 0 || stats.progress_bytes >= stats.total_bytes {
+                        continue;
+                    }
+                    match self.api.api_torrent_action_start(idx).await {
+                        Ok(_) => {
+                            debug!(info_hash = %candidate.info_hash, "pre-warming previously watched torrent");
+                            resumed += 1;
+                        }
+                        Err(e) => {
+                            debug!(info_hash = %candidate.info_hash, "could not pre-warm: {e}")
+                        }
+                    }
                 }
-                Err(e) => debug!(info_hash = %hash, "could not pre-warm: {e}"),
+                None if prefetch.len() < self.browse_prefetch => {
+                    prefetch.push(candidate.clone());
+                }
+                None => {}
             }
         }
+
+        // Concurrently, because each one is a network round-trip of its own
+        // and running them in sequence would mean the second candidate only
+        // starts warming after the first has finished or timed out.
+        let tasks: Vec<_> = prefetch
+            .into_iter()
+            .map(|candidate| {
+                let engine = Arc::clone(self);
+                tokio::spawn(async move { engine.prefetch_candidate(candidate).await })
+            })
+            .collect();
+        for task in tasks {
+            let _ = task.await;
+        }
+    }
+
+    /// Fetches one unknown torrent's metadata and joins its swarm, ahead of
+    /// the viewer picking it.
+    async fn prefetch_candidate(self: &Arc<Self>, candidate: BrowseCandidate) {
+        // Whether a video is on screen right now, read *before* this function
+        // opens a read of its own below (which would otherwise count itself).
+        let watching = self.open_stream_count() > 0;
+
+        let magnet =
+            resolver::magnet_with_trackers(&candidate.info_hash, None, &candidate.trackers);
+        if let Err(e) = self
+            .start_file(&magnet, candidate.file_idx, Vec::new())
+            .await
+        {
+            debug!(info_hash = %candidate.info_hash, "could not prefetch candidate: {e:#}");
+            return;
+        }
+
+        // Metadata only, in two cases:
+        //
+        // * something is being watched -- this prefetch has already bought
+        //   the expensive part (metadata survives pausing) and must not go on
+        //   competing for the line with the video on screen;
+        // * this is not the row the viewer is most likely to tap. Bytes are a
+        //   zero-sum resource on one link: pulling the head of three
+        //   candidates at once means the one actually chosen arrives at a
+        //   third of the speed. Metadata for breadth, bytes for the top pick.
+        //
+        // Parking here rather than waiting for the idle reaper's next tick is
+        // what keeps that bandwidth with the viewer.
+        if watching || !candidate.fetch_head {
+            if let Ok(idx) = TorrentIdOrHash::parse(&candidate.info_hash) {
+                let _ = self.api.api_torrent_action_pause(idx).await;
+            }
+            debug!(info_hash = %candidate.info_hash, "prefetched metadata only");
+            return;
+        }
+
+        self.prefetch_head(&candidate).await;
+    }
+
+    /// Pulls the first bytes of the file a prefetched candidate would play.
+    ///
+    /// Metadata alone is only half a head start. librqbit derives its piece
+    /// priorities purely from open read streams, so a torrent that is running
+    /// with nobody reading it downloads in whatever order it likes -- and the
+    /// one thing a player asks for first, the head of the file, is as likely
+    /// as not to be last. That is why a prefetched title could still stall on
+    /// the opening request: the swarm was found, peers were connected, and
+    /// none of the bytes on disk were the ones being asked for.
+    ///
+    /// Opening a read here points the download at exactly those bytes and
+    /// leaves them on disk, which is what turns the viewer's first request
+    /// into a local file read. Bounded by the same figure that request will
+    /// want, and by a timeout, because a swarm that cannot deliver this in
+    /// time is one the viewer is about to wait on anyway.
+    async fn prefetch_head(self: &Arc<Self>, candidate: &BrowseCandidate) {
+        let wanted = self.prebuffer_bytes.max(PREBUFFER_HEAD_FLOOR);
+        let mut reader = match self
+            .open_stream_at(&candidate.info_hash, candidate.file_idx, 0)
+            .await
+        {
+            Ok(reader) => reader,
+            Err(e) => {
+                debug!(info_hash = %candidate.info_hash, "could not open a prefetch read: {e:#}");
+                return;
+            }
+        };
+
+        // Deliberately *no* `StreamGuard`. A guard means "a viewer is reading
+        // this, do not touch it", and every bandwidth protection in this
+        // module asks for exactly that before pausing anything. Claiming it
+        // for a speculative read makes the prefetch immune to the protections
+        // that exist to keep it out of a real viewer's way -- so a candidate
+        // nobody chose goes on competing with the video on screen. Being
+        // paused mid-read is the correct outcome here: the read then simply
+        // times out below, with the head it managed to fetch already on disk.
+        let read = tokio::time::timeout(PREFETCH_HEAD_TIMEOUT, async {
+            let mut buf = vec![0u8; 64 * 1024];
+            let mut total = 0usize;
+            while total < wanted {
+                // A viewer just started watching something. Whatever they
+                // picked needs the line more than this guess does.
+                if self.open_stream_count() > 0 {
+                    break;
+                }
+                match reader.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => total += n,
+                }
+            }
+            total
+        })
+        .await;
+
+        match read {
+            Ok(bytes) => debug!(
+                info_hash = %candidate.info_hash, bytes,
+                "prefetched the head of a candidate; playing it is now a local read"
+            ),
+            Err(_) => debug!(
+                info_hash = %candidate.info_hash,
+                "prefetch head read timed out; the swarm is slow, playback will wait on it"
+            ),
+        }
+    }
+
+    /// Pauses every unfinished torrent that is not the one being watched and
+    /// has nobody reading it.
+    ///
+    /// Prefetching means several torrents can be running when the viewer
+    /// finally picks one, and every one of them competes for the same
+    /// upstream link as the video on screen. The idle reaper gets to them
+    /// eventually; "eventually" is up to a full check interval of the chosen
+    /// stream sharing its bandwidth with candidates nobody chose.
+    async fn pause_unfocused(&self, focused: &str) -> usize {
+        let candidates: Vec<(TorrentIdOrHash, String)> = self.api.session().with_torrents(|iter| {
+            iter.filter_map(|(_, handle)| {
+                let hash = handle.info_hash().as_string();
+                if hash == focused || handle.is_paused() {
+                    return None;
+                }
+                let stats = handle.stats();
+                // Finished: no download bandwidth being consumed.
+                if stats.total_bytes > 0 && stats.progress_bytes >= stats.total_bytes {
+                    return None;
+                }
+                Some((handle.info_hash().into(), hash))
+            })
+            .collect()
+        });
+
+        let mut paused = 0;
+        for (idx, hash) in candidates {
+            // A live reader parked inside librqbit is woken only by the piece
+            // it waits for; pausing it there freezes it permanently. See
+            // `StreamGuard`.
+            if self.has_open_stream(&hash) {
+                continue;
+            }
+            if self.api.api_torrent_action_pause(idx).await.is_ok() {
+                debug!(info_hash = %hash, "parked an unwatched torrent so the line goes to what is playing");
+                paused += 1;
+            }
+        }
+        paused
     }
 
     pub async fn touch_stream(&self, info_hash: &str, client: IpAddr) {
@@ -1166,6 +1461,46 @@ mod tests {
         // A later sighting with none must not wipe what is known.
         set.remember("aaaa".into(), Vec::new());
         assert!(!set.trackers_for("aaaa").is_empty());
+    }
+
+    /// Two callers racing to start the same torrent must contend on one lock,
+    /// or the second one launches a duplicate metadata fetch -- which is
+    /// exactly the case this exists for (a viewer tapping a title whose
+    /// prefetch is still resolving).
+    #[test]
+    fn the_same_torrent_always_yields_the_same_start_lock() {
+        let mut starts = HashMap::new();
+        let first = lock_for(&mut starts, "aaaa");
+        let second = lock_for(&mut starts, "aaaa");
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "both starts of one torrent must contend on a single lock"
+        );
+
+        let other = lock_for(&mut starts, "bbbb");
+        assert!(
+            !Arc::ptr_eq(&first, &other),
+            "unrelated torrents must start concurrently, not queue behind each other"
+        );
+    }
+
+    #[test]
+    fn start_locks_are_reclaimed_but_never_out_from_under_a_holder() {
+        let mut starts = HashMap::new();
+        let held = lock_for(&mut starts, "held");
+        drop(lock_for(&mut starts, "finished"));
+
+        // Passing over the map reclaims the finished entry; the held one --
+        // someone is still inside its critical section -- must survive, or
+        // two callers would end up with different locks for one torrent.
+        let _ = lock_for(&mut starts, "unrelated");
+        assert!(starts.contains_key("held"));
+        assert!(
+            !starts.contains_key("finished"),
+            "a browsing session would otherwise grow this map without bound"
+        );
+
+        assert!(Arc::ptr_eq(&lock_for(&mut starts, "held"), &held));
     }
 
     /// A pre-0.9 `advertised.json` is a bare list of hashes. It must load as
