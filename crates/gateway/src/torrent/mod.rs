@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use librqbit::api::TorrentIdOrHash;
+use librqbit::limits::LimitsConfig;
 use librqbit::{
     AddTorrent, AddTorrentOptions, Api, DhtSessionConfig, Session, SessionOptions,
     SessionPersistenceConfig,
@@ -200,6 +201,15 @@ impl OpenStreamCounts {
     fn is_open(&self, info_hash: &str) -> bool {
         self.0.get(info_hash).is_some_and(|count| *count > 0)
     }
+
+    /// How many distinct torrents have a live reader. Torrents rather than
+    /// readers because one player routinely holds several reads on the same
+    /// file at once (a container header, an index near the end, the playback
+    /// position), and reporting "3 active streams" for one viewer watching one
+    /// episode describes the implementation rather than what is happening.
+    fn torrents_open(&self) -> usize {
+        self.0.values().filter(|count| **count > 0).count()
+    }
 }
 
 pub struct TorrentEngine {
@@ -269,6 +279,14 @@ fn action_for_abandoned(has_open_stream: bool, finished: bool) -> UnfocusedActio
     UnfocusedAction::Discard
 }
 
+/// Turns a megabytes-per-second setting into the bytes-per-second rate limiter
+/// librqbit wants, with 0 (and anything that will not fit) meaning "no limit".
+fn bytes_per_second(mb_per_s: u64) -> Option<std::num::NonZeroU32> {
+    u32::try_from(mb_per_s.saturating_mul(1024 * 1024))
+        .ok()
+        .and_then(std::num::NonZeroU32::new)
+}
+
 impl TorrentEngine {
     pub async fn new(config: &AppConfig) -> Result<Arc<Self>> {
         tokio::fs::create_dir_all(config.downloads_dir())
@@ -290,6 +308,17 @@ impl TorrentEngine {
             persistence: Some(SessionPersistenceConfig::Json {
                 folder: Some(config.session_state_dir()),
             }),
+            // Both of these are left at librqbit's defaults by most callers,
+            // and both of those defaults are wrong for this gateway --
+            // see the field docs on `AppConfig` for the reasoning. In short:
+            // a torrent client wants to finish a download, while this wants to
+            // keep one video flowing over a link it is sharing with the
+            // torrent traffic itself.
+            peer_limit: Some(config.max_peers_per_torrent.max(1)),
+            ratelimits: LimitsConfig {
+                upload_bps: bytes_per_second(config.max_upload_mb_s),
+                download_bps: bytes_per_second(config.max_download_mb_s),
+            },
             ..Default::default()
         };
 
@@ -585,6 +614,17 @@ impl TorrentEngine {
     /// Whether any response body is currently reading this torrent.
     pub fn has_open_stream(&self, info_hash: &str) -> bool {
         self.open_streams().is_open(info_hash)
+    }
+
+    /// How many torrents are being read right now -- i.e. how many videos this
+    /// gateway is actually serving.
+    ///
+    /// This is what `/health` reports as `active_streams`. The obvious
+    /// alternative, the size of the `active_streams` activity map, counts
+    /// every torrent touched since the last clear and never shrinks, so after
+    /// three episodes it claims three streams with one player connected.
+    pub fn open_stream_count(&self) -> usize {
+        self.open_streams().torrents_open()
     }
 
     /// Declares `info_hash` the thing being watched, discarding what was

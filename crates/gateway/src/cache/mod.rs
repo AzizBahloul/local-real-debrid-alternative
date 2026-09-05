@@ -187,6 +187,35 @@ async fn list_torrent_dirs(root: &Path) -> anyhow::Result<Vec<TorrentDirEntry>> 
     Ok(out)
 }
 
+/// How many bytes a file actually occupies on disk.
+///
+/// Deliberately *not* `metadata.len()`. librqbit creates each file at its
+/// full final length before a single byte has been downloaded, leaving a
+/// sparse file whose apparent size is the whole movie and whose allocated
+/// size is almost nothing. Measuring `len()` therefore reports a fresh 5 GB
+/// episode as 5 GB of cache the instant playback starts -- which is what made
+/// the cache jump straight to its cap on the first play after a clear, and,
+/// worse, made the janitor evict torrents to get under a limit it was never
+/// actually near.
+///
+/// Counting allocated blocks measures what the disk has really given up, so
+/// the number tracks the download and the cap means what it says.
+#[cfg(unix)]
+fn allocated_size(meta: &std::fs::Metadata) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    // `blocks()` is in 512-byte units by POSIX definition, regardless of the
+    // filesystem's own block size.
+    meta.blocks().saturating_mul(512)
+}
+
+/// Elsewhere there is no portable way to ask, so fall back to the apparent
+/// size. It over-reports sparse files, which is the safe direction: the cache
+/// stays under its cap rather than over it.
+#[cfg(not(unix))]
+fn allocated_size(meta: &std::fs::Metadata) -> u64 {
+    meta.len()
+}
+
 /// Recursive directory size. Boxed because an `async fn` cannot recurse into
 /// itself directly (its future would have infinite size).
 fn dir_size(path: &Path) -> Pin<Box<dyn Future<Output = anyhow::Result<u64>> + Send + '_>> {
@@ -203,7 +232,7 @@ fn dir_size(path: &Path) -> Pin<Box<dyn Future<Output = anyhow::Result<u64>> + S
             if meta.is_dir() {
                 total += dir_size(&entry.path()).await?;
             } else {
-                total += meta.len();
+                total += allocated_size(&meta);
             }
         }
         Ok(total)
@@ -225,8 +254,48 @@ mod tests {
             .await
             .unwrap();
 
+        // Both files are counted, including the nested one. The exact figure
+        // is the space the filesystem allocated, which rounds each file up to
+        // a block, so this asserts the data is accounted for rather than an
+        // exact sum that would only hold on one filesystem.
         let size = dir_size(&tmp).await.unwrap();
-        assert_eq!(size, 350);
+        assert!(size >= 350, "both files must be counted, got {size}");
+
+        tokio::fs::remove_dir_all(&tmp).await.unwrap();
+    }
+
+    /// The regression this module exists to avoid re-introducing.
+    ///
+    /// librqbit lays every download out at its full final length up front, so
+    /// a movie that has barely started is a mostly-empty sparse file. Sizing
+    /// the cache by apparent length counts that emptiness as used space: the
+    /// gateway reported a multi-gigabyte cache seconds after a clear, and the
+    /// janitor deleted torrents to get under a cap it had not really reached.
+    #[tokio::test]
+    async fn dir_size_counts_allocated_bytes_not_a_sparse_file_s_apparent_length() {
+        use tokio::io::AsyncWriteExt;
+
+        let tmp = tempdir();
+        let apparent_len = 512 * 1024 * 1024; // half a gigabyte of nothing
+        let written = 64 * 1024;
+
+        let mut file = tokio::fs::File::create(tmp.join("movie.mkv")).await.unwrap();
+        file.set_len(apparent_len).await.unwrap();
+        file.write_all(&vec![7u8; written]).await.unwrap();
+        file.sync_all().await.unwrap();
+        drop(file);
+
+        let size = dir_size(&tmp).await.unwrap();
+
+        assert!(
+            size >= written as u64,
+            "the bytes actually written must be counted, got {size}"
+        );
+        assert!(
+            size < apparent_len / 4,
+            "a sparse hole must not be counted as cache usage: reported {size} \
+             for a file holding only {written} real bytes"
+        );
 
         tokio::fs::remove_dir_all(&tmp).await.unwrap();
     }
@@ -244,7 +313,7 @@ mod tests {
         let entries = list_torrent_dirs(&tmp).await.unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].info_hash, hash);
-        assert_eq!(entries[0].size, 10);
+        assert!(entries[0].size > 0, "the torrent's data must be measured");
 
         tokio::fs::remove_dir_all(&tmp).await.unwrap();
     }

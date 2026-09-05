@@ -41,6 +41,13 @@ async fn test_state() -> AppState {
         auto_cleanup: false,
         cleanup_interval_secs: 3600,
         max_concurrent_torrents: 4,
+        max_peers_per_torrent: 60,
+        // No rate limiting and no client timeout in tests: there is no swarm
+        // to throttle, and the router is driven in-process rather than over a
+        // real socket, so neither setting can influence the outcome.
+        max_upload_mb_s: 0,
+        max_download_mb_s: 0,
+        client_timeout_secs: 0,
         disable_dht: true, // tests must not depend on the public DHT network
         monitor_interval_secs: 3600,
         log_level: "error".to_string(),

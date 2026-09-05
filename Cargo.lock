@@ -4277,7 +4277,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "streaming-gateway"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -4290,6 +4290,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "socket2",
  "sysinfo",
  "tokio",
  "tokio-util",
@@ -4302,7 +4303,7 @@ dependencies = [
 
 [[package]]
 name = "streaming-gateway-gui"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "anyhow",
  "eframe",

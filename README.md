@@ -230,6 +230,10 @@ Everything has a sensible default. Change these only if you need to:
 | `IDLE_PAUSE_SECS` | `300` | Pause a movie you stopped watching, to free bandwidth |
 | `PREBUFFER_BYTES` | `4 MB` | Data to gather before playback starts |
 | `STALL_TIMEOUT_SECS` | `20` | If playback gets no data for this long, quietly reconnect |
+| `CLIENT_TIMEOUT_SECS` | `900` | Hang up on a player that stopped responding, freeing its movie |
+| `MAX_PEERS_PER_TORRENT` | `60` | Peers per movie. Higher is not faster on a home connection |
+| `MAX_DOWNLOAD_MB_S` | `0` (off) | Cap download speed. See "Playback keeps buffering" |
+| `MAX_UPLOAD_MB_S` | `0` (off) | Cap upload/seeding speed |
 | `INDEXER_URL` | Torrentio | Where movies are searched for |
 | `DISABLE_INDEXER` | `false` | Turn off search entirely |
 | `LOG_LEVEL` | `info` | Set to `debug` for troubleshooting |
@@ -296,6 +300,34 @@ Check what's using bandwidth:
 ```bash
 curl -s http://localhost:8080/health | python3 -m json.tool
 ```
+
+**If the PC is on WiFi rather than a cable, that is the next thing to look at**,
+and it is usually the real answer when the numbers above look fine. Two
+different flows share the one radio: the movie coming *in* from peers, and the
+same movie going back *out* to your phone. They are not additive on a wired
+machine — on WiFi they compete for the same airtime, and the radio can only do
+one at a time. The gateway also downloads well ahead of what you are watching
+(that is what makes seeking quick), so it can easily be pulling 3–4 MB/s to
+feed a stream that only needs 1.5 MB/s, and the surplus is spent on exactly the
+airtime the phone is waiting for.
+
+Check which band you're on:
+```bash
+iwconfig 2>/dev/null | grep -i frequency
+```
+
+`2.4 GHz` is the crowded one — shared with your neighbours, Bluetooth and
+microwaves — and it rarely sustains what the nominal link rate suggests.
+**Moving the PC to 5 GHz, or plugging in an ethernet cable, does more than any
+setting here.** Failing that, stop the gateway racing ahead:
+
+```bash
+MAX_DOWNLOAD_MB_S=3 MAX_UPLOAD_MB_S=1 ./target/release/streaming-gateway
+```
+
+Set the download cap a little above the movie's real bitrate (size in GB
+divided by length in hours). It makes the download slower and the picture
+steadier.
 </details>
 
 <details>
@@ -391,6 +423,21 @@ setup.sh   Dockerfile
   Players buffer minutes ahead and go quiet, so recency alone reads an actively
   watched movie as idle — and librqbit's reader has no timeout of its own, so
   pausing under it freezes playback permanently rather than just slowing it.
+- **Which makes a departed viewer dangerous, so the sockets time out.** A
+  player that stops reading without closing — backgrounded, force-quit, off the
+  wifi — leaves TCP zero-window probing, which by default continues forever.
+  The response body stays parked, its `StreamGuard` stays held, and that guard
+  is what exempts the torrent from the reaper, the janitor *and* the
+  switched-title cleanup. Every abandoned stream would otherwise pin one
+  torrent downloading for nobody, for the life of the process.
+  `TCP_USER_TIMEOUT` on the listening socket (inherited by every accepted one)
+  is what ends them; keepalive alone cannot, as it is suppressed while probes
+  are outstanding.
+- **The cache is measured in allocated blocks, not file length.** librqbit
+  creates each file at its full final size before downloading any of it, so
+  `len()` reports a 5 GB movie as 5 GB of cache the moment playback starts —
+  which both looked absurd and made the janitor evict torrents to get under a
+  cap it was nowhere near.
 - **Responses are withheld until data exists.** Players treat "headers, then a
   stalled body" as a broken stream, but wait patiently on a slow request.
 

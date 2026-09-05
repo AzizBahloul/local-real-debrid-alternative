@@ -46,6 +46,50 @@ pub struct AppConfig {
     #[arg(long, env = "MAX_CONCURRENT_TORRENTS", default_value_t = 8)]
     pub max_concurrent_torrents: usize,
 
+    /// Maximum peers to keep connected per torrent.
+    ///
+    /// Lower than librqbit's own default of 128, on purpose. That default is
+    /// tuned for finishing a download as fast as possible; this gateway is
+    /// doing something different -- feeding one player, usually from a machine
+    /// on wifi, where the torrent's traffic and the video's traffic share one
+    /// radio. Every peer slot is a TCP connection that gets opened, retried
+    /// and torn down, and most candidates never answer at all, so a high limit
+    /// buys a stream of connection attempts (measured at ~9 a second at 128)
+    /// whose cost in router NAT-table churn and airtime outweighs the few
+    /// extra peers it lands. 60 still saturates any home connection.
+    #[arg(long, env = "MAX_PEERS_PER_TORRENT", default_value_t = 60)]
+    pub max_peers_per_torrent: usize,
+
+    /// Cap the torrent engine's upload rate, in MB/s. 0 means unlimited.
+    ///
+    /// Worth setting when this machine is on wifi rather than ethernet:
+    /// seeding competes for the same radio the video is being sent over, and
+    /// the viewer feels it as buffering. Do not set it too low -- peers
+    /// reciprocate, so throttling upload hard also slows the download.
+    #[arg(long, env = "MAX_UPLOAD_MB_S", default_value_t = 0)]
+    pub max_upload_mb_s: u64,
+
+    /// Cap the torrent engine's download rate, in MB/s. 0 means unlimited.
+    ///
+    /// The gateway normally fetches far faster than playback consumes, which
+    /// is what makes seeking quick. On a wifi-attached machine that surplus is
+    /// spent on the same airtime the video needs, so capping it to a little
+    /// above the file's real bitrate (size in GB / hours, roughly) can make
+    /// playback smoother even though the download gets slower.
+    #[arg(long, env = "MAX_DOWNLOAD_MB_S", default_value_t = 0)]
+    pub max_download_mb_s: u64,
+
+    /// How long a client may leave sent data unacknowledged before the gateway
+    /// drops its connection, in seconds. 0 disables the timeout.
+    ///
+    /// This is what reclaims a stream whose viewer vanished without closing
+    /// the connection. Generous by default because a player that has buffered
+    /// minutes ahead legitimately reads nothing for that long, and a player
+    /// that does get dropped simply reconnects. See `network::harden_listener`
+    /// for why the default of "probe forever" is actively harmful here.
+    #[arg(long, env = "CLIENT_TIMEOUT_SECS", default_value_t = 900)]
+    pub client_timeout_secs: u64,
+
     /// Disable BitTorrent DHT (uses trackers/peer exchange only).
     #[arg(long, env = "DISABLE_DHT", default_value_t = false)]
     pub disable_dht: bool,

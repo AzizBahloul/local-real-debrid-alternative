@@ -29,7 +29,6 @@ pub struct HealthResponse {
 
 pub async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
     let active_torrents = state.engine.list_active();
-    let recent_streams = state.engine.recent_streams().await;
     let cache_usage_bytes = state.cache.usage_bytes().await;
     let (process_memory_bytes, process_cpu_percent) = self_process_usage();
 
@@ -37,7 +36,9 @@ pub async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
         status: "ok",
         version: env!("CARGO_PKG_VERSION"),
         uptime_seconds: state.engine.session_uptime_secs(),
-        active_streams: recent_streams.len(),
+        // Videos being served right now, not titles touched at some point --
+        // see `open_stream_count`.
+        active_streams: state.engine.open_stream_count(),
         active_torrents,
         cache_usage_bytes,
         cache_max_bytes: state.cache.max_size_bytes(),
