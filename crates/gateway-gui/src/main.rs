@@ -51,7 +51,30 @@ fn human_duration(secs: u64) -> String {
 /// banner out of a log line, so the GUI shows the exact address the server
 /// actually bound (including the fallback-port case) instead of guessing.
 fn extract_url(line: &str) -> Option<String> {
-    let start = line.find("http://")?;
+    extract_scheme_url(line, "http://")
+}
+
+/// Pulls the https addon base URL out of the server's "PASTE THIS INTO
+/// STREMIO" line.
+///
+/// This has to be scraped rather than derived, because Stremio on Android
+/// refuses a plain-http addon outright: building `{http address}/manifest.json`
+/// hands the user the one URL their phone is guaranteed to reject, which looks
+/// exactly like the gateway being broken. The https URL also has a different
+/// host *and* port (`<ip-with-dashes>.local-ip.sh:8443`), so it cannot be
+/// reconstructed from the http one anyway.
+///
+/// Anchored on the `/manifest.json` suffix on purpose -- plenty of other log
+/// lines carry an unrelated `https://` (the indexer, the certificate provider,
+/// the addon logo).
+fn extract_addon_url(line: &str) -> Option<String> {
+    let url = extract_scheme_url(line, "https://")?;
+    let base = url.strip_suffix("/manifest.json")?;
+    Some(base.to_string())
+}
+
+fn extract_scheme_url(line: &str, scheme: &str) -> Option<String> {
+    let start = line.find(scheme)?;
     let rest = &line[start..];
     let end = rest.find(|c: char| c.is_whitespace()).unwrap_or(rest.len());
     Some(rest[..end].to_string())
@@ -111,6 +134,9 @@ struct GatewayApp {
 
     logs: VecDeque<String>,
     detected_url: Option<String>,
+    /// The https addon URL, which arrives a few seconds after `detected_url`
+    /// because the certificate is fetched in the background.
+    addon_url: Option<String>,
 
     health: Option<HealthInfo>,
     health_rx: Option<Receiver<Option<HealthInfo>>>,
@@ -139,6 +165,7 @@ impl Default for GatewayApp {
             cache_dir: "./cache".to_string(),
             logs: VecDeque::with_capacity(MAX_LOG_LINES),
             detected_url: None,
+            addon_url: None,
             health: None,
             health_rx: None,
             next_health_poll: Instant::now(),
@@ -187,6 +214,7 @@ impl GatewayApp {
                 self.running = true;
                 self.start_error = None;
                 self.detected_url = None;
+                self.addon_url = None;
                 self.logs.clear();
             }
             Err(e) => self.start_error = Some(format!("{e:#}")),
@@ -242,6 +270,7 @@ impl GatewayApp {
         if self.running && !self.process.is_running() {
             self.running = false;
             self.detected_url = None;
+            self.addon_url = None;
             self.health = None;
         }
 
@@ -249,6 +278,11 @@ impl GatewayApp {
             if self.detected_url.is_none() {
                 if let Some(url) = extract_url(line.text()) {
                     self.detected_url = Some(url);
+                }
+            }
+            if self.addon_url.is_none() {
+                if let Some(url) = extract_addon_url(line.text()) {
+                    self.addon_url = Some(url);
                 }
             }
             let text = if line.is_err() {
@@ -279,6 +313,7 @@ impl GatewayApp {
                 self.stopping = false;
                 self.running = false;
                 self.detected_url = None;
+                self.addon_url = None;
                 self.health = None;
                 self.stop_done_rx = None;
             }
@@ -486,6 +521,7 @@ impl eframe::App for GatewayApp {
             });
 
             if let Some(url) = self.detected_url.clone() {
+                let addon = self.addon_url.clone();
                 ui.add_space(10.0);
                 egui::Frame::none()
                     .fill(BG_PANEL)
@@ -493,18 +529,40 @@ impl eframe::App for GatewayApp {
                     .inner_margin(egui::Margin::symmetric(12.0, 8.0))
                     .show(ui, |ui| {
                         ui.set_width(ui.available_width());
-                        ui.colored_label(ACCENT_CYAN, "GATEWAY ADDRESS");
+                        // The addon URL goes first and the plain-http one is
+                        // labelled for what it is: the http address is not a
+                        // usable addon URL on a phone, and showing it as one
+                        // is the single most common way this looks broken.
+                        ui.colored_label(ACCENT_CYAN, "STREMIO ADDON (phone, tablet, TV)");
+                        match &addon {
+                            Some(addon) => {
+                                let manifest = format!("{addon}/manifest.json");
+                                ui.horizontal(|ui| {
+                                    ui.monospace(&manifest);
+                                    if ui.small_button("copy").clicked() {
+                                        ui.output_mut(|o| o.copied_text = manifest.clone());
+                                    }
+                                });
+                            }
+                            None => {
+                                ui.label(
+                                    egui::RichText::new(
+                                        "preparing the https certificate, a few seconds...",
+                                    )
+                                    .color(egui::Color32::GRAY)
+                                    .size(11.0),
+                                );
+                            }
+                        }
+
+                        ui.add_space(8.0);
+                        ui.colored_label(ACCENT_CYAN, "DIRECT ADDRESS (VLC, browsers)");
                         ui.horizontal(|ui| {
                             ui.monospace(&url);
                             if ui.small_button("copy").clicked() {
                                 ui.output_mut(|o| o.copied_text = url.clone());
                             }
                         });
-                        ui.label(
-                            egui::RichText::new(format!("Stremio addon: {url}/manifest.json"))
-                                .color(egui::Color32::GRAY)
-                                .size(11.0),
-                        );
                     });
             }
 
@@ -590,4 +648,59 @@ fn main() -> eframe::Result<()> {
             Ok(Box::new(GatewayApp::default()))
         }),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The exact lines `network::print_banner` / `print_addon_ready` emit.
+    /// The GUI scrapes the server's stdout, so these strings are a real
+    /// cross-crate contract -- if the banner is reworded, this test is what
+    /// notices before the GUI silently shows nothing.
+    const ADDON_LINE: &str = "   https://192-168-1-67.local-ip.sh:8443/manifest.json";
+    const DIRECT_LINE: &str = "   http://192.168.1.67:8080";
+
+    #[test]
+    fn scrapes_both_urls_from_the_banner() {
+        assert_eq!(
+            extract_addon_url(ADDON_LINE).as_deref(),
+            Some("https://192-168-1-67.local-ip.sh:8443")
+        );
+        assert_eq!(
+            extract_url(DIRECT_LINE).as_deref(),
+            Some("http://192.168.1.67:8080")
+        );
+    }
+
+    /// The regression this whole change exists for: `find("http://")` must not
+    /// match inside an `https://` URL, or the GUI captures the addon line as
+    /// the direct address and shows a manifest URL Android refuses.
+    #[test]
+    fn http_scrape_never_matches_an_https_url() {
+        assert_eq!(extract_url(ADDON_LINE), None);
+    }
+
+    /// Other log lines carry an unrelated `https://` (indexer, certificate
+    /// provider, addon logo). Only the manifest line may be adopted.
+    #[test]
+    fn ignores_https_urls_that_are_not_the_manifest() {
+        for line in [
+            "torrent discovery enabled url=https://torrentio.strem.fun",
+            "fetching https://local-ip.sh/server.pem",
+            "logo https://raw.githubusercontent.com/Stremio/x/icon.png",
+        ] {
+            assert_eq!(extract_addon_url(line), None, "adopted: {line}");
+        }
+    }
+
+    /// The fallback-port case: the GUI must show what the server actually
+    /// bound, not the configured default.
+    #[test]
+    fn scrapes_the_fallback_port() {
+        assert_eq!(
+            extract_url("   http://192.168.1.67:11470").as_deref(),
+            Some("http://192.168.1.67:11470")
+        );
+    }
 }
