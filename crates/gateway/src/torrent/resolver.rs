@@ -141,6 +141,21 @@ pub fn normalize_to_magnet(input: &str) -> Result<String> {
     )
 }
 
+/// Pulls the `tr=` trackers back out of a magnet URI.
+///
+/// A raw magnet often carries the trackers its release actually announces on,
+/// and those are worth remembering alongside the info hash: a later lazy start
+/// (after a restart, say) begins from a bare hash with nothing but DHT and the
+/// generic defaults otherwise. See `AdvertisedHashes`.
+pub fn trackers_from_magnet(magnet: &str) -> Vec<String> {
+    let query = magnet.split_once('?').map_or(magnet, |(_, q)| q);
+    query
+        .split('&')
+        .filter_map(|part| part.strip_prefix("tr="))
+        .filter_map(|t| urlencoding::decode(t).ok().map(|d| d.into_owned()))
+        .collect()
+}
+
 /// Extracts the display info-hash straight out of a magnet URI, for cases
 /// where we already normalized but need the bare hash (e.g. building our own
 /// canonical stream URLs).
@@ -247,6 +262,28 @@ mod tests {
             info_hash_from_magnet(magnet).unwrap(),
             "abcdef0123456789abcdef0123456789abcdef01"
         );
+    }
+
+    /// Round-trips through the writer, since these two are the only places
+    /// that agree on how a per-release tracker is encoded into a magnet.
+    #[test]
+    fn extracts_trackers_from_magnet() {
+        let trackers = vec![
+            "udp://tracker.opentrackr.org:1337/announce".to_string(),
+            "http://tracker.example/ann?x=1".to_string(),
+        ];
+        let magnet = magnet_with_trackers(
+            "45fa4233ef87c58f5f8b4817e4d50c9f5363caef",
+            Some("Movie 2024"),
+            &trackers,
+        );
+        assert_eq!(trackers_from_magnet(&magnet), trackers);
+    }
+
+    #[test]
+    fn extracts_no_trackers_when_the_magnet_carries_none() {
+        let magnet = "magnet:?xt=urn:btih:45fa4233ef87c58f5f8b4817e4d50c9f5363caef&dn=x";
+        assert!(trackers_from_magnet(magnet).is_empty());
     }
 
     #[test]

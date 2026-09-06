@@ -4283,6 +4283,7 @@ dependencies = [
  "async-stream",
  "axum",
  "axum-server",
+ "bytes",
  "clap",
  "librqbit",
  "local-ip-address",

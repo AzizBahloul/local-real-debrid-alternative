@@ -22,8 +22,8 @@ use anyhow::{Context, Result};
 use librqbit::api::TorrentIdOrHash;
 use librqbit::limits::LimitsConfig;
 use librqbit::{
-    AddTorrent, AddTorrentOptions, Api, DhtSessionConfig, ListenerMode, ListenerOptions, Session,
-    SessionOptions, SessionPersistenceConfig,
+    AddTorrent, AddTorrentOptions, AddTorrentResponse, Api, DhtSessionConfig, ListenerMode,
+    ListenerOptions, Session, SessionOptions, SessionPersistenceConfig,
 };
 use tokio::io::{AsyncRead, AsyncSeekExt};
 use tokio::sync::{Mutex, Semaphore};
@@ -71,6 +71,14 @@ const START_FAILURE_COOLDOWN: Duration = Duration::from_secs(45);
 /// to how many streams a browse session shows (15 per title by default).
 const ADVERTISED_HASH_CAPACITY: usize = 512;
 
+/// How many resolved torrents keep their metadata around for a later start.
+///
+/// One entry is a whole `.torrent` file (chiefly the piece hashes: 20 bytes
+/// per piece, so a few hundred KB for a large release), which is why this is
+/// small rather than generous — it only has to bridge the gap between reading
+/// a stream list and tapping one of its rows. See `MetadataCache`.
+const RESOLVED_METADATA_CAPACITY: usize = 16;
+
 /// Cap on how many already-known torrents a single browse will wake up. A
 /// title's stream list can name a dozen releases we have partial data for;
 /// resuming all of them would have them compete for the same upstream
@@ -82,6 +90,50 @@ use resolver::{
     info_hash_from_magnet, is_video_file, suggest_video_file, MagnetSource, ResolvedTorrent,
     TorrentFile, TorrentSource,
 };
+
+/// Torrent metadata already fetched from the swarm, keyed by info hash.
+///
+/// Resolving a magnet is the expensive half of a cold start: the magnet
+/// carries only an info hash, so the file list has to be pulled from a peer
+/// that holds it, and `list_only` (how `resolve` asks for it) deliberately
+/// leaves nothing behind in the session. Every caller that resolves goes on to
+/// *start* the same torrent moments later — `/play` immediately, the addon's
+/// magnet path when the viewer taps the row — and without this that start
+/// pays the identical fetch a second time.
+///
+/// What is stored is the full `.torrent` blob librqbit assembled from the
+/// fetched info (trackers included), which `AddTorrent::from_bytes` takes
+/// directly. Adding from it needs no peers at all: the metadata step goes from
+/// a network round-trip to a parse.
+///
+/// Bounded, newest last, oldest evicted — a miss costs only the fetch that
+/// would have happened anyway.
+#[derive(Default)]
+struct MetadataCache {
+    order: VecDeque<String>,
+    bytes: HashMap<String, bytes::Bytes>,
+}
+
+impl MetadataCache {
+    fn remember(&mut self, info_hash: String, torrent_bytes: bytes::Bytes) {
+        if torrent_bytes.is_empty() {
+            return;
+        }
+        if self.bytes.insert(info_hash.clone(), torrent_bytes).is_some() {
+            return;
+        }
+        self.order.push_back(info_hash);
+        while self.order.len() > RESOLVED_METADATA_CAPACITY {
+            if let Some(oldest) = self.order.pop_front() {
+                self.bytes.remove(&oldest);
+            }
+        }
+    }
+
+    fn get(&self, info_hash: &str) -> Option<bytes::Bytes> {
+        self.bytes.get(info_hash).cloned()
+    }
+}
 
 /// Recency of activity on a given torrent's stream, so the cache janitor
 /// never evicts something someone is actively watching. HTTP range requests
@@ -353,6 +405,9 @@ pub struct TorrentEngine {
     /// One lock per info hash being started, so the same torrent is never
     /// added twice at once. See `start_lock`.
     starts: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    /// Metadata from torrents already resolved, so starting one does not
+    /// re-fetch what a resolve just pulled. See `MetadataCache`.
+    resolved_metadata: Mutex<MetadataCache>,
     /// When a hash last failed to find any peers. See `START_FAILURE_COOLDOWN`.
     failed_starts: StdMutex<HashMap<String, Instant>>,
 }
@@ -507,11 +562,17 @@ impl TorrentEngine {
             stall_timeout: Duration::from_secs(config.stall_timeout_secs),
             browse_prefetch: config.browse_prefetch_count,
             starts: Mutex::new(HashMap::new()),
+            resolved_metadata: Mutex::new(MetadataCache::default()),
             failed_starts: StdMutex::new(HashMap::new()),
         }))
     }
 
     /// Fetches torrent metadata only (fast, no data downloaded) and lists its files.
+    ///
+    /// Goes through `Session::add_torrent` rather than the `Api` wrapper for
+    /// one reason: the wrapper discards the assembled `.torrent` bytes, and
+    /// those are exactly what lets the subsequent start skip a second
+    /// metadata fetch. See `MetadataCache`.
     pub async fn resolve(&self, input: &str) -> Result<ResolvedTorrent> {
         let magnet = self.source.to_magnet(input)?;
         let info_hash = info_hash_from_magnet(&magnet)?;
@@ -522,35 +583,51 @@ impl TorrentEngine {
         };
         let response = self
             .api
-            .api_add_torrent(AddTorrent::from_url(magnet.clone()), Some(opts))
+            .session()
+            .add_torrent(AddTorrent::from_url(magnet.clone()), Some(opts))
             .await
             .context(
                 "failed to fetch torrent metadata (no peers found yet, or invalid torrent?)",
             )?;
 
-        let files: Vec<TorrentFile> = response
-            .details
-            .files
-            .unwrap_or_default()
-            .into_iter()
+        // `list_only` always takes the `ListOnly` arm; the others would mean
+        // librqbit started a download we explicitly asked it not to.
+        let AddTorrentResponse::ListOnly(listed) = response else {
+            anyhow::bail!("torrent engine started a torrent for a metadata-only request");
+        };
+
+        let files: Vec<TorrentFile> = listed
+            .info
+            .iter_file_details()
             .enumerate()
-            .map(|(index, f)| TorrentFile {
-                index,
-                is_video: is_video_file(&f.name),
-                name: f.name,
-                length: f.length,
+            .map(|(index, d)| {
+                let name = d.filename.to_string();
+                TorrentFile {
+                    index,
+                    is_video: is_video_file(&name),
+                    name,
+                    length: d.len,
+                }
             })
             .collect();
 
         let suggested_file_idx = suggest_video_file(&files);
+        let name = listed.info.name().map(|n| n.into_owned());
+
+        // Whoever resolved is about to start this same torrent, so keep what
+        // the fetch cost so `start_file` does not pay it again.
+        self.resolved_metadata
+            .lock()
+            .await
+            .remember(info_hash.clone(), listed.torrent_bytes);
 
         Ok(ResolvedTorrent {
             info_hash,
-            name: response.details.name,
+            name,
             magnet,
             files,
             suggested_file_idx,
-            seen_peers: response.seen_peers.unwrap_or_default(),
+            seen_peers: listed.seen_peers,
         })
     }
 
@@ -595,12 +672,23 @@ impl TorrentEngine {
             return Ok(info_hash);
         }
 
+        // Metadata this gateway already pulled for exactly this hash. Adding
+        // from it resolves nothing over the network, so the slowest step of a
+        // cold start disappears entirely -- which is the whole point of
+        // keeping it. See `MetadataCache`.
+        let cached_metadata = self.resolved_metadata.lock().await.get(&info_hash);
+
         // A hash that just failed to find any peers fails the same way every
         // time, for the same 25 seconds -- so a client auto-retrying a dead
         // stream (a resumed "continue watching", or its own error recovery)
         // gets an instant, honest failure instead of paying that wait again
-        // on every retry. See `START_FAILURE_COOLDOWN`.
-        if let Some(remaining) = self.recent_start_failure(&info_hash) {
+        // on every retry. Skipped when we already hold the metadata, since
+        // that cooldown exists to avoid re-running a search this add does not
+        // need to run. See `START_FAILURE_COOLDOWN`.
+        if let Some(remaining) = self
+            .recent_start_failure(&info_hash)
+            .filter(|_| cached_metadata.is_none())
+        {
             anyhow::bail!(
                 "no reachable peers as of {}s ago; not searching again for another {}s -- \
                  try a release with more seeders",
@@ -630,10 +718,17 @@ impl TorrentEngine {
             ..Default::default()
         };
 
+        let source = match cached_metadata {
+            Some(torrent_bytes) => {
+                debug!(%info_hash, "starting from metadata already fetched; no second swarm lookup");
+                AddTorrent::from_bytes(torrent_bytes)
+            }
+            None => AddTorrent::from_url(magnet),
+        };
+
         let added = tokio::time::timeout(
             ADD_TORRENT_TIMEOUT,
-            self.api
-                .api_add_torrent(AddTorrent::from_url(magnet), Some(opts)),
+            self.api.api_add_torrent(source, Some(opts)),
         )
         .await;
 
@@ -1442,6 +1537,61 @@ mod tests {
         // Bookkeeping must stay consistent, or the set leaks past its cap.
         assert_eq!(set.order.len(), 2);
         assert_eq!(set.trackers.len(), 2);
+    }
+
+    #[test]
+    fn metadata_cache_hands_back_what_a_resolve_fetched() {
+        let mut cache = MetadataCache::default();
+        cache.remember("aaaa".into(), bytes::Bytes::from_static(b"d4:infoe"));
+
+        assert_eq!(
+            cache.get("aaaa").as_deref(),
+            Some(&b"d4:infoe"[..]),
+            "a start must be able to reuse the metadata its resolve paid for"
+        );
+        assert!(cache.get("bbbb").is_none());
+    }
+
+    /// One entry is a whole `.torrent` file, so an unbounded map here would
+    /// grow with every title browsed for the life of the process.
+    #[test]
+    fn metadata_cache_evicts_oldest_beyond_capacity() {
+        let mut cache = MetadataCache::default();
+        for i in 0..RESOLVED_METADATA_CAPACITY + 1 {
+            cache.remember(format!("hash{i}"), bytes::Bytes::from_static(b"x"));
+        }
+
+        assert!(cache.get("hash0").is_none(), "oldest entry must be evicted");
+        assert!(cache
+            .get(&format!("hash{RESOLVED_METADATA_CAPACITY}"))
+            .is_some());
+        assert_eq!(cache.order.len(), RESOLVED_METADATA_CAPACITY);
+        assert_eq!(cache.bytes.len(), RESOLVED_METADATA_CAPACITY);
+    }
+
+    /// Re-resolving the same torrent must refresh it in place. Pushing a
+    /// second `order` entry for one hash would let the cache evict the entry
+    /// its own duplicate still points at, dropping metadata it still holds.
+    #[test]
+    fn metadata_cache_does_not_double_count_repeats() {
+        let mut cache = MetadataCache::default();
+        cache.remember("aaaa".into(), bytes::Bytes::from_static(b"first"));
+        cache.remember("aaaa".into(), bytes::Bytes::from_static(b"second"));
+
+        assert_eq!(cache.order.len(), 1);
+        assert_eq!(cache.get("aaaa").as_deref(), Some(&b"second"[..]));
+    }
+
+    /// A torrent with no metadata bytes is not a cache entry, it is a miss --
+    /// storing it would make `start_file` add an empty torrent file instead of
+    /// falling back to the magnet.
+    #[test]
+    fn metadata_cache_ignores_empty_metadata() {
+        let mut cache = MetadataCache::default();
+        cache.remember("aaaa".into(), bytes::Bytes::new());
+
+        assert!(cache.get("aaaa").is_none());
+        assert!(cache.order.is_empty());
     }
 
     #[test]

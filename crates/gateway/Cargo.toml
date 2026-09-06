@@ -44,6 +44,10 @@ urlencoding = "2"
 # Already in the tree via librqbit; needed directly because
 # `SessionOptions::trackers` is a `HashSet<url::Url>`.
 url = "2"
+# Likewise already in the tree: `ListOnlyResponse::torrent_bytes` (what lets a
+# resolved torrent start without a second metadata fetch) is a `bytes::Bytes`,
+# so the metadata cache has to be able to name the type.
+bytes = "1"
 # Used only to query the torrent index over HTTPS. `rustls` here resolves to
 # the same aws-lc-rs provider librqbit already pulls in, so this adds no second
 # TLS stack and keeps the zero-OpenSSL property described above.

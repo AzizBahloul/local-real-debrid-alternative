@@ -30,7 +30,7 @@ use serde_json::{json, Value};
 use tracing::{debug, warn};
 
 use crate::indexer::{IndexedTorrent, StreamIndexer};
-use crate::torrent::BrowseCandidate;
+use crate::torrent::{resolver, BrowseCandidate};
 use crate::AppState;
 
 pub const ADDON_ID: &str = "com.localgateway.streaminggateway";
@@ -173,12 +173,7 @@ async fn magnet_streams(state: &AppState, magnet: &str) -> Vec<Value> {
 
     // A raw magnet may carry its own trackers -- remember them so a later
     // lazy start (after a restart, say) announces to the same places.
-    let trackers: Vec<String> = resolved
-        .magnet
-        .split('&')
-        .filter_map(|part| part.strip_prefix("tr="))
-        .filter_map(|t| urlencoding::decode(t).ok().map(|d| d.into_owned()))
-        .collect();
+    let trackers = resolver::trackers_from_magnet(&resolved.magnet);
     state
         .engine
         .remember_advertised(&resolved.info_hash, &trackers)

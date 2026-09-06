@@ -18,7 +18,7 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use tracing::{debug, warn};
 
 use crate::error::ApiErrorResponse;
-use crate::torrent::{BoxedReader, StreamGuard, TorrentEngine};
+use crate::torrent::{resolver, BoxedReader, StreamGuard, TorrentEngine};
 
 /// Bytes the pre-buffer will actually *wait* for. Everything above this is
 /// only taken if it is already downloaded -- see `prebuffer`. Deliberately
@@ -94,9 +94,25 @@ pub async fn play(
         ));
     }
 
+    // The redirect target refuses any hash this gateway never offered, and
+    // "offered" is what we are doing right here. Without this the URL works
+    // only while the torrent stays in the session: the moment it leaves --
+    // a restart, or switching to another title, which discards the one left
+    // behind -- the link a player is still holding starts 404ing with
+    // "this gateway has not offered that info hash". The magnet's own
+    // trackers ride along so that later start announces where this release's
+    // seeders actually are. See `AdvertisedHashes`.
+    engine
+        .remember_advertised(
+            &resolved.info_hash,
+            &resolver::trackers_from_magnet(&resolved.magnet),
+        )
+        .await;
+
     // The resolve above just talked to the swarm; hand those peers straight
     // to the download so it connects immediately instead of re-discovering
-    // the same swarm over DHT/trackers a second time.
+    // the same swarm over DHT/trackers a second time. The metadata it fetched
+    // is reused too, so this start does no swarm lookup of its own at all.
     let info_hash = engine
         .start_file(&query.magnet, file_idx, resolved.seen_peers.clone())
         .await
