@@ -66,6 +66,19 @@ const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(15);
 /// gets the fast, honest "still no peers" instead of another full wait.
 const START_FAILURE_COOLDOWN: Duration = Duration::from_secs(45);
 
+/// How long after its last read a torrent is still considered "being watched"
+/// for the purpose of *deleting* it — see `action_for_abandoned`.
+///
+/// Sized off the retry cycle rather than off playback: a player that fails to
+/// start re-attempts roughly every 25-30s (the same figure
+/// `START_FAILURE_COOLDOWN` is built on), and a viewer picking another source
+/// by hand takes longer. This spans a couple of those cycles so the retry
+/// lands on a torrent that kept its data and its warmed-up peers, which is the
+/// difference between the second attempt starting instantly and starting cold
+/// again. It only delays reclaiming space; the cache janitor still enforces
+/// the cap, and the idle reaper still parks the torrent in the meantime.
+const ABANDON_GRACE: Duration = Duration::from_secs(90);
+
 
 /// How many recently-advertised info hashes stay startable. Generous relative
 /// to how many streams a browse session shows (15 per title by default).
@@ -434,18 +447,35 @@ pub(crate) enum UnfocusedAction {
 /// eight queued titles the first time anything was played — the viewer's
 /// backlog is not the same thing as the title they just left.
 ///
-/// Two exemptions, and they are not stylistic:
+/// Three exemptions, and they are not stylistic:
 ///
 /// * an **open stream** means some response body is still reading those bytes
 ///   (a second device, or this player's own header/index reads). Deleting
 ///   underneath it truncates a video someone is watching — see `StreamGuard`.
+/// * **recent activity** means someone was reading it moments ago and has not
+///   had time to come back. An open connection is not the same question as
+///   "is anyone watching this": range requests are stateless, so there is no
+///   connection at all between a seek and the next read, and none while a
+///   player that just timed out prepares its retry. `StreamActivity` says this
+///   outright, and the idle reaper already honours it — this path did not, so
+///   the *irreversible* action was judging liveness more loosely than the
+///   reversible one. That is what made a failed play destructive: a player
+///   giving up on a cold torrent closed its connection, the next stream it
+///   tried took focus, and the torrent it had just spent 15 seconds warming
+///   was deleted along with every byte and every peer it had found. Each
+///   attempt therefore started colder than the last, which is what a viewer
+///   sees as the player cycling through every source and playing none.
 /// * a **finished** torrent is a complete file. It costs no download
 ///   bandwidth, and throwing away a fully-downloaded movie because the viewer
 ///   started the next episode is destructive in a way nobody asks for. The
 ///   cache janitor already reclaims those, oldest-first, once the cap forces
 ///   it.
-fn action_for_abandoned(has_open_stream: bool, finished: bool) -> UnfocusedAction {
-    if has_open_stream || finished {
+fn action_for_abandoned(
+    has_open_stream: bool,
+    recently_active: bool,
+    finished: bool,
+) -> UnfocusedAction {
+    if has_open_stream || recently_active || finished {
         return UnfocusedAction::Leave;
     }
     UnfocusedAction::Discard
@@ -1075,8 +1105,11 @@ impl TorrentEngine {
         let Some((idx, finished)) = matches.into_iter().next() else {
             return false;
         };
-        if action_for_abandoned(self.has_open_stream(info_hash), finished)
-            != UnfocusedAction::Discard
+        if action_for_abandoned(
+            self.has_open_stream(info_hash),
+            self.is_recently_active(info_hash, ABANDON_GRACE).await,
+            finished,
+        ) != UnfocusedAction::Discard
         {
             return false;
         }
@@ -1748,7 +1781,10 @@ mod tests {
         // The whole point: starting a new episode abandons the old one, so
         // its half-downloaded file is deleted rather than kept forever in a
         // cache that is permanently at its cap.
-        assert_eq!(action_for_abandoned(false, false), UnfocusedAction::Discard);
+        assert_eq!(
+            action_for_abandoned(false, false, false),
+            UnfocusedAction::Discard
+        );
     }
 
     #[test]
@@ -1756,7 +1792,38 @@ mod tests {
         // A second device watching something else, or this player's own
         // header/index reads. Deleting underneath a live reader truncates a
         // video someone is watching -- see `StreamGuard`.
-        assert_eq!(action_for_abandoned(true, false), UnfocusedAction::Leave);
+        assert_eq!(
+            action_for_abandoned(true, false, false),
+            UnfocusedAction::Leave
+        );
+    }
+
+    #[test]
+    fn a_torrent_read_moments_ago_survives_the_switch() {
+        // The compounding-failure regression. A player that gives up on a cold
+        // torrent has no open connection, so `has_open_stream` alone reads it
+        // as abandoned -- and deleting it there throws away the data and the
+        // warmed-up peers that the player's *own retry*, seconds later, is
+        // about to need. Every attempt then starts colder than the last, which
+        // is what a viewer sees as the player cycling through every source and
+        // playing none. Range requests are stateless; recency, not an open
+        // socket, is what "someone is watching this" means here.
+        assert_eq!(
+            action_for_abandoned(false, true, false),
+            UnfocusedAction::Leave
+        );
+    }
+
+    /// The grace window has to outlast a player's retry cycle (~25-30s, the
+    /// same figure `START_FAILURE_COOLDOWN` is built on) or it spares nothing
+    /// that matters -- the retry arrives after the torrent is already gone.
+    #[test]
+    fn abandon_grace_outlasts_a_player_retry_cycle() {
+        assert!(
+            ABANDON_GRACE >= START_FAILURE_COOLDOWN,
+            "a torrent must not be deleted while the client is still in the \
+             retry cycle that would reuse it"
+        );
     }
 
     #[test]
@@ -1765,7 +1832,10 @@ mod tests {
         // that finished downloading because the viewer started the next
         // episode is destructive. The cache janitor reclaims it under
         // pressure, oldest-first.
-        assert_eq!(action_for_abandoned(false, true), UnfocusedAction::Leave);
+        assert_eq!(
+            action_for_abandoned(false, false, true),
+            UnfocusedAction::Leave
+        );
     }
 
     #[test]
