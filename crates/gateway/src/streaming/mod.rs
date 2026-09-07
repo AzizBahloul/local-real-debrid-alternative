@@ -266,7 +266,7 @@ pub async fn stream_video(
     // it minutes later. No-op when this is the same torrent (a seek).
     engine.focus_stream(&info_hash);
 
-    // Fetch an mp4's trailing index in parallel with its opening frames, so
+    // Fetch the file's trailing index in parallel with its opening frames, so
     // the player's own tail request lands on data that is already here rather
     // than paying a second cold start for it. Detached and best-effort; a
     // playback read must never wait on it. See `warm_mp4_tail`.
@@ -326,15 +326,17 @@ pub async fn stream_video(
     // already there. The reverse is not claimed -- a warm read that happened to
     // be slow is recorded as cold, which errs toward flagging a wait rather
     // than explaining it away.
+    // A superseded read is short of its target because it was told to stop, not
+    // because the swarm was slow. Calling that a timeout would make the log
+    // report a fault where there was a deliberate decision.
+    let timed_out = !superseded && head.len() < prebuffer_target;
+
     engine.audit().record(crate::audit::Event::Prebuffer {
         info_hash: info_hash.clone(),
         bytes: head.len(),
         wanted: prebuffer_target,
         ms: prebuffer_ms,
-        // A superseded read is short of its target because it was told to
-        // stop, not because the swarm was slow. Calling that a timeout would
-        // make the log report a fault where there was a deliberate decision.
-        timed_out: !superseded && head.len() < prebuffer_target,
+        timed_out,
         warm: head.len() >= prebuffer_target && prebuffer_ms < WARM_PREBUFFER_MS,
         piece_remainder,
         superseded,
@@ -346,6 +348,27 @@ pub async fn stream_video(
         debug!(%info_hash, start, "dropping a read this client seeked away from");
         return Err(ApiErrorResponse::superseded(
             "superseded by a newer range request from the same client",
+        ));
+    }
+
+    // Nothing arrived at all. Sending the 206 anyway is what the timeout path
+    // used to do, and it is the one outcome the pre-buffer was built to make
+    // impossible: a player handed headers over an empty body treats the stream
+    // as broken and stops, rather than waiting the way it does for a response
+    // that is merely slow. Measured on 2026-09-07 -- a seek to 83% of a file
+    // 40% downloaded returned `206` with `bytes: 0` after 15 s and playback
+    // ended. A retryable status keeps the player asking instead.
+    //
+    // `timed_out` already excludes the pre-buffer-disabled case (target 0), so
+    // this cannot fire when the operator has deliberately turned the wait off.
+    if timed_out && head.is_empty() {
+        warn!(
+            %info_hash, start, piece_remainder,
+            "no bytes after {}s; asking the player to retry rather than sending an empty body",
+            prebuffer_ms / 1000
+        );
+        return Err(ApiErrorResponse::not_ready(
+            "no data for this offset yet; retry shortly",
         ));
     }
 
@@ -849,6 +872,49 @@ mod tests {
             "must return promptly on timeout, not block"
         );
         assert_eq!(head, vec![1u8; 512], "partial data must still be served");
+    }
+
+    /// The precondition behind the `not_ready` branch in `stream_video`: a
+    /// swarm that sends nothing at all leaves the pre-buffer empty, not merely
+    /// short. That is the case where returning a 206 hands the player headers
+    /// over an empty body, and the player stops — measured on 2026-09-07, a
+    /// seek to 83% of a file 40% downloaded, `bytes: 0` after 15 s.
+    #[tokio::test]
+    async fn a_prebuffer_that_gets_nothing_comes_back_empty() {
+        let reader = Box::new(StallsAfter {
+            chunk: Vec::new(),
+            sent: true,
+        });
+        let (head, _rest) = prebuffer(
+            reader,
+            PREBUFFER_MIN_BYTES,
+            1024 * 1024,
+            Duration::from_millis(200),
+            &never_cancelled(),
+        )
+        .await;
+
+        assert!(head.is_empty(), "nothing arrived, so nothing may be served");
+    }
+
+    /// Empty-handed and superseded are both "no body", and they must not get
+    /// the same status. One asks the player to come back; the other tells it
+    /// not to bother, because it has already asked for somewhere else.
+    #[test]
+    fn an_empty_handed_read_is_retryable_and_a_superseded_one_is_not() {
+        assert_eq!(
+            ApiErrorResponse::not_ready("x").status,
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            ApiErrorResponse::superseded("x").status,
+            axum::http::StatusCode::CONFLICT
+        );
+        assert!(
+            !ApiErrorResponse::not_ready("x").status.is_success(),
+            "a 2xx here is the empty-206 bug returning: the player would treat \
+             headers-with-no-body as a broken stream and stop"
+        );
     }
 
     #[tokio::test]

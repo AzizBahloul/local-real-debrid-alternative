@@ -289,7 +289,7 @@ pub struct AppConfig {
     #[arg(long, env = "SEEK_SUPERSEDE", default_value_t = true)]
     pub seek_supersede: bool,
 
-    /// Fetch an mp4's trailing index alongside its opening frames.
+    /// Fetch a video's trailing index alongside its opening frames.
     ///
     /// A non-faststart mp4 keeps its `moov` atom at the very end of the file,
     /// and a player cannot start until it has read it -- so it range-requests
@@ -298,8 +298,12 @@ pub struct AppConfig {
     /// when the stream first opens puts that piece into the priority set at
     /// the same time as the first one, so the two arrive together instead of
     /// one after the other. Costs one piece of bandwidth on a file that turns
-    /// out to be faststart already. Ignored for containers that carry their
-    /// index at the front (mkv).
+    /// out to need no tail read at all.
+    ///
+    /// Covers mkv/webm as well as mp4 since 2026-09-07: players probe those for
+    /// their Cues even though Matroska's index is nominally at the front, and
+    /// the measurement that settled it is in `torrent::TAIL_INDEXED_EXTENSIONS`.
+    /// The env var keeps its `MP4_` name so an existing config keeps working.
     #[arg(long, env = "MP4_TAIL_WARM", default_value_t = true)]
     pub mp4_tail_warm: bool,
 

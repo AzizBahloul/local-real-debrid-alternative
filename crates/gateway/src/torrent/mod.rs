@@ -405,10 +405,18 @@ const TAIL_WARM_BYTES: u64 = 24 * 1024 * 1024;
 /// watching, and once its pieces arrive it stops asking for anything.
 const TAIL_WARM_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// Containers that keep their index at the end of the file, where a player
-/// has to fetch the tail before it can play the beginning. mkv/webm put it at
-/// the front and need none of this.
-const TAIL_INDEXED_EXTENSIONS: [&str; 3] = ["mp4", "m4v", "mov"];
+/// Containers whose players read the tail of the file before they will play
+/// the head.
+///
+/// For mp4/m4v/mov this is the `moov` atom, and it is a certainty on a
+/// non-faststart file. mkv/webm are here for a measured reason rather than a
+/// structural one: Matroska puts its SeekHead at the front, so the theory says
+/// it needs none of this — but muxers routinely write the Cues at the end, and
+/// players probe for them anyway. On 2026-09-07 a 1.16 GB mkv start spent
+/// **12.2 s of its 20 s** on exactly one such request (`bytes=1162008830-`,
+/// the last 21 KB), serialised after the head read instead of beside it. The
+/// warmer costs one piece when it guesses wrong, and that trade is not close.
+const TAIL_INDEXED_EXTENSIONS: [&str; 5] = ["mp4", "m4v", "mov", "mkv", "webm"];
 
 /// How often the read-ahead claim is re-pointed at the current position.
 const READAHEAD_REFRESH: Duration = Duration::from_secs(5);
@@ -538,8 +546,9 @@ impl Drop for ReadaheadHandle {
     }
 }
 
-/// Whether this filename names a container that keeps its index at the end of
-/// the file, so a player must read the tail before it can play the head.
+/// Whether this filename names a container whose player is likely to read the
+/// tail before it will play the head — see `TAIL_INDEXED_EXTENSIONS` for why
+/// that is a claim about observed player behaviour, not about the format.
 fn has_tail_index(name: &str) -> bool {
     name.rsplit('.')
         .next()
@@ -1416,13 +1425,13 @@ impl TorrentEngine {
             .map(|f| f.name.clone())
     }
 
-    /// Fetches the tail of an mp4 in parallel with its opening frames.
+    /// Fetches the tail of the file in parallel with its opening frames.
     ///
-    /// A non-faststart mp4 stores its `moov` index at the end of the file, and
-    /// no player can begin decoding without it — so it issues a range request
-    /// for the tail *first*, at an offset no peer has been asked for, and only
-    /// then requests byte 0. That is two full piece-fetch waits in sequence,
-    /// which is one whole cold start hiding inside another.
+    /// A player that needs a trailing index — a non-faststart mp4's `moov`, an
+    /// mkv's Cues — issues a range request for the tail *first*, at an offset no
+    /// peer has been asked for, and only then requests byte 0. That is two full
+    /// piece-fetch waits in sequence, which is one whole cold start hiding
+    /// inside another, and it is where 12.2 s of a measured 20 s start went.
     ///
     /// Opening a short-lived read at the tail as soon as the stream opens puts
     /// that piece into the priority set alongside the first one, so the two are
@@ -2206,16 +2215,20 @@ mod tests {
         assert!(!slot("192.168.1.5", 0, false).superseded_by("bbbb", 0, ip("192.168.1.5")));
     }
 
-    /// mkv carries its index at the front, so warming its tail would spend a
-    /// piece of bandwidth to solve a problem it does not have.
+    /// mkv is in the list on evidence, not on theory: Matroska's SeekHead is at
+    /// the front, and players probe the tail for the Cues regardless. Leaving it
+    /// out cost a measured 12.2 s on one start — see `TAIL_INDEXED_EXTENSIONS`.
+    /// Pinned as a test because the structural argument for excluding it is
+    /// genuinely persuasive and someone will make it again.
     #[test]
     fn only_tail_indexed_containers_are_warmed() {
         assert!(has_tail_index("The.Movie.2024.1080p.mp4"));
         assert!(has_tail_index("clip.MP4"), "extensions are not case-sensitive");
         assert!(has_tail_index("holiday.mov"));
-        assert!(!has_tail_index("The.Movie.2024.1080p.mkv"));
-        assert!(!has_tail_index("stream.webm"));
+        assert!(has_tail_index("tires.s03e08.1080p.web.h264-cakes.mkv"));
+        assert!(has_tail_index("stream.webm"));
         assert!(!has_tail_index("no-extension"));
+        assert!(!has_tail_index("subtitles.srt"));
     }
 
     #[test]

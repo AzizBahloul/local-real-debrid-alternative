@@ -49,6 +49,22 @@ impl ApiErrorResponse {
         }
     }
 
+    /// The swarm has not produced a single byte of this range yet.
+    ///
+    /// 503 rather than a 206 over an empty body, which is what this replaced.
+    /// A player given headers and no data concludes the stream is broken and
+    /// stops — the exact failure the pre-buffer exists to prevent, reached by
+    /// the pre-buffer's own timeout path. A 503 is a *retryable* answer: the
+    /// player asks again, and the ask is cheap because the attempt that just
+    /// timed out already re-pointed piece priority at this offset. Waiting
+    /// longer instead would hold that claim while the viewer watches nothing.
+    pub fn not_ready(msg: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            error: msg.into(),
+        }
+    }
+
     pub fn internal(msg: impl Into<String>) -> Self {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,

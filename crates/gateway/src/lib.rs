@@ -66,6 +66,9 @@ impl FromRef<AppState> for Arc<TorrentEngine> {
     }
 }
 
+/// The liveness endpoint, named because `audit_requests` has to recognise it.
+const HEALTH_PATH: &str = "/health";
+
 /// Builds the full HTTP router. Split out from `run` so integration tests can
 /// exercise real routing/middleware/handlers without binding a socket.
 pub fn build_router(state: AppState) -> Router {
@@ -77,7 +80,7 @@ pub fn build_router(state: AppState) -> Router {
             "/videos/{info_hash}/{file_idx}",
             get(streaming::stream_video),
         )
-        .route("/health", get(monitoring::health))
+        .route(HEALTH_PATH, get(monitoring::health))
         // Loopback-only; see the handler. The desktop app's "clear" button.
         .route("/cache/clear", post(monitoring::clear_cache))
         // Loopback-only; see the handler. The desktop app's "export logs".
@@ -132,14 +135,25 @@ async fn audit_requests(
 
     let started = std::time::Instant::now();
     let response = next.run(request).await;
+    let status = response.status();
 
-    state.audit.record(audit::Event::Request {
-        client: addr.ip().to_string(),
-        path,
-        status: response.status().as_u16(),
-        latency_ms: started.elapsed().as_millis() as u64,
-        range,
-    });
+    // A successful health poll is not evidence of anything, and the GUI issues
+    // one per second for as long as it is open. Left in, they were 35 402 of
+    // 35 519 lines -- 99.7% -- which at 8 MB per rotation and one generation
+    // kept meant the log evicted a real investigation inside two days and made
+    // the rest of it something you had to grep past. A *failing* poll still
+    // records: that one is a fact about the server.
+    let is_routine_health_poll = path == HEALTH_PATH && status.is_success();
+
+    if !is_routine_health_poll {
+        state.audit.record(audit::Event::Request {
+            client: addr.ip().to_string(),
+            path,
+            status: status.as_u16(),
+            latency_ms: started.elapsed().as_millis() as u64,
+            range,
+        });
+    }
     response
 }
 

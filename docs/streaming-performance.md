@@ -7,12 +7,27 @@ against the real code paths (`crates/gateway/src/streaming/mod.rs`,
 Everything here is ordered by **payoff per unit of effort**. Part 1 costs
 nothing and needs no rebuild. Part 4 is where code changes start.
 
-> **Status (2026-09-07).** §4.1–§4.6 are implemented, and the §6 profile is now
-> the shipped default rather than something you set by hand. What is *not* done
-> is the measurement: none of it has been timed against a real swarm on this
-> link yet. §4.1 exists precisely so that next round is measured rather than
-> argued — see §7. Two levers ship **off** on purpose (§4.5, §4.6); the reasons
-> are under each one.
+> **Status (2026-09-07, second pass).** §4.1–§4.6 are implemented and the §6
+> profile is the shipped default. The measurement §4.1 was built for has now
+> happened, against a real swarm on this link, and it found two things that
+> argument had missed:
+>
+> 1. **The tail warmer was excluded from mkv on a structural argument that the
+>    log falsifies.** A 1.16 GB mkv start spent **12.2 s of its 20 s** on one
+>    request for the last 21 KB of the file. Matroska's index is nominally at
+>    the front; players probe the tail for the Cues regardless. mkv/webm are now
+>    in `TAIL_INDEXED_EXTENSIONS`.
+> 2. **The pre-buffer's own timeout path produced the failure the pre-buffer
+>    exists to prevent.** On timeout it sent the response "with whatever
+>    arrived" — and when that was *zero bytes*, the player got a `206` over an
+>    empty body, read it as a broken stream, and stopped. It now answers `503`,
+>    which a player retries.
+>
+> Both were found by reading `events.jsonl`, neither was visible from the code,
+> and the second had a doc-comment predicting it verbatim
+> (`audit::Event::Prebuffer`: *"a `timed_out` here with `bytes: 0` is a stream
+> that was handed to the player empty"*). Two levers still ship **off** on
+> purpose (§4.5, §4.6); the reasons are under each one.
 
 ---
 
