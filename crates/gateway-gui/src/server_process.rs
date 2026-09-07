@@ -52,6 +52,89 @@ pub fn find_server_binary() -> Option<PathBuf> {
         .find(|candidate| candidate.is_file())
 }
 
+/// Moves a child's stdout and stderr onto a channel, one line at a time.
+///
+/// Two threads rather than one poll loop because there is no portable way to
+/// wait on both pipes at once, and a blocked read on the quiet one must not
+/// hold up the busy one.
+fn pipe_output(child: &mut Child) -> Receiver<LogLine> {
+    let (tx, rx) = mpsc::channel();
+
+    if let Some(stdout) = child.stdout.take() {
+        let tx = tx.clone();
+        thread::spawn(move || {
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                if tx.send(LogLine::Out(line)).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    if let Some(stderr) = child.stderr.take() {
+        thread::spawn(move || {
+            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                if tx.send(LogLine::Err(line)).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+
+    rx
+}
+
+/// A read-only follower of somebody else's output -- in practice
+/// `journalctl -f` on the gateway's systemd unit.
+///
+/// Separate from [`ServerProcess`] because the ownership is the opposite way
+/// round: this process did not start the thing being logged and must never
+/// stop it, so the tail is disposable and kills itself on drop. Killing it
+/// promptly matters -- a leaked `journalctl -f` would keep running long after
+/// the window that wanted it is gone.
+pub struct LogTail {
+    child: Child,
+    rx: Receiver<LogLine>,
+}
+
+impl LogTail {
+    pub fn spawn(mut cmd: Command) -> Result<Self> {
+        let mut child = cmd
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .context("failed to start the log follower")?;
+        let rx = pipe_output(&mut child);
+        Ok(Self { child, rx })
+    }
+
+    pub fn drain(&mut self) -> Vec<LogLine> {
+        let mut out = Vec::new();
+        while let Ok(line) = self.rx.try_recv() {
+            out.push(line);
+        }
+        out
+    }
+
+    /// False once the follower itself has exited (journald restarted, unit
+    /// vanished), so the caller can respawn it rather than sit silently.
+    pub fn is_running(&mut self) -> bool {
+        matches!(self.child.try_wait(), Ok(None))
+    }
+
+    #[cfg(test)]
+    fn pid(&self) -> u32 {
+        self.child.id()
+    }
+}
+
+impl Drop for LogTail {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 #[derive(Default)]
 pub struct ServerProcess {
     child: Option<Child>,
@@ -99,28 +182,7 @@ impl ServerProcess {
         let mut child = cmd
             .spawn()
             .with_context(|| format!("failed to start {}", program.display()))?;
-
-        let (tx, rx) = mpsc::channel();
-
-        if let Some(stdout) = child.stdout.take() {
-            let tx = tx.clone();
-            thread::spawn(move || {
-                for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-                    if tx.send(LogLine::Out(line)).is_err() {
-                        break;
-                    }
-                }
-            });
-        }
-        if let Some(stderr) = child.stderr.take() {
-            thread::spawn(move || {
-                for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                    if tx.send(LogLine::Err(line)).is_err() {
-                        break;
-                    }
-                }
-            });
-        }
+        let rx = pipe_output(&mut child);
 
         self.child = Some(child);
         self.log_rx = Some(rx);
@@ -244,6 +306,34 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(3));
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// The tail must stop when the window that opened it goes away: it is a
+    /// `journalctl -f`, which never ends on its own.
+    #[test]
+    fn a_log_tail_streams_output_and_is_killed_when_dropped() {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "echo hello; while true; do sleep 0.05; done"]);
+        let mut tail = LogTail::spawn(cmd).expect("spawns");
+        let pid = tail.pid();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut seen = Vec::new();
+        while seen.is_empty() && Instant::now() < deadline {
+            seen.extend(tail.drain().into_iter().map(|l| l.text().to_string()));
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(seen.first().map(String::as_str), Some("hello"));
+
+        drop(tail);
+        // Reaped by Drop, so the pid is either gone or a zombie-free slot.
+        assert!(
+            !Path::new(&format!("/proc/{pid}/cmdline")).exists()
+                || std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                    .map(|s| s.contains(" Z "))
+                    .unwrap_or(true),
+            "the follower outlived the LogTail that owned it"
+        );
     }
 
     #[test]

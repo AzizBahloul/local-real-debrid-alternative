@@ -37,6 +37,15 @@ build/test/lint. Run build+test+clippy before calling any change done.
   `crates/gateway/src/config/mod.rs` and hardcoded in `gateway-gui/src/main.rs`
   — a test pins both. If you change one you must change the other or the GUI
   binds a port the server doesn't advertise.
+- **The GUI draws ASCII text only; everything else is painted.** Bars, frames,
+  the wordmark and the status lamp are `egui::Painter` rectangles, not block or
+  box-drawing glyphs — eframe's bundled font only guarantees ASCII coverage, so
+  a `█` progress bar renders as tofu boxes on someone else's machine. Tests in
+  `gateway-gui/src/{fx,widgets}.rs` pin this. Layer order also matters and is
+  easy to break: rain in the background layer (painted before any panel, which
+  is why panel frames are transparent and `clear_color` supplies the black),
+  widgets in the panel layer, CRT overlay in the foreground, boot cover above
+  that.
 - **Zero-OpenSSL is load-bearing.** Every TLS-adjacent dependency
   (`librqbit`, `reqwest`, `axum-server`, `rustls`) is pinned to rust-tls/rustls
   features specifically so `cargo build` needs no system `pkg-config`/
@@ -52,7 +61,25 @@ build/test/lint. Run build+test+clippy before calling any change done.
 - The GUI has no persistent log file — logs only exist in the GUI's in-memory
   Log panel and the server's stdout (piped, not written to disk). Use
   `GET /health` on the running port for a live sanity check instead of
-  grepping for a log file.
+  grepping for a log file. **Exception: in always-on mode** the server is a
+  systemd user service, so its output *is* in the journal
+  (`journalctl --user -u novastream`), which is where the GUI's panel reads
+  from — and it follows by `_SYSTEMD_INVOCATION_ID`, because journalctl
+  rejects the timestamp format systemd's own `ActiveEnterTimestamp` prints.
+- **Closing the GUI window spawns a `--tray` process; it does not hide the
+  window.** Wayland forbids a client hiding or un-minimising its own toplevel,
+  and winit allows one event loop per process, so a closed window is gone for
+  good — the tray has to be a second process. `tray.rs` keeps exactly one of
+  each via a pid file in `$XDG_RUNTIME_DIR`. Don't "simplify" this back into
+  `ViewportCommand::Visible(false)`: it is a silent no-op on Wayland.
+- **Two owners of the server, and the GUI dispatches on which.**
+  `service.installed` (the systemd user unit exists) means start/stop go
+  through `systemctl --user` and logs come from the journal; otherwise the
+  server is this window's child as before. Anything that reads `self.running`
+  must go through that split or it reports on the wrong process.
+- The service's `EnvironmentFile` (`~/.config/novastream/server.env`) is also
+  what a freshly opened window reads its port and cache directory from — a
+  service moved off 8080 is otherwise invisible to the health poll.
 
 ## Do not
 - Don't `git push` or restart/kill a running gateway process unless asked —

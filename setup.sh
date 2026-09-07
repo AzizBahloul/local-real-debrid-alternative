@@ -9,20 +9,28 @@
 # Usage:
 #   ./setup.sh              # install server deps (asks for sudo if needed) + build + verify
 #   ./setup.sh --gui        # also build the desktop GUI launcher and package a .deb
+#   ./setup.sh --gui --service  # ...and run the gateway as an always-on user service
 #   ./setup.sh --no-build   # only install system/Rust deps, skip compiling
 #
 # The server itself has no GUI dependencies at all (it's a headless HTTP
 # service) -- --gui is separate and optional specifically so this script
 # stays usable on a headless box (NAS, home server, container host).
+#
+# --service installs a *user* systemd unit (see crates/gateway-gui/src/service.rs),
+# so it needs no root and survives a reboot via linger. It is driven through
+# the GUI binary's own `--enable-always-on` flag rather than a unit file
+# written here, so there is exactly one definition of that unit in the repo.
 
 set -euo pipefail
 
 BUILD=1
 GUI=0
+SERVICE=0
 for arg in "$@"; do
   case "$arg" in
     --no-build) BUILD=0 ;;
     --gui) GUI=1 ;;
+    --service) SERVICE=1 ;;
     *)
       echo "unknown argument: $arg" >&2
       exit 1
@@ -169,6 +177,16 @@ if [ "$BUILD" -eq 1 ]; then
     command -v gio >/dev/null 2>&1 && gio set "$SHORTCUT" metadata::trusted true 2>/dev/null || true
     log "OK: Desktop shortcut created at $SHORTCUT"
     echo "  Launch \"NovaStream\" from your applications menu, the new Desktop icon, or run streaming-gateway-gui."
+
+    if [ "$SERVICE" -eq 1 ]; then
+      # The installed binary, not the one in target/: the unit records an
+      # absolute ExecStart, and pointing it at a build directory would break
+      # the service the first time someone runs `cargo clean`.
+      log "Enabling always-on mode (systemd user service, starts at boot)..."
+      /usr/bin/streaming-gateway-gui --enable-always-on
+    fi
+  elif [ "$SERVICE" -eq 1 ]; then
+    warn "--service needs --gui: the always-on switch lives in the desktop binary."
   fi
 
   # Optional convenience: open the default port on ufw if it's active, so

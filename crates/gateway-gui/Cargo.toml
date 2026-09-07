@@ -20,6 +20,15 @@ ureq = { version = "2", default-features = false, features = ["json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
+# Timestamps the exported filename. Already built for the gateway crate.
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+# The tray icon, over D-Bus (StatusNotifierItem). Pure Rust on purpose: the
+# usual alternative pulls in libappindicator/GTK development packages, and
+# needing a new system -dev package to build the launcher is exactly the kind
+# of dependency this workspace has stayed clear of. "blocking" keeps it out of
+# the way of egui's own loop -- the tray owns a thread, not a runtime we have
+# to host.
+ksni = { version = "0.3", default-features = false, features = ["tokio", "blocking"] }
 
 [package.metadata.deb]
 name = "streaming-gateway"

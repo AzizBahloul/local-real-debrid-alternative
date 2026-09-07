@@ -37,6 +37,7 @@ your phone as a normal video stream you can pause and seek.
 | ⏩ **Seek anywhere** | Jump to any point; it fetches just that part. |
 | 📱 **Any device** | Stremio, VLC, browsers, smart TVs — anything that plays a URL. |
 | 🖥️ **One-click app** | Desktop app with a big Start button. No terminal needed. |
+| 📟 **Live dashboard** | CRT-terminal launcher: throughput graph, swarm progress, cache/CPU meters, colourised log. |
 | 🔒 **Stays on your network** | Video never leaves your WiFi. |
 
 ---
@@ -85,6 +86,32 @@ Stremio needs (step 3); the plain `http://192.168.1.67:8080` one is for VLC,
 browsers and TVs.
 
 Prefer a terminal? `./target/release/streaming-gateway` does the same thing.
+
+### Keeping it on: the tray, and always-on mode
+
+Closing the window **does not quit NovaStream** — it tucks it into the system
+tray next to your clock. Click that icon to open the window again, or use its
+menu to start/stop the gateway or quit for good.
+
+For the gateway to keep streaming after the window is gone (and to come back by
+itself after a reboot), turn on **always-on mode** in the window's *always-on*
+panel. It installs a systemd **user** service — no root, no password prompt —
+that starts the gateway at boot and restarts it if it ever crashes. With it on,
+the window becomes a viewer: opening and closing it does nothing to the movie
+your phone is playing.
+
+The same switch from a terminal, handy for a headless box:
+
+```bash
+streaming-gateway-gui --enable-always-on    # install, start, and survive reboots
+streaming-gateway-gui --status              # what it is currently doing
+streaming-gateway-gui --disable-always-on   # stop and remove it
+systemctl --user status novastream          # the service itself
+journalctl --user -u novastream -f          # its log
+```
+
+`./setup.sh --gui --service` does the whole thing — build, install, enable — in
+one go.
 
 ## Step 3 — Add it to Stremio on your phone
 
@@ -464,6 +491,29 @@ setup.sh   Dockerfile
   viewer tapping a title mid-prefetch saw nothing running and kicked off a
   second, duplicate metadata fetch — competing with the first and discarding
   the head start entirely.
+- **Closing the window starts a second process instead of hiding the first.**
+  "Minimise to tray" normally means keeping the window and hiding it, which is
+  not available here: on Wayland a client cannot hide its own toplevel or
+  un-minimise one, and winit refuses to build a second event loop in a process,
+  so a window that closes can never be reopened. The window therefore really
+  closes, leaving a tiny `--tray` process holding only a D-Bus
+  StatusNotifierItem; opening from the tray spawns a fresh window and retires
+  the tray. A pid file in `$XDG_RUNTIME_DIR` keeps it to one of each.
+- **Always-on is a systemd *user* unit, not a system one.** It installs with no
+  root at all (nothing for the `.deb` to do at install time for a user who may
+  never want it), runs as the person who owns the cache, and needs only
+  `loginctl enable-linger` — a self-service polkit action — to also start at
+  boot with nobody logged in. Its settings live in an `EnvironmentFile`, since
+  the server already reads every option from the environment.
+- **The service's cache path is anchored to `$HOME`, not to a working
+  directory.** The app's default is the relative `./cache`, which for the
+  desktop launcher resolves against `$HOME` anyway; a service inherits no such
+  directory, so the same text has to be made absolute or a user's existing
+  downloads would appear to vanish behind a second, empty cache.
+- **The log panel follows the journal by invocation id, not by timestamp.**
+  systemd prints `ActiveEnterTimestamp` as `Mon 2026-09-07 01:49:30 CET`, which
+  its own `journalctl --since` refuses to parse — the follower then exits
+  instantly and the panel sits empty next to a running gateway.
 - **The gateway listens for incoming peers.** librqbit does not open a
   listening socket unless asked, which leaves the gateway dialling out only:
   every seeder that would have connected to *us* after a tracker announce is
