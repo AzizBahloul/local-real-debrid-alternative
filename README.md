@@ -243,6 +243,66 @@ http://192.168.1.67:8080/play?magnet=<your-magnet-link>
 
 ---
 
+## Updating to a newer version
+
+Pull the changes, then run the same script you installed with:
+
+```bash
+git pull
+./setup.sh --gui
+```
+
+That rebuilds both programs, repackages, and reinstalls over the old version.
+Your settings, your cache and your Stremio addon are untouched — the address
+does not change, so there is nothing to re-paste into your phone.
+
+**Then restart the two things that are still running the old code.** Neither
+does it by itself, and both look perfectly healthy while out of date:
+
+```bash
+systemctl --user restart novastream   # only if you use always-on mode
+```
+
+and for the desktop app: **close the window, then quit from the tray icon**,
+then open **NovaStream** from your applications menu again.
+
+> [!WARNING]
+> Closing the window is not quitting. It leaves a tray process running, and
+> that process keeps the **old** binary loaded no matter how many times you
+> reinstall. If an update seems to have changed nothing, this is why.
+
+> [!CAUTION]
+> Do not reach for `pkill -f streaming-gateway-gui` to shortcut that. `-f`
+> matches whole command lines, so if the string appears in the command you are
+> typing, the shell running it matches its own pattern and kills itself
+> mid-sequence. Quit from the tray icon instead.
+
+<details>
+<summary><b>Rebuilding without <code>setup.sh</code></b></summary>
+
+Three commands, no backgrounding:
+
+```bash
+cargo deb -p streaming-gateway-gui
+sudo dpkg -i target/debian/streaming-gateway_*_amd64.deb
+systemctl --user restart novastream
+```
+
+`cargo deb` runs the release build itself, so there is no separate
+`cargo build` step. A restart takes up to a minute — the server shuts its
+torrent engine down cleanly first, and `systemctl --user is-active novastream`
+reports `deactivating` for that whole time. That is normal, not a hang.
+
+Confirm the new version is actually the one running, rather than assuming it:
+
+```bash
+curl -s http://127.0.0.1:8080/health | grep -o '"version":"[^"]*"'
+```
+
+</details>
+
+---
+
 ## Settings
 
 Everything has a sensible default. Change these only if you need to:
@@ -253,26 +313,49 @@ Everything has a sensible default. Change these only if you need to:
 | `HTTPS_PORT` | `8443` | Port for the https address you paste into Stremio |
 | `DISABLE_HTTPS` | `false` | Turn off https (you would then need a tunnel again) |
 | `TLS_CERT_FILE` | — | Use your own certificate instead of the published one |
-| `MAX_CACHE_SIZE_GB` | `20` | Disk limit before old movies are deleted |
-| `IDLE_PAUSE_SECS` | `300` | Pause a movie you stopped watching, to free bandwidth |
-| `PREBUFFER_BYTES` | `4 MB` | Data to gather before playback starts |
+| `CACHE_DIRECTORY` | `./cache` | Where movies are stored. **Relative to wherever the app was launched from** — check the GUI's "Cache directory" line for the real path |
+| `MAX_CACHE_SIZE_GB` | `100` | Disk limit before old movies are deleted |
+| `MAX_CACHED_TORRENTS` | `2` | Keep only this many movies, newest first, even under the size cap |
+| `IDLE_PAUSE_SECS` | `1800` | Pause a movie you stopped watching, to free bandwidth |
+| `PREBUFFER_BYTES` | `1 MB` | Data to gather before playback starts |
+| `PREBUFFER_TIMEOUT_SECS` | `15` | Give up gathering it after this long. If nothing at all arrived, the player is asked to retry rather than handed an empty stream |
 | `STALL_TIMEOUT_SECS` | `20` | If playback gets no data for this long, quietly reconnect |
 | `CLIENT_TIMEOUT_SECS` | `900` | Hang up on a player that stopped responding, freeing its movie |
 | `MAX_PEERS_PER_TORRENT` | `60` | Peers per movie. Higher is not faster on a home connection |
-| `BROWSE_PREFETCH_COUNT` | `1` | Start the top stream while you read the list, so playing it is instant. `0` turns it off |
+| `BROWSE_PREFETCH_COUNT` | `0` | Start the top stream while you read the list, so playing it is instant. `0` turns it off |
 | `PEER_PORT` | `6881` | Port other peers connect in on. Falls back to a free one if taken |
 | `DISABLE_UPNP` | `false` | Stop asking the router to forward `PEER_PORT` |
 | `MAX_DOWNLOAD_MB_S` | `0` (off) | Cap download speed. See "Playback keeps buffering" |
-| `MAX_UPLOAD_MB_S` | `0` (off) | Cap upload/seeding speed |
+| `MAX_UPLOAD_MB_S` | `2` | Cap upload/seeding speed |
 | `INDEXER_URL` | Torrentio | Where movies are searched for |
 | `DISABLE_INDEXER` | `false` | Turn off search entirely |
+| `LOG_DIRECTORY` | — | Where the event log is written. Defaults to your XDG state directory |
 | `LOG_LEVEL` | `info` | Set to `debug` for troubleshooting |
+
+### Speed knobs
+
+These change how fast a movie starts and how well it survives a seek. The
+reasoning behind every one of them, with measurements, is in
+[`docs/streaming-performance.md`](docs/streaming-performance.md).
+
+| Setting | Default | What it does |
+|---|---|---|
+| `READAHEAD_EXTRA_MB` | `0` (off) | Buffer this many MB **beyond** the built-in 32 MB window, re-aimed as you watch. `96` gives roughly five minutes in hand. Only turn it on if your download speed comfortably beats the video's bitrate — it splits capacity rather than adding any, so on a slow swarm it makes stalls *worse* |
+| `READAHEAD_SETTLE_SECS` | `10` | Seconds of uninterrupted playback before that extra buffer is claimed |
+| `MP4_TAIL_WARM` | `true` | Fetch the end of the file alongside the beginning. Many players read the tail before they will play anything, and doing it in sequence costs a whole second start — this was **12.2 s of one measured 20 s start** |
+| `SEEK_SUPERSEDE` | `true` | When you skip again before the last skip finished, drop the abandoned one instead of letting it compete |
+| `COLD_START_PEER_LIMIT` | `0` (off) | Raise the peer cap for a movie as it starts. Only helps if you are actually hitting `MAX_PEERS_PER_TORRENT`; check `/health` before bothering |
 
 Set them like this:
 
 ```bash
 MAX_CACHE_SIZE_GB=100 ./target/release/streaming-gateway
 ```
+
+If you installed the desktop app, put them in
+`~/.config/novastream/server.env` instead — one `NAME=value` per line — then
+restart the server. Anything you add there is kept when the app saves its own
+settings.
 
 > [!TIP]
 > If you watch 4K, raise `MAX_CACHE_SIZE_GB` to at least **100**. A single 4K
@@ -535,7 +618,7 @@ setup.sh   Dockerfile
 
 ```bash
 cargo build --release              # both crates
-cargo test --release               # 67 tests
+cargo test --release               # 149 tests
 cargo clippy --release --all-targets -- -D warnings
 cargo deb -p streaming-gateway-gui # .deb package
 ```
@@ -556,7 +639,8 @@ instead of your LAN address.
 | `GET /stream/{type}/{id}.json` | Stream list for a title |
 | `GET /videos/{hash}/{idx}` | The video itself (Range supported) |
 | `GET /play?magnet=…` | Resolve a magnet and redirect to the video |
-| `GET /health` | Status, active torrents, cache usage |
+| `GET /health` | Status, active torrents, cache usage, and `recent_starts` — the last 24 measured waits, broken into phases |
+| `GET /audit/export` | The full event log as JSONL. Loopback only: it records client IPs and titles |
 
 </details>
 

@@ -1,6 +1,6 @@
 [package]
 name = "streaming-gateway"
-version = "0.9.1"
+version = "1.0.0"
 edition = "2021"
 description = "Local high-performance Stremio streaming gateway (torrent engine + HTTP range streaming server)"
 license = "MIT"
