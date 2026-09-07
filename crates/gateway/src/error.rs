@@ -35,6 +35,20 @@ impl ApiErrorResponse {
         }
     }
 
+    /// The client asked for something else before this could be answered.
+    ///
+    /// 409 rather than a 5xx because nothing failed: the request was overtaken
+    /// by a later one from the same client, which is a conflict between two of
+    /// its own requests and not an error on either side. Players treat it as a
+    /// non-retryable answer to a request they have already abandoned, which is
+    /// exactly right — the response they are waiting for is the newer one.
+    pub fn superseded(msg: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            error: msg.into(),
+        }
+    }
+
     pub fn internal(msg: impl Into<String>) -> Self {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,

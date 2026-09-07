@@ -60,7 +60,11 @@ rustls = { version = "0.23.43", default-features = false, features = ["aws-lc-rs
 # forever. A thin syscall wrapper with no TLS and no runtime, so it cannot
 # reintroduce OpenSSL; the `all` feature is what exposes the option.
 socket2 = { version = "0.6", features = ["all"] }
+# Wall-clock timestamps for the audit log. Already in the tree via librqbit,
+# so naming it directly adds no new compilation and no new TLS surface.
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
 tower = { version = "0.5", features = ["util"] }
+tempfile = "3"

@@ -30,8 +30,24 @@ pub struct AppConfig {
     #[arg(long, env = "CACHE_DIRECTORY", default_value = "./cache")]
     pub cache_dir: PathBuf,
 
+    /// Directory for the audit log (`events.jsonl`).
+    ///
+    /// Defaults to an absolute path under `XDG_STATE_HOME`, unlike `cache_dir`
+    /// which is relative to the working directory. That difference is on
+    /// purpose: the installed binaries are started by a desktop launcher from
+    /// whatever directory it happened to be in, and a log nobody can find is
+    /// the problem this whole subsystem exists to fix.
+    #[arg(long, env = "LOG_DIRECTORY")]
+    pub log_dir: Option<PathBuf>,
+
     /// Maximum size of the cache directory, in gigabytes, before old data is evicted.
-    #[arg(long, env = "MAX_CACHE_SIZE_GB", default_value_t = 20)]
+    ///
+    /// Generous on purpose. Every gigabyte evicted is a region of a film that
+    /// becomes slow to seek back into, and re-downloading it costs the whole
+    /// piece-fetch latency again; disk is by far the cheapest speed available
+    /// here. 100 GB is roughly 20-40 films, which is about the horizon over
+    /// which someone actually re-watches or resumes something.
+    #[arg(long, env = "MAX_CACHE_SIZE_GB", default_value_t = 100)]
     pub max_cache_size_gb: u64,
 
     /// Whether to automatically evict old cached torrents when over the size cap.
@@ -66,7 +82,13 @@ pub struct AppConfig {
     /// seeding competes for the same radio the video is being sent over, and
     /// the viewer feels it as buffering. Do not set it too low -- peers
     /// reciprocate, so throttling upload hard also slows the download.
-    #[arg(long, env = "MAX_UPLOAD_MB_S", default_value_t = 0)]
+    ///
+    /// Defaults to a cap rather than "unlimited" because the expected
+    /// deployment is a laptop on wifi, where upload and video share one
+    /// half-duplex radio and unlimited seeding is felt directly as buffering.
+    /// 2 MB/s is high enough that peers keep reciprocating. Set 0 for
+    /// unlimited, which is the right value on ethernet.
+    #[arg(long, env = "MAX_UPLOAD_MB_S", default_value_t = 2)]
     pub max_upload_mb_s: u64,
 
     /// Cap the torrent engine's download rate, in MB/s. 0 means unlimited.
@@ -178,7 +200,14 @@ pub struct AppConfig {
     /// response until real data exists converts the former into the latter.
     /// Costs nothing once a torrent is cached (the read is then instant).
     /// Set to 0 to disable.
-    #[arg(long, env = "PREBUFFER_BYTES", default_value_t = 4 * 1024 * 1024)]
+    ///
+    /// This is a *ceiling*, not a wait: only the first
+    /// `streaming::PREBUFFER_MIN_BYTES` are ever blocked for, and the rest is
+    /// topped up from data already on disk. It is still kept small, because on
+    /// a warm seek the top-up is real time spent reading before any byte goes
+    /// out, and a player needs enough to parse a container header, not a
+    /// multi-megabyte head start it is about to buffer again itself.
+    #[arg(long, env = "PREBUFFER_BYTES", default_value_t = 1024 * 1024)]
     pub prebuffer_bytes: usize,
 
     /// Cap on how long that pre-buffer wait may take. On timeout the response
@@ -218,12 +247,83 @@ pub struct AppConfig {
     /// reclaiming bandwidth from something genuinely abandoned is worth a few
     /// minutes, but paying the peer-rediscovery cost on a title someone
     /// stepped away from briefly is not. Set to 0 to never pause.
-    #[arg(long, env = "IDLE_PAUSE_SECS", default_value_t = 300)]
+    ///
+    /// Half an hour, because the cost is asymmetric. Pausing early saves idle
+    /// upstream bandwidth on a machine that usually has nothing else running;
+    /// pausing a film someone paused to make dinner guarantees them a full
+    /// DHT/tracker rediscovery when they come back, which is the single
+    /// longest wait this gateway ever imposes.
+    #[arg(long, env = "IDLE_PAUSE_SECS", default_value_t = 1800)]
     pub idle_pause_secs: u64,
 
     /// How often (seconds) to look for idle torrents to pause.
     #[arg(long, env = "IDLE_CHECK_INTERVAL_SECS", default_value_t = 30)]
     pub idle_check_interval_secs: u64,
+
+    /// Cancel a still-empty read as soon as the same player asks for a
+    /// different offset in the same file.
+    ///
+    /// librqbit interleaves piece requests round-robin across every open
+    /// stream, so ten abandoned scrubs do not just waste the bandwidth they
+    /// already spent -- they permanently take nine tenths of the piece
+    /// requests away from the position the viewer actually landed on. A
+    /// reader that has not yet produced a single byte is provably showing
+    /// nobody anything, so dropping it costs nothing and gives its share back.
+    ///
+    /// Scoped to the same client address, which is what keeps a second device
+    /// watching the same title from cancelling the first one's cold start (and
+    /// the first one's retry then cancelling the second's, forever).
+    /// A reader that has served bytes is never touched: that is someone
+    /// watching. Set false to disable.
+    #[arg(long, env = "SEEK_SUPERSEDE", default_value_t = true)]
+    pub seek_supersede: bool,
+
+    /// Fetch an mp4's trailing index alongside its opening frames.
+    ///
+    /// A non-faststart mp4 keeps its `moov` atom at the very end of the file,
+    /// and a player cannot start until it has read it -- so it range-requests
+    /// the tail *before* byte 0, paying a second full piece-fetch at an offset
+    /// no peer has been primed for. Opening a short-lived read at the tail
+    /// when the stream first opens puts that piece into the priority set at
+    /// the same time as the first one, so the two arrive together instead of
+    /// one after the other. Costs one piece of bandwidth on a file that turns
+    /// out to be faststart already. Ignored for containers that carry their
+    /// index at the front (mkv).
+    #[arg(long, env = "MP4_TAIL_WARM", default_value_t = true)]
+    pub mp4_tail_warm: bool,
+
+    /// Extra megabytes of read-ahead to claim once playback has settled.
+    ///
+    /// librqbit gives each open stream a fixed 32 MB priority window and
+    /// offers no way to widen it, so the only lever is a second read parked
+    /// further ahead. **Off by default, and that is a measured trade rather
+    /// than caution**: the piece scheduler interleaves streams round-robin, so
+    /// a second window does not add capacity, it splits the existing capacity
+    /// between the bytes needed in ten seconds and the bytes needed in two
+    /// minutes. On a swarm that is comfortably outrunning playback that is
+    /// free insurance against a stall; on one that is barely keeping up it is
+    /// actively harmful. Measure before turning it on.
+    #[arg(long, env = "READAHEAD_EXTRA_MB", default_value_t = 0)]
+    pub readahead_extra_mb: u64,
+
+    /// How many seconds of uninterrupted playback count as "settled" before
+    /// the extra read-ahead above is claimed. No effect at 0 extra MB.
+    #[arg(long, env = "READAHEAD_SETTLE_SECS", default_value_t = 10)]
+    pub readahead_settle_secs: u64,
+
+    /// Peer cap applied to a torrent as it is added, overriding
+    /// `MAX_PEERS_PER_TORRENT` for that torrent. 0 means "no override".
+    ///
+    /// Cold start wants peers fast and has no stream to protect yet, which is
+    /// the opposite of the steady-state reasoning behind the lower session
+    /// default. The two cannot be fully reconciled here: librqbit reads
+    /// `peer_limit` when the torrent is added and there is no way to lower it
+    /// afterwards, so a raised limit lasts that torrent's whole life rather
+    /// than the first thirty seconds. Off by default for exactly that reason
+    /// -- try 100 and measure whether it moves anything on your link before
+    /// leaving it on.
+    #[arg(long, env = "COLD_START_PEER_LIMIT", default_value_t = 0)]
+    pub cold_start_peer_limit: usize,
 
     /// Disable the https listener.
     ///
@@ -287,6 +387,17 @@ impl AppConfig {
         Self::parse()
     }
 
+    /// The shipped configuration, as if the binary were started with no
+    /// arguments and no environment.
+    ///
+    /// Exists so tests can start from the real defaults and override the two
+    /// or three fields they care about. A struct literal cannot: it must name
+    /// every field, so adding one to `AppConfig` breaks test files for reasons
+    /// that have nothing to do with what they test.
+    pub fn defaults() -> Self {
+        Self::parse_from(["streaming-gateway"])
+    }
+
     pub fn max_cache_size_bytes(&self) -> u64 {
         self.max_cache_size_gb.saturating_mul(1024 * 1024 * 1024)
     }
@@ -298,6 +409,13 @@ impl AppConfig {
     pub fn session_state_dir(&self) -> PathBuf {
         self.cache_dir.join("session")
     }
+
+    /// Where the audit log goes: the explicit setting, else the XDG default.
+    pub fn resolved_log_dir(&self) -> PathBuf {
+        self.log_dir
+            .clone()
+            .unwrap_or_else(crate::audit::default_log_dir)
+    }
 }
 
 #[cfg(test)]
@@ -305,7 +423,7 @@ mod tests {
     use super::*;
 
     fn defaults() -> AppConfig {
-        AppConfig::parse_from(["streaming-gateway"])
+        AppConfig::defaults()
     }
 
     /// The port is not a free choice: the addon URL installed in Stremio, the
@@ -345,6 +463,33 @@ mod tests {
     #[test]
     fn browse_prefetch_stays_off_by_default() {
         assert_eq!(defaults().browse_prefetch_count, 0);
+    }
+
+    /// The read-ahead widener splits piece priority rather than adding
+    /// capacity (see the field docs), so it ships off. This pins that, because
+    /// turning it on regresses nothing visibly -- playback still works, it
+    /// just stalls more often on a marginal swarm, which is indistinguishable
+    /// from a bad night on the wifi.
+    #[test]
+    fn speculative_levers_stay_off_by_default() {
+        let config = defaults();
+        assert_eq!(config.readahead_extra_mb, 0);
+        assert_eq!(
+            config.cold_start_peer_limit, 0,
+            "librqbit cannot lower a peer limit again after the add, so raising \
+             it is a whole-session decision and must be taken deliberately"
+        );
+    }
+
+    /// Both of these only ever cost latency, never correctness, so a
+    /// regression shows up as "it feels slower" and nothing else.
+    #[test]
+    fn latency_defaults_are_the_tuned_ones() {
+        let config = defaults();
+        assert_eq!(config.prebuffer_bytes, 1024 * 1024);
+        assert_eq!(config.idle_pause_secs, 1800);
+        assert!(config.seek_supersede, "scrub bursts otherwise keep every abandoned reader's piece-priority claim");
+        assert!(config.mp4_tail_warm);
     }
 
     #[test]

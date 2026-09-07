@@ -1,3 +1,4 @@
+pub mod audit;
 pub mod cache;
 pub mod config;
 pub mod error;
@@ -53,6 +54,8 @@ pub struct AppState {
     /// and offer its "you must be away from home" fallback for a request
     /// that never left the building.
     pub tls_host: Option<String>,
+    /// Persistent event log. Cheap to clone; see the `audit` module.
+    pub audit: audit::AuditLog,
 }
 
 // Lets handlers ask for `State<Arc<TorrentEngine>>` directly instead of the
@@ -77,6 +80,16 @@ pub fn build_router(state: AppState) -> Router {
         .route("/health", get(monitoring::health))
         // Loopback-only; see the handler. The desktop app's "clear" button.
         .route("/cache/clear", post(monitoring::clear_cache))
+        // Loopback-only; see the handler. The desktop app's "export logs".
+        .route("/audit/export", get(monitoring::export_audit_log))
+        // Records every request with its time-to-first-byte. Added here, so it
+        // sits *inside* the timeout layer below and therefore still logs a
+        // request that the timeout cut off -- a 504 is precisely the event
+        // worth having in the file.
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            audit_requests,
+        ))
         .layer(TraceLayer::new_for_http())
         // Required by the Stremio addon protocol ("all routes must serve
         // CORS headers permitting all origins"); also what lets a phone's
@@ -95,6 +108,39 @@ pub fn build_router(state: AppState) -> Router {
             Duration::from_secs(60),
         ))
         .with_state(state)
+}
+
+/// Records one `Request` event per HTTP request, with its time-to-first-byte.
+///
+/// TTFB rather than total duration, because the response returns as soon as
+/// headers are ready and the body then streams for the length of the video --
+/// timing that would measure how long someone watched, not how long they
+/// waited. The wait is the number that decides whether a player starts or
+/// gives up, so it is the one worth recording.
+async fn audit_requests(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<SocketAddr>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let path = request.uri().path().to_string();
+    let range = request
+        .headers()
+        .get(axum::http::header::RANGE)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+
+    let started = std::time::Instant::now();
+    let response = next.run(request).await;
+
+    state.audit.record(audit::Event::Request {
+        client: addr.ip().to_string(),
+        path,
+        status: response.status().as_u16(),
+        latency_ms: started.elapsed().as_millis() as u64,
+        range,
+    });
+    response
 }
 
 /// Binds the primary port, falling back to `fallback_port` if it's already
@@ -134,12 +180,28 @@ pub async fn run() -> anyhow::Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::new(config.log_level.clone()))
         .init();
 
+    // Opened before anything that can fail, so a startup failure is itself
+    // recorded rather than being the one class of problem the log misses.
+    let log_dir = config.resolved_log_dir();
+    let audit = audit::AuditLog::open(&log_dir);
+    audit::install_panic_hook(audit.clone());
+    match audit.path() {
+        Some(path) => info!(path = %path.display(), "audit log"),
+        None => warn!("audit log is disabled; no session record will be kept"),
+    }
+
     if let Err(e) = librqbit::try_increase_nofile_limit() {
         warn!("could not raise open-file limit (streaming many torrents may hit OS limits): {e:#}");
     }
 
     info!("starting torrent engine...");
-    let engine = TorrentEngine::new(&config).await?;
+    let engine = TorrentEngine::new(&config).await.inspect_err(|e| {
+        audit.record(audit::Event::Problem {
+            context: "torrent engine startup".to_string(),
+            message: format!("{e:#}"),
+        });
+    })?;
+    engine.attach_audit(audit.clone());
 
     let cache = CacheManager::new(
         config.downloads_dir(),
@@ -201,12 +263,25 @@ pub async fn run() -> anyhow::Result<()> {
     let tls_host =
         (!config.disable_https).then(|| tls::hostname_for(lan_ip, &config.tls_host_suffix));
 
+    audit.record(audit::Event::ServerStart {
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        http_port: bound_port,
+        https_port: (!config.disable_https).then_some(config.https_port),
+        cache_dir: config
+            .cache_dir
+            .canonicalize()
+            .unwrap_or_else(|_| config.cache_dir.clone())
+            .display()
+            .to_string(),
+    });
+
     let state = AppState {
         engine,
         cache,
         stream_base_url,
         indexer,
         tls_host: tls_host.clone(),
+        audit: audit.clone(),
     };
 
     monitoring::spawn_terminal_monitor(
@@ -229,13 +304,34 @@ pub async fn run() -> anyhow::Result<()> {
     }
     info!(%lan_ip, port = bound_port, "streaming gateway listening");
 
-    axum::serve(
+    let started = std::time::Instant::now();
+    let served = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
     .with_graceful_shutdown(shutdown_signal())
-    .await?;
+    .await;
 
+    // Recorded on both paths: a clean stop and a serve error are the two ways
+    // this process ends without panicking, and telling them apart afterwards
+    // is most of "why did it stop?".
+    match &served {
+        Ok(()) => audit.record(audit::Event::ServerStop {
+            uptime_secs: started.elapsed().as_secs(),
+        }),
+        Err(e) => audit.record(audit::Event::Problem {
+            context: "http server stopped".to_string(),
+            message: format!("{e:#}"),
+        }),
+    }
+    // The writer flushes after draining each batch, so the record above lands
+    // within milliseconds -- but it is queued, not written, at this point, and
+    // returning from `run` ends the process. This is the margin that keeps the
+    // last line of a session (the one saying how the session ended) from being
+    // the one line that never makes it to disk.
+    std::thread::sleep(Duration::from_millis(200));
+
+    served?;
     Ok(())
 }
 

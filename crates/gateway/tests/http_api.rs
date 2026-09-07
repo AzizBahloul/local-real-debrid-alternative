@@ -32,57 +32,65 @@ async fn test_state() -> AppState {
             .as_nanos()
     ));
 
-    let config = AppConfig {
-        port: 0,
-        fallback_port: 0,
-        bind_addr: "127.0.0.1".parse().unwrap(),
-        cache_dir: dir,
-        max_cache_size_gb: 20,
-        auto_cleanup: false,
-        cleanup_interval_secs: 3600,
-        max_concurrent_torrents: 4,
-        max_peers_per_torrent: 60,
-        // No rate limiting and no client timeout in tests: there is no swarm
-        // to throttle, and the router is driven in-process rather than over a
-        // real socket, so neither setting can influence the outcome.
-        max_upload_mb_s: 0,
-        max_download_mb_s: 0,
-        client_timeout_secs: 0,
-        disable_dht: true, // tests must not depend on the public DHT network
-        // An ephemeral peer port so concurrent test sessions never clash over
-        // one, and no UPnP: a test must not reconfigure the developer's
-        // router. Prefetch off -- it would join real swarms.
-        peer_port: 0,
-        disable_upnp: true,
-        browse_prefetch_count: 0,
-        monitor_interval_secs: 3600,
-        log_level: "error".to_string(),
-        // Discovery off: these tests must not reach out to a public index.
-        // Indexer parsing/id-validation is covered by unit tests instead.
-        indexer_url: "https://indexer.invalid".to_string(),
-        disable_indexer: true,
-        indexer_max_results: 15,
-        indexer_timeout_secs: 5,
-        public_stream_url: None,
-        idle_pause_secs: 120,
-        idle_check_interval_secs: 30,
-        // No pre-buffering in tests: there is no swarm, so waiting for bytes
-        // that can never arrive would just add the timeout to every case.
-        prebuffer_bytes: 0,
-        prebuffer_timeout_secs: 1,
-        // Stall recovery off: with no swarm every read stalls by definition,
-        // so leaving it on would just re-open streams in a loop.
-        stall_timeout_secs: 0,
-        // No https listener in tests: it would fetch a certificate over the
-        // network, which these tests must never depend on.
-        disable_https: true,
-        https_port: 0,
-        tls_host_suffix: "local-ip.sh".to_string(),
-        tls_cert_url: "https://tls.invalid/server.pem".to_string(),
-        tls_key_url: "https://tls.invalid/server.key".to_string(),
-        tls_cert_file: None,
-        tls_key_file: None,
-    };
+    // Started from the real defaults and then overridden, rather than written
+    // out field by field. A struct literal here has to name every field, so
+    // adding one to `AppConfig` breaks this file for reasons that have nothing
+    // to do with what it tests -- and the fix is always "copy the default in",
+    // which is what this does once instead of on every future field.
+    let mut config = AppConfig::defaults();
+
+    config.port = 0;
+    config.fallback_port = 0;
+    config.bind_addr = "127.0.0.1".parse().unwrap();
+    config.cache_dir = dir;
+    // Tests use a disabled `AuditLog`, so nothing is written and this path is
+    // never created.
+    config.log_dir = None;
+    config.auto_cleanup = false;
+    config.cleanup_interval_secs = 3600;
+    config.max_concurrent_torrents = 4;
+
+    // No rate limiting and no client timeout: there is no swarm to throttle,
+    // and the router is driven in-process rather than over a real socket, so
+    // neither setting can influence the outcome.
+    config.max_upload_mb_s = 0;
+    config.max_download_mb_s = 0;
+    config.client_timeout_secs = 0;
+
+    config.disable_dht = true; // tests must not depend on the public DHT network
+    // An ephemeral peer port so concurrent test sessions never clash over one,
+    // and no UPnP: a test must not reconfigure the developer's router.
+    config.peer_port = 0;
+    config.disable_upnp = true;
+    // Both would join real swarms.
+    config.browse_prefetch_count = 0;
+    config.mp4_tail_warm = false;
+
+    config.monitor_interval_secs = 3600;
+    config.log_level = "error".to_string();
+
+    // Discovery off: these tests must not reach out to a public index. Indexer
+    // parsing/id-validation is covered by unit tests instead.
+    config.indexer_url = "https://indexer.invalid".to_string();
+    config.disable_indexer = true;
+
+    config.idle_pause_secs = 120;
+    config.idle_check_interval_secs = 30;
+
+    // No pre-buffering: there is no swarm, so waiting for bytes that can never
+    // arrive would just add the timeout to every case.
+    config.prebuffer_bytes = 0;
+    config.prebuffer_timeout_secs = 1;
+    // Stall recovery off: with no swarm every read stalls by definition, so
+    // leaving it on would re-open streams in a loop.
+    config.stall_timeout_secs = 0;
+
+    // No https listener: it would fetch a certificate over the network, which
+    // these tests must never depend on.
+    config.disable_https = true;
+    config.https_port = 0;
+    config.tls_cert_url = "https://tls.invalid/server.pem".to_string();
+    config.tls_key_url = "https://tls.invalid/server.key".to_string();
 
     let engine = TorrentEngine::new(&config).await.expect("engine starts");
     let cache = CacheManager::new(
@@ -98,6 +106,7 @@ async fn test_state() -> AppState {
         stream_base_url: "http://127.0.0.1:8080".to_string(),
         indexer: None,
         tls_host: None,
+        audit: streaming_gateway::audit::AuditLog::disabled(),
     }
 }
 
@@ -303,4 +312,45 @@ async fn videos_endpoint_accepts_a_hash_the_gateway_advertised() {
         advertised.is_err(),
         "an advertised hash must pass the gate and reach the torrent engine"
     );
+}
+
+/// Same as `get`, but lets the test choose the peer address the router sees.
+async fn get_from(app: axum::Router, uri: &str, from: SocketAddr) -> StatusCode {
+    app.oneshot(
+        Request::builder()
+            .uri(uri)
+            .extension(axum::extract::ConnectInfo(from))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await
+    .unwrap()
+    .status()
+}
+
+#[tokio::test]
+async fn audit_export_is_refused_to_everything_but_loopback() {
+    // The audit log records every client IP that ever connected and every
+    // title it played. Every *other* route here is deliberately open to the
+    // whole LAN, because that is the product -- so this one being closed is a
+    // property worth a test rather than a convention worth trusting. The
+    // gateway has no authentication of any kind, so "reachable from the WiFi"
+    // means "readable by anything on the WiFi".
+    let app = build_router(test_state().await);
+    let status = get_from(
+        app,
+        "/audit/export",
+        SocketAddr::from(([192, 168, 1, 214], 51000)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn audit_export_is_served_over_loopback() {
+    // The other half: the desktop app's "save logs" button asks over
+    // 127.0.0.1, so a guard that refused everyone would be just as broken.
+    let app = build_router(test_state().await);
+    let status = get_from(app, "/audit/export", SocketAddr::from(([127, 0, 0, 1], 9))).await;
+    assert_eq!(status, StatusCode::OK);
 }

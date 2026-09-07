@@ -11,10 +11,11 @@
 
 pub mod resolver;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::SeekFrom;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
@@ -386,6 +387,178 @@ impl OpenStreamCounts {
     }
 }
 
+/// librqbit's per-stream look-ahead window, from
+/// `torrent_state::streaming::PER_STREAM_BUF_DEFAULT`.
+///
+/// Not configurable from outside the library, which is the whole reason
+/// `spawn_readahead` exists: the only way to prioritise further ahead than
+/// this is to hold a second read positioned there.
+const LIBRQBIT_STREAM_WINDOW: u64 = 32 * 1024 * 1024;
+
+/// How much of an mp4's tail the warmer pulls. One piece is enough to make
+/// the range request the player is about to issue land on data already here;
+/// this is comfortably over the largest piece size in practice.
+const TAIL_WARM_BYTES: u64 = 24 * 1024 * 1024;
+
+/// How long the tail warmer waits for those bytes before giving up. Generous
+/// because it costs nothing to wait -- it is a background read nobody is
+/// watching, and once its pieces arrive it stops asking for anything.
+const TAIL_WARM_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Containers that keep their index at the end of the file, where a player
+/// has to fetch the tail before it can play the beginning. mkv/webm put it at
+/// the front and need none of this.
+const TAIL_INDEXED_EXTENSIONS: [&str; 3] = ["mp4", "m4v", "mov"];
+
+/// How often the read-ahead claim is re-pointed at the current position.
+const READAHEAD_REFRESH: Duration = Duration::from_secs(5);
+
+/// How far the playback position must move before the read-ahead claim is
+/// re-opened. Re-opening is a real API call, so it is not done per refresh.
+const READAHEAD_ADVANCE_BYTES: u64 = 8 * 1024 * 1024;
+
+/// A one-way "stop what you are doing" signal for a single response.
+///
+/// Built on a closed semaphore rather than a flag plus a `Notify` because the
+/// obvious version of that has a race: check the flag, find it clear, await
+/// the notification, and miss the one that fired in between. A semaphore with
+/// no permits can only ever resolve by being closed, and closing is
+/// idempotent, observable, and cannot be missed by a late waiter.
+pub struct ReaderCancel(Semaphore);
+
+impl ReaderCancel {
+    fn new() -> Self {
+        Self(Semaphore::new(0))
+    }
+
+    /// A signal that will never fire, for callers with nothing to supersede
+    /// them (tests, and any future non-HTTP reader).
+    pub fn never_cancelled() -> Self {
+        Self::new()
+    }
+
+    /// Fires the signal by hand. Only for tests -- in the gateway itself the
+    /// decision to supersede belongs to `register_reader`, which is the one
+    /// place that can see every reader and apply the same rules to all of them.
+    #[cfg(test)]
+    pub fn cancel_for_test(&self) {
+        self.cancel();
+    }
+
+    fn cancel(&self) {
+        self.0.close();
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.0.is_closed()
+    }
+
+    /// Resolves when, and only when, this reader has been superseded.
+    pub async fn cancelled(&self) {
+        let _ = self.0.acquire().await;
+    }
+}
+
+/// One in-flight video response, as far as deciding who still deserves piece
+/// priority is concerned.
+struct ReaderSlot {
+    id: u64,
+    info_hash: String,
+    file_idx: usize,
+    /// Superseding is scoped to one client, so a second device starting the
+    /// same title cannot cancel the first device's cold start (and be
+    /// cancelled in turn by its retry, forever).
+    client: IpAddr,
+    /// An index/tail probe. Exempt, because it is a second read the same
+    /// player genuinely needs at the same time, not a superseded seek.
+    tail_probe: bool,
+    served: Arc<AtomicU64>,
+    cancel: Arc<ReaderCancel>,
+}
+
+impl ReaderSlot {
+    /// Whether a new read of `(info_hash, file_idx)` from `client` makes this
+    /// one redundant.
+    ///
+    /// Every clause is load-bearing; see `register_reader` for why each one is
+    /// there and what breaks without it.
+    fn superseded_by(&self, info_hash: &str, file_idx: usize, client: IpAddr) -> bool {
+        self.info_hash == info_hash
+            && self.file_idx == file_idx
+            && self.client == client
+            && !self.tail_probe
+            && self.served.load(Ordering::Relaxed) == 0
+    }
+}
+
+/// Registration of a live video response. Held for as long as the response is,
+/// and removed from the registry when dropped.
+pub struct ReaderTicket {
+    engine: Arc<TorrentEngine>,
+    id: u64,
+    served: Arc<AtomicU64>,
+    cancel: Arc<ReaderCancel>,
+}
+
+impl ReaderTicket {
+    /// The signal to stop. Selected on by the pre-buffer and by the response
+    /// body, which are the two places a superseded read would otherwise sit
+    /// holding piece priority it is never going to use.
+    pub fn cancel_handle(&self) -> Arc<ReaderCancel> {
+        Arc::clone(&self.cancel)
+    }
+
+    /// Reports progress. A reader that has delivered even one byte is someone
+    /// watching something and is never superseded.
+    pub fn record_served(&self, bytes: u64) {
+        self.served.fetch_add(bytes, Ordering::Relaxed);
+    }
+}
+
+impl Drop for ReaderTicket {
+    fn drop(&mut self) {
+        self.engine
+            .readers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .retain(|slot| slot.id != self.id);
+    }
+}
+
+/// Keeps an extra read-ahead claim alive for the life of one response.
+///
+/// Dropping it aborts the task, which drops the read it was holding, which is
+/// what removes the claim from librqbit's priority set. There is no other
+/// unregister step — the claim *is* the open read.
+pub struct ReadaheadHandle(tokio::task::JoinHandle<()>);
+
+impl Drop for ReadaheadHandle {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Whether this filename names a container that keeps its index at the end of
+/// the file, so a player must read the tail before it can play the head.
+fn has_tail_index(name: &str) -> bool {
+    name.rsplit('.')
+        .next()
+        .is_some_and(|ext| TAIL_INDEXED_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()))
+}
+
+/// Where a byte offset sits relative to the piece that contains it.
+///
+/// The piece is the unit BitTorrent actually transfers, so this is the shape
+/// of the floor under every seek: nothing at `offset` can be read until the
+/// whole piece holding it has arrived and passed its hash check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PieceGeometry {
+    pub piece_len: u64,
+    /// Bytes from the requested offset to the end of its piece, clamped to the
+    /// end of the file.
+    pub remainder: u64,
+}
+
 pub struct TorrentEngine {
     api: Api,
     /// How an identifier turns into a magnet link. Only `MagnetSource` today;
@@ -423,6 +596,37 @@ pub struct TorrentEngine {
     resolved_metadata: Mutex<MetadataCache>,
     /// When a hash last failed to find any peers. See `START_FAILURE_COOLDOWN`.
     failed_starts: StdMutex<HashMap<String, Instant>>,
+    /// Event log. Set after construction by `attach_audit` (the engine is
+    /// built before the log's owner exists), and inert until then.
+    audit: StdMutex<crate::audit::AuditLog>,
+    /// Every video response currently in flight. See `register_reader`.
+    readers: StdMutex<Vec<ReaderSlot>>,
+    next_reader_id: AtomicU64,
+    /// Files whose trailing index has already been warmed, so the warmer runs
+    /// once per file rather than once per seek.
+    tail_warmed: StdMutex<HashSet<(String, usize)>>,
+    seek_supersede: bool,
+    mp4_tail_warm: bool,
+    /// Extra read-ahead to claim past librqbit's own window, in bytes. 0 off.
+    readahead_extra: u64,
+    readahead_settle: Duration,
+    /// Per-torrent peer cap applied at add time, when set.
+    cold_start_peer_limit: Option<usize>,
+}
+
+/// Where the time went during one cold start, filled in as it proceeds so the
+/// record is complete on the error paths too — a start that *failed* after 25
+/// seconds is the one worth explaining, and it is exactly the case a
+/// success-only measurement misses.
+#[derive(Debug, Default)]
+struct ColdStartPhases {
+    info_hash: String,
+    /// False when the torrent was already running, i.e. not a cold start at
+    /// all and not worth a line in the log.
+    was_cold: bool,
+    from_cached_metadata: bool,
+    metadata_ms: u64,
+    initialize_ms: u64,
 }
 
 /// What to do with a torrent that is not the one being watched.
@@ -594,7 +798,36 @@ impl TorrentEngine {
             starts: Mutex::new(HashMap::new()),
             resolved_metadata: Mutex::new(MetadataCache::default()),
             failed_starts: StdMutex::new(HashMap::new()),
+            audit: StdMutex::new(crate::audit::AuditLog::disabled()),
+            readers: StdMutex::new(Vec::new()),
+            next_reader_id: AtomicU64::new(0),
+            tail_warmed: StdMutex::new(HashSet::new()),
+            seek_supersede: config.seek_supersede,
+            mp4_tail_warm: config.mp4_tail_warm,
+            readahead_extra: config.readahead_extra_mb.saturating_mul(1024 * 1024),
+            readahead_settle: Duration::from_secs(config.readahead_settle_secs),
+            cold_start_peer_limit: (config.cold_start_peer_limit > 0)
+                .then_some(config.cold_start_peer_limit),
         }))
+    }
+
+    /// Gives the engine somewhere to record events.
+    ///
+    /// Separate from `new` because the engine is constructed before the rest
+    /// of the application state exists. Until this is called the engine logs
+    /// nothing, which is what tests and the integration harness want.
+    pub fn attach_audit(&self, log: crate::audit::AuditLog) {
+        *self
+            .audit
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = log;
+    }
+
+    pub fn audit(&self) -> crate::audit::AuditLog {
+        self.audit
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     /// Fetches torrent metadata only (fast, no data downloaded) and lists its files.
@@ -675,8 +908,43 @@ impl TorrentEngine {
         file_idx: usize,
         initial_peers: Vec<std::net::SocketAddr>,
     ) -> Result<String> {
+        let mut phases = ColdStartPhases::default();
+        let began = Instant::now();
+        let result = self
+            .start_file_timed(input, file_idx, initial_peers, &mut phases)
+            .await;
+
+        // Only a genuinely cold start is worth a record. A warm one is a map
+        // lookup, and logging those would bury the slow starts -- the ones
+        // this exists to explain -- under one line per seek.
+        if phases.was_cold {
+            self.audit().record(crate::audit::Event::ColdStart {
+                info_hash: phases.info_hash.clone(),
+                file_idx,
+                metadata_ms: phases.metadata_ms,
+                initialize_ms: phases.initialize_ms,
+                total_ms: began.elapsed().as_millis() as u64,
+                from_cached_metadata: phases.from_cached_metadata,
+                outcome: match &result {
+                    Ok(_) => "ok".to_string(),
+                    Err(e) => format!("{e:#}"),
+                },
+            });
+        }
+        result
+    }
+
+    /// The body of `start_file`, recording where the time went as it goes.
+    async fn start_file_timed(
+        &self,
+        input: &str,
+        file_idx: usize,
+        initial_peers: Vec<std::net::SocketAddr>,
+        phases: &mut ColdStartPhases,
+    ) -> Result<String> {
         let magnet = self.source.to_magnet(input)?;
         let info_hash = info_hash_from_magnet(&magnet)?;
+        phases.info_hash = info_hash.clone();
 
         // Serializes starts of *this* torrent. librqbit resolves a magnet's
         // metadata before the torrent appears in the session, so for the
@@ -707,6 +975,11 @@ impl TorrentEngine {
         // cold start disappears entirely -- which is the whole point of
         // keeping it. See `MetadataCache`.
         let cached_metadata = self.resolved_metadata.lock().await.get(&info_hash);
+
+        // Past the warm-path return above, so everything from here is a cold
+        // start and worth a record however it ends.
+        phases.was_cold = true;
+        phases.from_cached_metadata = cached_metadata.is_some();
 
         // A hash that just failed to find any peers fails the same way every
         // time, for the same 25 seconds -- so a client auto-retrying a dead
@@ -745,6 +1018,11 @@ impl TorrentEngine {
             // on disk back to the torrent it belongs to.
             sub_folder: Some(info_hash.clone()),
             initial_peers: (!initial_peers.is_empty()).then_some(initial_peers),
+            // Overrides the session-wide cap for this torrent only, and only
+            // when asked for. `None` keeps the session default. librqbit reads
+            // this once, here, so it cannot be walked back down after the
+            // start -- see the field docs on `cold_start_peer_limit`.
+            peer_limit: self.cold_start_peer_limit,
             ..Default::default()
         };
 
@@ -756,11 +1034,13 @@ impl TorrentEngine {
             None => AddTorrent::from_url(magnet),
         };
 
+        let metadata_began = Instant::now();
         let added = tokio::time::timeout(
             ADD_TORRENT_TIMEOUT,
             self.api.api_add_torrent(source, Some(opts)),
         )
         .await;
+        phases.metadata_ms = metadata_began.elapsed().as_millis() as u64;
 
         if added.is_err() {
             self.record_start_failure(&info_hash);
@@ -787,8 +1067,12 @@ impl TorrentEngine {
         // "invalid state: initializing" for the first second or two -- which a
         // player treats as a dead link rather than retrying, so playback fails
         // outright. Waiting here makes "started" actually mean "playable".
-        self.wait_until_streamable(&info_hash, INITIALIZE_TIMEOUT)
-            .await?;
+        let initialize_began = Instant::now();
+        let streamable = self
+            .wait_until_streamable(&info_hash, INITIALIZE_TIMEOUT)
+            .await;
+        phases.initialize_ms = initialize_began.elapsed().as_millis() as u64;
+        streamable?;
 
         Ok(info_hash)
     }
@@ -1000,6 +1284,263 @@ impl TorrentEngine {
         self.stall_timeout
     }
 
+    /// Registers an in-flight video response and, in doing so, retires the
+    /// ones this client has already given up on.
+    ///
+    /// librqbit interleaves piece requests round-robin across every open
+    /// stream, so an abandoned read is not merely idle — it keeps taking its
+    /// share of the request slots for a position nobody is watching. Ten quick
+    /// scrubs therefore leave the position the viewer finally landed on
+    /// receiving a tenth of the download, which is why a burst of seeks feels
+    /// like ten cold starts rather than one.
+    ///
+    /// What gets retired is deliberately narrow. Only reads that have not
+    /// delivered a single byte, only from the same client address, and never
+    /// an index probe:
+    ///
+    /// * **Zero bytes served** is the proof that nobody is watching it. A read
+    ///   that has produced output is feeding a picture on a screen and is left
+    ///   alone no matter how old it is.
+    /// * **Same client** keeps two devices playing the same title from
+    ///   cancelling each other's cold start — and then each other's retry, in
+    ///   a loop where neither ever starts.
+    /// * **Not a tail probe** because an mp4's index read is a second read the
+    ///   same player needs *concurrently*, not a superseded seek. Cancelling
+    ///   it would break exactly the players §4.3 exists to help.
+    pub fn register_reader(
+        self: &Arc<Self>,
+        info_hash: &str,
+        file_idx: usize,
+        client: IpAddr,
+        tail_probe: bool,
+    ) -> ReaderTicket {
+        let id = self.next_reader_id.fetch_add(1, Ordering::Relaxed);
+        let served = Arc::new(AtomicU64::new(0));
+        let cancel = Arc::new(ReaderCancel::new());
+
+        let superseded = {
+            let mut readers = self
+                .readers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+            let superseded: Vec<Arc<ReaderCancel>> = if self.seek_supersede && !tail_probe {
+                readers
+                    .iter()
+                    .filter(|slot| slot.superseded_by(info_hash, file_idx, client))
+                    .map(|slot| Arc::clone(&slot.cancel))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+
+            readers.push(ReaderSlot {
+                id,
+                info_hash: info_hash.to_string(),
+                file_idx,
+                client,
+                tail_probe,
+                served: Arc::clone(&served),
+                cancel: Arc::clone(&cancel),
+            });
+            superseded
+        };
+
+        if !superseded.is_empty() {
+            debug!(
+                %info_hash,
+                count = superseded.len(),
+                "dropping reads this client abandoned before they produced a byte"
+            );
+            for cancel in superseded {
+                cancel.cancel();
+            }
+        }
+
+        ReaderTicket {
+            engine: Arc::clone(self),
+            id,
+            served,
+            cancel,
+        }
+    }
+
+    /// Where `file_offset` sits inside its piece, or `None` while the torrent
+    /// has no metadata yet.
+    ///
+    /// The piece is the smallest thing BitTorrent will transfer, so this is
+    /// the floor under any read at that offset — and knowing it is what lets
+    /// the pre-buffer avoid asking for one byte more than the piece it is
+    /// already waiting for, which would silently double the wait.
+    ///
+    /// Recording it next to the measured wait is also what separates "this
+    /// gateway is slow" from "this release has 8 MB pieces", which look
+    /// identical from a stopwatch and call for completely different responses.
+    pub fn piece_geometry(
+        &self,
+        info_hash: &str,
+        file_idx: usize,
+        file_offset: u64,
+    ) -> Option<PieceGeometry> {
+        let idx = TorrentIdOrHash::parse(info_hash).ok()?;
+        let handle = self.api.session().get(idx)?;
+        let metadata = handle.metadata.load_full()?;
+        let file = metadata.file_infos.get(file_idx)?;
+        if file_offset >= file.len {
+            return None;
+        }
+        // librqbit's own arithmetic rather than a re-derivation of it: this is
+        // the same function its reader uses to decide which piece it is
+        // parked on, so the number reported here cannot drift from the number
+        // actually being waited for.
+        let lengths = metadata.lengths();
+        let current = lengths.compute_current_piece(file_offset, file.offset_in_torrent)?;
+        Some(PieceGeometry {
+            piece_len: u64::from(lengths.piece_length(current.id)),
+            // Clamped to the end of the file: the last piece of a file inside
+            // a multi-file torrent runs on into the next file, and those bytes
+            // are not ones this request could ever be served.
+            remainder: u64::from(current.piece_remaining).min(file.len - file_offset),
+        })
+    }
+
+    /// The name of one file inside a torrent, for deciding what container it
+    /// is. `None` when the torrent or index is unknown.
+    pub fn file_name(&self, info_hash: &str, file_idx: usize) -> Option<String> {
+        let idx = TorrentIdOrHash::parse(info_hash).ok()?;
+        self.api
+            .api_torrent_details(idx)
+            .ok()?
+            .files?
+            .get(file_idx)
+            .map(|f| f.name.clone())
+    }
+
+    /// Fetches the tail of an mp4 in parallel with its opening frames.
+    ///
+    /// A non-faststart mp4 stores its `moov` index at the end of the file, and
+    /// no player can begin decoding without it — so it issues a range request
+    /// for the tail *first*, at an offset no peer has been asked for, and only
+    /// then requests byte 0. That is two full piece-fetch waits in sequence,
+    /// which is one whole cold start hiding inside another.
+    ///
+    /// Opening a short-lived read at the tail as soon as the stream opens puts
+    /// that piece into the priority set alongside the first one, so the two are
+    /// fetched together. Runs once per file, detached, and gives up quietly:
+    /// it is an optimisation, and nothing downstream may wait on it.
+    ///
+    /// The cost when it guesses wrong (the file was faststart after all) is one
+    /// piece of bandwidth, once.
+    pub fn warm_mp4_tail(self: &Arc<Self>, info_hash: &str, file_idx: usize, file_len: u64) {
+        if !self.mp4_tail_warm || file_len <= TAIL_WARM_BYTES {
+            return;
+        }
+
+        // Claimed before anything is inspected, and claimed even for files
+        // that turn out to be ineligible. This runs on every range request, so
+        // the eligibility check -- which costs an engine lookup -- must happen
+        // once per file rather than once per seek. Claiming up front also
+        // means a warm that failed is not retried on the next seek, which is
+        // the behaviour this is meant to remove rather than add.
+        {
+            let mut warmed = self
+                .tail_warmed
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if !warmed.insert((info_hash.to_string(), file_idx)) {
+                return;
+            }
+        }
+
+        let Some(name) = self.file_name(info_hash, file_idx) else {
+            return;
+        };
+        if !has_tail_index(&name) {
+            return;
+        }
+
+        let engine = Arc::clone(self);
+        let info_hash = info_hash.to_string();
+        tokio::spawn(async move {
+            let from = file_len - TAIL_WARM_BYTES;
+            let Ok(mut reader) = engine.open_stream_at(&info_hash, file_idx, from).await else {
+                debug!(%info_hash, "could not open a tail read to warm the mp4 index");
+                return;
+            };
+            let mut sink = vec![0u8; 64 * 1024];
+            let warmed = tokio::time::timeout(TAIL_WARM_TIMEOUT, async {
+                use tokio::io::AsyncReadExt;
+                // One read is enough: it returns only once the piece holding
+                // the tail has arrived, which is the entire point.
+                reader.read(&mut sink).await
+            })
+            .await;
+            match warmed {
+                Ok(Ok(n)) if n > 0 => {
+                    debug!(%info_hash, "mp4 index fetched alongside the opening frames")
+                }
+                _ => debug!(%info_hash, "mp4 tail warm did not complete; harmless"),
+            }
+        });
+    }
+
+    /// Claims piece priority further ahead than librqbit's fixed 32 MB window,
+    /// once playback has been running long enough to look settled.
+    ///
+    /// Returns `None` when the feature is off, which is the default — see
+    /// `readahead_extra_mb` in the config for why widening the window is a
+    /// trade rather than a win. The returned handle stops the claim when
+    /// dropped, so it lives exactly as long as the response it belongs to.
+    pub fn spawn_readahead(
+        self: &Arc<Self>,
+        info_hash: &str,
+        file_idx: usize,
+        position: Arc<AtomicU64>,
+        file_len: u64,
+    ) -> Option<ReadaheadHandle> {
+        if self.readahead_extra == 0 {
+            return None;
+        }
+
+        let engine = Arc::clone(self);
+        let info_hash = info_hash.to_string();
+        let settle = self.readahead_settle;
+        let extra = self.readahead_extra;
+
+        let task = tokio::spawn(async move {
+            tokio::time::sleep(settle).await;
+
+            // Held across iterations: dropping the reader is what releases the
+            // claim, so the claim only exists while this task does.
+            let mut claim: Option<BoxedReader> = None;
+            let mut claimed_at = 0u64;
+
+            loop {
+                let target = position
+                    .load(Ordering::Relaxed)
+                    .saturating_add(LIBRQBIT_STREAM_WINDOW)
+                    .saturating_add(extra);
+                if target >= file_len {
+                    // Past the end of the file there is nothing left to claim,
+                    // and librqbit's own window already covers the remainder.
+                    return;
+                }
+                if claim.is_none() || target.saturating_sub(claimed_at) >= READAHEAD_ADVANCE_BYTES {
+                    match engine.open_stream_at(&info_hash, file_idx, target).await {
+                        Ok(reader) => {
+                            claim = Some(reader);
+                            claimed_at = target;
+                        }
+                        Err(e) => debug!(%info_hash, "could not claim extra read-ahead: {e:#}"),
+                    }
+                }
+                tokio::time::sleep(READAHEAD_REFRESH).await;
+            }
+        });
+
+        Some(ReadaheadHandle(task))
+    }
+
     /// A lock poisoned by a panic elsewhere still holds a perfectly usable
     /// map -- refusing to serve video over it would be a worse outcome than
     /// the inconsistency it guards against.
@@ -1090,19 +1631,28 @@ impl TorrentEngine {
     /// tracking it, which is exactly the orphaned bulk the cache cap is
     /// already fighting.
     pub async fn discard_abandoned(&self, info_hash: &str) -> bool {
-        let matches: Vec<(TorrentIdOrHash, bool)> = self.api.session().with_torrents(|iter| {
-            iter.filter_map(|(_, handle)| {
-                if handle.info_hash().as_string() != info_hash {
-                    return None;
-                }
-                let stats = handle.stats();
-                let finished = stats.total_bytes > 0 && stats.progress_bytes >= stats.total_bytes;
-                Some((handle.info_hash().into(), finished))
-            })
-            .collect()
-        });
+        let matches: Vec<(TorrentIdOrHash, bool, f64)> =
+            self.api.session().with_torrents(|iter| {
+                iter.filter_map(|(_, handle)| {
+                    if handle.info_hash().as_string() != info_hash {
+                        return None;
+                    }
+                    let stats = handle.stats();
+                    let finished =
+                        stats.total_bytes > 0 && stats.progress_bytes >= stats.total_bytes;
+                    // Captured here, while the torrent still exists, so the
+                    // log can say how much was thrown away.
+                    let progress = if stats.total_bytes > 0 {
+                        stats.progress_bytes as f64 / stats.total_bytes as f64 * 100.0
+                    } else {
+                        0.0
+                    };
+                    Some((handle.info_hash().into(), finished, progress))
+                })
+                .collect()
+            });
 
-        let Some((idx, finished)) = matches.into_iter().next() else {
+        let Some((idx, finished, progress)) = matches.into_iter().next() else {
             return false;
         };
         if action_for_abandoned(
@@ -1117,6 +1667,14 @@ impl TorrentEngine {
         match self.api.api_torrent_action_delete(idx).await {
             Ok(_) => {
                 info!(info_hash = %info_hash, "discarded abandoned torrent and its partial data");
+                // Deleting a viewer's partial download is the most destructive
+                // thing this process does on its own initiative, and it was
+                // invisible until it was caught in the act. It gets a line.
+                self.audit()
+                    .record(crate::audit::Event::TorrentDiscarded {
+                        info_hash: info_hash.to_string(),
+                        progress_percent: progress,
+                    });
                 self.forget_activity(info_hash).await;
                 true
             }
@@ -1548,6 +2106,74 @@ impl TorrentEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn slot(client: &str, served: u64, tail_probe: bool) -> ReaderSlot {
+        ReaderSlot {
+            id: 0,
+            info_hash: "aaaa".to_string(),
+            file_idx: 0,
+            client: client.parse().unwrap(),
+            tail_probe,
+            served: Arc::new(AtomicU64::new(served)),
+            cancel: Arc::new(ReaderCancel::new()),
+        }
+    }
+
+    fn ip(value: &str) -> IpAddr {
+        value.parse().unwrap()
+    }
+
+    /// A scrub burst is the case this exists for: each abandoned read keeps
+    /// its share of librqbit's round-robin piece requests, so ten of them
+    /// leave the position the viewer landed on getting a tenth of the
+    /// download.
+    #[test]
+    fn a_read_that_showed_nobody_anything_is_superseded() {
+        assert!(slot("192.168.1.5", 0, false).superseded_by("aaaa", 0, ip("192.168.1.5")));
+    }
+
+    /// The one rule that must never be got wrong: a read that has delivered
+    /// bytes is a picture on someone's screen, and cancelling it stops
+    /// playback dead.
+    #[test]
+    fn a_read_that_is_playing_is_never_superseded() {
+        assert!(!slot("192.168.1.5", 1, false).superseded_by("aaaa", 0, ip("192.168.1.5")));
+    }
+
+    /// Two devices on the same title would otherwise cancel each other's cold
+    /// start, and then each other's retry, and neither would ever play.
+    #[test]
+    fn a_second_device_does_not_supersede_the_first() {
+        assert!(!slot("192.168.1.5", 0, false).superseded_by("aaaa", 0, ip("192.168.1.9")));
+    }
+
+    /// An mp4 index read is a second read the same player needs *at the same
+    /// time* as the one at the head, not a superseded seek. Cancelling it
+    /// breaks exactly the players the tail warmer exists to help.
+    #[test]
+    fn an_index_probe_survives_the_playback_request_that_follows_it() {
+        assert!(!slot("192.168.1.5", 0, true).superseded_by("aaaa", 0, ip("192.168.1.5")));
+    }
+
+    /// One player legitimately reads two files of a multi-file torrent (an
+    /// episode and its subtitles), and neither is a seek away from the other.
+    #[test]
+    fn a_read_of_a_different_file_is_left_alone() {
+        assert!(!slot("192.168.1.5", 0, false).superseded_by("aaaa", 1, ip("192.168.1.5")));
+        assert!(!slot("192.168.1.5", 0, false).superseded_by("bbbb", 0, ip("192.168.1.5")));
+    }
+
+    /// mkv carries its index at the front, so warming its tail would spend a
+    /// piece of bandwidth to solve a problem it does not have.
+    #[test]
+    fn only_tail_indexed_containers_are_warmed() {
+        assert!(has_tail_index("The.Movie.2024.1080p.mp4"));
+        assert!(has_tail_index("clip.MP4"), "extensions are not case-sensitive");
+        assert!(has_tail_index("holiday.mov"));
+        assert!(!has_tail_index("The.Movie.2024.1080p.mkv"));
+        assert!(!has_tail_index("stream.webm"));
+        assert!(!has_tail_index("no-extension"));
+    }
 
     #[test]
     fn advertised_set_remembers_and_rejects() {

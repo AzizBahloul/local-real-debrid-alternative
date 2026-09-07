@@ -25,6 +25,13 @@ pub struct HealthResponse {
     cache_max_bytes: u64,
     process_memory_bytes: u64,
     process_cpu_percent: f32,
+    /// The last few measured start/seek waits, oldest first.
+    ///
+    /// Here rather than only in the log file because "was that slow start the
+    /// metadata fetch or the swarm?" is a question asked while the thing is
+    /// still slow, by someone who is not going to go and grep a JSONL file on
+    /// another machine to find out.
+    recent_starts: Vec<crate::audit::StartSample>,
 }
 
 pub async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
@@ -44,6 +51,7 @@ pub async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
         cache_max_bytes: state.cache.max_size_bytes(),
         process_memory_bytes,
         process_cpu_percent,
+        recent_starts: state.audit.recent_starts(),
     })
 }
 
@@ -69,6 +77,50 @@ pub async fn clear_cache(
     }
     let deleted = state.engine.discard_everything().await;
     Ok(Json(ClearResponse { deleted }))
+}
+
+/// `GET /audit/export` — the whole audit log as plain text.
+///
+/// **Loopback only**, for the same reason as `clear_cache`: the gateway has no
+/// authentication, and this file records every client IP that ever connected
+/// plus every title they played. That is exactly the sort of thing that must
+/// not be readable by anything that can reach the WiFi. The desktop app runs
+/// on this machine and asks over 127.0.0.1.
+///
+/// Served as one response rather than a file path so the GUI does not need to
+/// know, or guess, where the server chose to write it — the two processes can
+/// disagree about the working directory (see `default_log_dir`).
+pub async fn export_audit_log(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+) -> Result<String, StatusCode> {
+    if !addr.ip().is_loopback() {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    let path = state
+        .audit
+        .path()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "(logging is disabled)".to_string());
+    let dropped = state.audit.dropped();
+
+    // A header, then the raw JSONL. The header is what makes an exported file
+    // self-describing when it arrives as an email attachment with no context,
+    // and `dropped` is what stops a gap in the events being read as a quiet
+    // period rather than a lost one.
+    let mut out = format!(
+        "# NovaStream audit log\n\
+         # exported: {}\n\
+         # version: {}\n\
+         # source: {path}\n\
+         # events dropped (queue full): {dropped}\n\
+         # one JSON object per line; try: grep '\"event\":\"cold_start\"'\n\n",
+        chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, false),
+        env!("CARGO_PKG_VERSION"),
+    );
+    out.push_str(&state.audit.read_all());
+    Ok(out)
 }
 
 fn self_process_usage() -> (u64, f32) {

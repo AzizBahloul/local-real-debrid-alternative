@@ -5,6 +5,7 @@
 //! input validation, and translating byte ranges into HTTP status/headers.
 
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -18,7 +19,9 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use tracing::{debug, warn};
 
 use crate::error::ApiErrorResponse;
-use crate::torrent::{resolver, BoxedReader, StreamGuard, TorrentEngine};
+use crate::torrent::{
+    resolver, BoxedReader, ReaderCancel, ReaderTicket, StreamGuard, TorrentEngine,
+};
 
 /// Bytes the pre-buffer will actually *wait* for. Everything above this is
 /// only taken if it is already downloaded -- see `prebuffer`. Deliberately
@@ -32,6 +35,37 @@ use crate::torrent::{resolver, BoxedReader, StreamGuard, TorrentEngine};
 /// player needs enough bytes to start parsing the container, not half a
 /// megabyte of it.
 const PREBUFFER_MIN_BYTES: usize = 128 * 1024;
+
+/// Never block for less than this, whatever the piece arithmetic says.
+///
+/// `piece_aware_floor` can shrink the blocking wait, and shrinking it too far
+/// reintroduces the bug the pre-buffer exists to prevent: a response with
+/// headers and almost no body reads to a player as a broken stream, not a slow
+/// one. Small enough to cost nothing, large enough to be a body.
+const PREBUFFER_FLOOR_BYTES: usize = 64 * 1024;
+
+/// A range starting within this distance of the end of the file is treated as
+/// an index probe rather than playback.
+///
+/// Players fetch a non-faststart mp4's trailing `moov` atom before they can
+/// decode anything, and that read wants entirely different handling from
+/// playback: a few hundred kilobytes, once, with no interest in filling a
+/// buffer. Sized above the largest realistic piece so a probe and a genuine
+/// seek to the final minutes are never confused.
+const TAIL_PROBE_ZONE: u64 = 24 * 1024 * 1024;
+
+/// The pre-buffer ceiling for a tail probe. The player wants an index, not a
+/// head start, and topping up here spends the viewer's time on bytes nothing
+/// will read.
+const TAIL_PROBE_PREBUFFER: usize = 256 * 1024;
+
+/// Below this, a full pre-buffer is recorded as served from disk rather than
+/// from the swarm — see the `warm` field where it is used.
+///
+/// Two orders of magnitude above a disk read of this size and two below the
+/// smallest wait a swarm round-trip can produce, so the classification does
+/// not hinge on where exactly in that gap the threshold sits.
+const WARM_PREBUFFER_MS: u64 = 50;
 
 /// How long "is more data already available?" is allowed to take before the
 /// pre-buffer stops topping up and sends what it has.
@@ -206,6 +240,18 @@ pub async fn stream_video(
 
     insert_len_header(&mut resp_headers, end - start);
 
+    // An index probe, not playback: see `TAIL_PROBE_ZONE`. It gets its own
+    // small budget, and it is exempt from being superseded, because it is a
+    // read the same player needs *alongside* the one at the head rather than
+    // instead of it.
+    let tail_probe = start >= file_len.saturating_sub(TAIL_PROBE_ZONE);
+
+    // Registered before the read is opened, so a scrub that arrives while an
+    // earlier one is still blocked in the pre-buffer retires it immediately
+    // rather than after it finally gives up. See `register_reader`.
+    let ticket = engine.register_reader(&info_hash, file_idx, addr.ip(), tail_probe);
+    let cancel = ticket.cancel_handle();
+
     let reader = engine
         .open_stream_at(&info_hash, file_idx, start)
         .await
@@ -220,14 +266,88 @@ pub async fn stream_video(
     // it minutes later. No-op when this is the same torrent (a seek).
     engine.focus_stream(&info_hash);
 
+    // Fetch an mp4's trailing index in parallel with its opening frames, so
+    // the player's own tail request lands on data that is already here rather
+    // than paying a second cold start for it. Detached and best-effort; a
+    // playback read must never wait on it. See `warm_mp4_tail`.
+    if !tail_probe {
+        engine.warm_mp4_tail(&info_hash, file_idx, file_len);
+    }
+
+    // Read before the wait, because a piece that arrives *during* it would
+    // make the request look like it never had anything to wait for.
+    let geometry = engine.piece_geometry(&info_hash, file_idx, start);
+    let piece_remainder = geometry.map_or(0, |g| g.remainder);
+
     // Hold the response until some real data is in hand -- see `prebuffer`.
     let wanted = usize::try_from(end - start).unwrap_or(usize::MAX);
+    let prebuffer_target = if tail_probe {
+        TAIL_PROBE_PREBUFFER.min(wanted)
+    } else {
+        engine.prebuffer_bytes().min(wanted)
+    };
+
+    // How much to actually *block* for. Capped at what remains of the piece
+    // this offset lands in: past that boundary the next byte lives in a
+    // second piece, and waiting for it doubles the wait for no benefit the
+    // player can use. Floored so the response can never be a set of headers
+    // over a few kilobytes, which is the failure the pre-buffer exists to
+    // prevent.
+    let prebuffer_floor = piece_aware_floor(piece_remainder, prebuffer_target);
+
+    let prebuffer_began = std::time::Instant::now();
     let (head, reader) = prebuffer(
         reader,
-        engine.prebuffer_bytes().min(wanted),
+        prebuffer_floor,
+        prebuffer_target,
         engine.prebuffer_timeout(),
+        &cancel,
     )
     .await;
+    let prebuffer_ms = prebuffer_began.elapsed().as_millis() as u64;
+
+    // Superseded while it waited: the same player has already asked for a
+    // different offset, so nothing will ever read this response.
+    let superseded = cancel.is_cancelled();
+
+    // The last phase of the wait a player is timing out on, and the one the
+    // cold-start record cannot see (it happens after the engine hands back).
+    //
+    // Recorded before the superseded check below, not after: a burst of
+    // retired scrubs is precisely what someone is looking for when they ask
+    // why a seek took so long, and returning early without a line would leave
+    // the log showing one slow start and no sign of the nine reads that were
+    // competing with it.
+    //
+    // `warm` is inferred from the wait rather than by asking which pieces are
+    // present, and that inference is sound in one direction: librqbit's reader
+    // cannot return a byte that is not already on disk, so a full-size fill in
+    // under `WARM_PREBUFFER_MS` could only have come from data that was
+    // already there. The reverse is not claimed -- a warm read that happened to
+    // be slow is recorded as cold, which errs toward flagging a wait rather
+    // than explaining it away.
+    engine.audit().record(crate::audit::Event::Prebuffer {
+        info_hash: info_hash.clone(),
+        bytes: head.len(),
+        wanted: prebuffer_target,
+        ms: prebuffer_ms,
+        // A superseded read is short of its target because it was told to
+        // stop, not because the swarm was slow. Calling that a timeout would
+        // make the log report a fault where there was a deliberate decision.
+        timed_out: !superseded && head.len() < prebuffer_target,
+        warm: head.len() >= prebuffer_target && prebuffer_ms < WARM_PREBUFFER_MS,
+        piece_remainder,
+        superseded,
+    });
+
+    // Answering fast and empty-handed is the point: it releases the
+    // piece-priority claim to the request the viewer is actually waiting on.
+    if superseded {
+        debug!(%info_hash, start, "dropping a read this client seeked away from");
+        return Err(ApiErrorResponse::superseded(
+            "superseded by a newer range request from the same client",
+        ));
+    }
 
     let body = healing_body(BodyContext {
         position: start + head.len() as u64,
@@ -235,13 +355,41 @@ pub async fn stream_video(
         engine: Arc::clone(&engine),
         info_hash,
         file_idx,
+        file_len,
         client: addr.ip(),
         head,
         reader,
         guard,
+        ticket,
+        cancel,
     });
 
     Ok((status, resp_headers, body).into_response())
+}
+
+/// How many bytes the pre-buffer may *block* for at an offset with
+/// `piece_remainder` bytes left in its piece.
+///
+/// Nothing at that offset can be read until its whole piece has arrived, so
+/// blocking for anything within the remainder is free — it is data that comes
+/// with the piece already being waited for. Asking for one byte past it means
+/// waiting for a *second* piece, and on a release with 8 MB pieces that is the
+/// difference between one piece-fetch and two.
+///
+/// `PREBUFFER_FLOOR_BYTES` is the safety rail: an offset a few kilobytes short
+/// of a piece boundary would otherwise return a response with headers and
+/// almost no body, which players read as a broken stream rather than a slow
+/// one. A remainder of 0 means the geometry was unavailable (metadata not
+/// loaded yet), where the old fixed behaviour is the right fallback.
+fn piece_aware_floor(piece_remainder: u64, target: usize) -> usize {
+    let uncapped = PREBUFFER_MIN_BYTES.min(target);
+    if piece_remainder == 0 {
+        return uncapped;
+    }
+    let remainder = usize::try_from(piece_remainder).unwrap_or(usize::MAX);
+    uncapped
+        .min(remainder.max(PREBUFFER_FLOOR_BYTES))
+        .min(target)
 }
 
 /// Everything the streaming body needs to keep going, and to rebuild its own
@@ -250,6 +398,7 @@ struct BodyContext {
     engine: Arc<TorrentEngine>,
     info_hash: String,
     file_idx: usize,
+    file_len: u64,
     client: IpAddr,
     /// Absolute file offset of the next byte to send.
     position: u64,
@@ -259,6 +408,10 @@ struct BodyContext {
     head: Vec<u8>,
     reader: BoxedReader,
     guard: StreamGuard,
+    /// Keeps this response in the reader registry, and reports the bytes it
+    /// has delivered — which is what makes it immune to being superseded.
+    ticket: ReaderTicket,
+    cancel: Arc<ReaderCancel>,
 }
 
 /// Builds the response body, re-opening the underlying torrent read whenever
@@ -278,24 +431,66 @@ fn healing_body(ctx: BodyContext) -> Body {
         engine,
         info_hash,
         file_idx,
+        file_len,
         client,
         mut position,
         end,
         head,
         mut reader,
         guard,
+        ticket,
+        cancel,
     } = ctx;
 
     let stall_timeout = engine.stall_timeout();
+
+    // Published for the read-ahead claim to follow. An atomic rather than a
+    // message because the claim only ever wants the latest value and must
+    // never be able to hold the body up.
+    let live_position = Arc::new(AtomicU64::new(position));
 
     Body::from_stream(async_stream::stream! {
         // Moved in so it lives exactly as long as the body: dropping the
         // response releases the torrent back to the idle reaper.
         let _guard = guard;
+        // Likewise: dropping this deregisters the response, so a reader only
+        // competes for piece priority while it actually exists.
+        let ticket = ticket;
+        // Claims priority past librqbit's fixed window once playback settles.
+        // `None` unless `READAHEAD_EXTRA_MB` is set; dropping it drops the
+        // claim. See `spawn_readahead`.
+        let _readahead = engine.spawn_readahead(
+            &info_hash,
+            file_idx,
+            Arc::clone(&live_position),
+            file_len,
+        );
         let mut stalls = 0u32;
         let mut last_touch = Instant::now();
 
+        // Records how this response ended, whatever ends it.
+        //
+        // It has to be a drop guard rather than a line after the loop: the
+        // most common ending by far is the player hanging up, which drops this
+        // generator mid-`yield`, and code placed after the loop would simply
+        // never run for it. That would leave the log recording only the
+        // tidy endings -- exactly backwards, since an abandoned stream is the
+        // interesting one.
+        let mut closer = CloseRecorder {
+            audit: engine.audit(),
+            info_hash: info_hash.clone(),
+            client,
+            opened_at: Instant::now(),
+            start_offset: position,
+            position,
+            reason: "client disconnected",
+        };
+
         if !head.is_empty() {
+            // Counted before it is sent: from here on this response has shown
+            // the viewer something, and must never be superseded by a later
+            // request. See `register_reader`.
+            ticket.record_served(head.len() as u64);
             yield Ok::<Bytes, std::io::Error>(Bytes::from(head));
         }
 
@@ -307,19 +502,48 @@ fn healing_body(ctx: BodyContext) -> Body {
 
             // `Ok(None)` means "produced nothing in time", which is the
             // signal to rebuild the reader rather than an error.
+            //
+            // The cancellation arm only ever fires for a response that has
+            // delivered nothing at all -- a read the player seeked away from
+            // while it was still waiting for its first piece. Ending it here
+            // hands its share of the piece requests to the position the viewer
+            // actually landed on, which is the entire point (a torrent read
+            // parks until its piece arrives, so without this the abandoned
+            // read keeps its claim for the full stall timeout).
             let outcome = if stall_timeout.is_zero() {
-                reader.read(&mut chunk[..want]).await.map(Some)
+                tokio::select! {
+                    result = reader.read(&mut chunk[..want]) => result.map(Some),
+                    _ = cancel.cancelled() => {
+                        closer.reason = "superseded by a newer request";
+                        break;
+                    }
+                }
             } else {
-                match tokio::time::timeout(stall_timeout, reader.read(&mut chunk[..want])).await {
-                    Ok(result) => result.map(Some),
-                    Err(_) => Ok(None),
+                tokio::select! {
+                    result = tokio::time::timeout(
+                        stall_timeout,
+                        reader.read(&mut chunk[..want]),
+                    ) => match result {
+                        Ok(result) => result.map(Some),
+                        Err(_) => Ok(None),
+                    },
+                    _ = cancel.cancelled() => {
+                        closer.reason = "superseded by a newer request";
+                        break;
+                    }
                 }
             };
 
             match outcome {
-                Ok(Some(0)) => break, // end of file
+                Ok(Some(0)) => {
+                    closer.reason = "end of file";
+                    break;
+                }
                 Ok(Some(n)) => {
                     position += n as u64;
+                    closer.position = position;
+                    ticket.record_served(n as u64);
+                    live_position.store(position, std::sync::atomic::Ordering::Relaxed);
                     stalls = 0;
                     if last_touch.elapsed() >= TOUCH_INTERVAL {
                         engine.touch_stream(&info_hash, client).await;
@@ -335,6 +559,7 @@ fn healing_body(ctx: BodyContext) -> Body {
                             "stream stalled and did not recover after {MAX_CONSECUTIVE_REOPENS} \
                              re-opens; ending the response so the player can retry"
                         );
+                        closer.reason = "stalled, gave up re-opening";
                         break;
                     }
                     warn!(
@@ -348,17 +573,48 @@ fn healing_body(ctx: BodyContext) -> Body {
                         Ok(fresh) => reader = fresh,
                         Err(e) => {
                             warn!(%info_hash, "could not re-open stalled stream: {e:#}");
+                            closer.reason = "could not re-open stalled stream";
                             break;
                         }
                     }
                 }
                 Err(e) => {
                     warn!(%info_hash, position, "torrent read failed: {e}");
+                    closer.reason = "torrent read failed";
                     break;
                 }
             }
         }
     })
+}
+
+/// Emits a `StreamClose` when the response body ends, however it ends.
+///
+/// See the comment where it is constructed for why this is a drop guard and
+/// not a line at the end of the loop.
+struct CloseRecorder {
+    audit: crate::audit::AuditLog,
+    info_hash: String,
+    client: IpAddr,
+    opened_at: Instant,
+    /// File offset this response began at, so `bytes_served` measures what
+    /// this request delivered rather than how far into the file it reached --
+    /// a seek to the last minute of a film is not a 2 GB read.
+    start_offset: u64,
+    position: u64,
+    reason: &'static str,
+}
+
+impl Drop for CloseRecorder {
+    fn drop(&mut self) {
+        self.audit.record(crate::audit::Event::StreamClose {
+            info_hash: self.info_hash.clone(),
+            client: self.client.to_string(),
+            bytes_served: self.position.saturating_sub(self.start_offset),
+            duration_ms: self.opened_at.elapsed().as_millis() as u64,
+            reason: self.reason.to_string(),
+        });
+    }
 }
 
 /// Reads up to `max_bytes` from `reader` before the response is sent, and
@@ -378,21 +634,47 @@ fn healing_body(ctx: BodyContext) -> Body {
 /// The consumed bytes are returned rather than chained back onto the reader
 /// because the body has to know the exact file offset it has reached, so it
 /// can re-open at that offset if the stream stalls.
+///
+/// `min_bytes` is what this will actually *block* for; `max_bytes` is only
+/// ever reached from data already on disk. The caller sizes the former against
+/// the piece the offset lands in (see `piece_aware_floor`), because waiting
+/// past that boundary means waiting for a whole second piece.
+///
+/// `cancel` ends the wait early when the same client has already seeked
+/// elsewhere. That matters more here than anywhere: this is where an
+/// abandoned scrub would otherwise sit for the full timeout holding a piece
+/// priority claim for a position nobody is going to watch.
 async fn prebuffer(
     mut reader: BoxedReader,
+    min_bytes: usize,
     max_bytes: usize,
     timeout: Duration,
+    cancel: &ReaderCancel,
 ) -> (Vec<u8>, BoxedReader) {
     if max_bytes == 0 {
         return (Vec::new(), reader);
     }
 
-    let min_bytes = PREBUFFER_MIN_BYTES.min(max_bytes);
+    let min_bytes = min_bytes.min(max_bytes);
     let mut buf = Vec::with_capacity(max_bytes.min(1024 * 1024));
 
     // Phase 1 -- block until there is enough to be worth sending. This is the
     // wait that stops a player seeing an empty, apparently-broken stream.
-    let filled = tokio::time::timeout(timeout, fill(&mut reader, &mut buf, min_bytes)).await;
+    //
+    // The cancellation arm cannot simply return the reader: the other arm
+    // holds a mutable borrow of it for as long as the `select!` does. So it
+    // sets a flag and the return happens once both futures are dropped.
+    let mut superseded = false;
+    let filled = tokio::select! {
+        filled = tokio::time::timeout(timeout, fill(&mut reader, &mut buf, min_bytes)) => filled,
+        _ = cancel.cancelled() => {
+            superseded = true;
+            Ok(())
+        }
+    };
+    if superseded {
+        return (buf, reader);
+    }
     if filled.is_err() {
         debug!(
             got = buf.len(),
@@ -523,11 +805,18 @@ mod tests {
         }
     }
 
+    /// A cancel signal that is never fired, for the tests that are not about
+    /// superseding.
+    fn never_cancelled() -> Arc<ReaderCancel> {
+        Arc::new(ReaderCancel::never_cancelled())
+    }
+
     #[tokio::test]
     async fn prebuffer_returns_all_requested_bytes_when_data_is_available() {
         let data = vec![7u8; 8192];
         let reader = Box::new(std::io::Cursor::new(data.clone()));
-        let (head, mut rest) = prebuffer(reader, 4096, Duration::from_secs(5)).await;
+        let (head, mut rest) =
+            prebuffer(reader, 4096, 4096, Duration::from_secs(5), &never_cancelled()).await;
 
         // Every byte must survive the split, in order: the body sends `head`
         // first and then continues from `rest`.
@@ -546,7 +835,14 @@ mod tests {
             sent: false,
         });
         let started = std::time::Instant::now();
-        let (head, _rest) = prebuffer(reader, 4 * 1024 * 1024, Duration::from_millis(200)).await;
+        let (head, _rest) = prebuffer(
+            reader,
+            PREBUFFER_MIN_BYTES,
+            4 * 1024 * 1024,
+            Duration::from_millis(200),
+            &never_cancelled(),
+        )
+        .await;
 
         assert!(
             started.elapsed() < Duration::from_secs(2),
@@ -558,7 +854,8 @@ mod tests {
     #[tokio::test]
     async fn prebuffer_disabled_takes_nothing_and_hands_the_reader_back() {
         let reader = Box::new(std::io::Cursor::new(vec![9u8; 100]));
-        let (head, mut rest) = prebuffer(reader, 0, Duration::from_secs(5)).await;
+        let (head, mut rest) =
+            prebuffer(reader, 0, 0, Duration::from_secs(5), &never_cancelled()).await;
         assert!(
             head.is_empty(),
             "disabled pre-buffer must not consume bytes"
@@ -569,6 +866,84 @@ mod tests {
         assert_eq!(got, vec![9u8; 100]);
     }
 
+    /// A superseded read must abandon its wait immediately, not sit out the
+    /// full pre-buffer timeout.
+    ///
+    /// The timeout is what it costs to get this wrong: until the wait ends,
+    /// the abandoned read keeps its claim in librqbit's piece-priority set, so
+    /// the position the viewer actually seeked to is still sharing the
+    /// download with a position nobody is watching. That is the whole defect
+    /// superseding exists to fix, so "it returns eventually" is not enough.
+    #[tokio::test]
+    async fn a_superseded_prebuffer_stops_waiting_at_once() {
+        let reader = Box::new(StallsAfter {
+            chunk: vec![1u8; 512],
+            sent: false,
+        });
+        let cancel = never_cancelled();
+
+        let waiter = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            waiter.cancel_for_test();
+        });
+
+        let started = std::time::Instant::now();
+        // A 60s timeout it must not wait out, and a floor it can never reach
+        // from a reader that produces 512 bytes and then stops forever.
+        let (head, _rest) = prebuffer(
+            reader,
+            PREBUFFER_MIN_BYTES,
+            4 * 1024 * 1024,
+            Duration::from_secs(60),
+            &cancel,
+        )
+        .await;
+
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "a superseded read must not hold its priority claim for the full timeout"
+        );
+        assert_eq!(
+            head,
+            vec![1u8; 512],
+            "whatever did arrive is still handed back, so nothing is lost if the \
+             caller decides to serve it anyway"
+        );
+    }
+
+    /// Blocking past the end of the piece the offset lands in means waiting
+    /// for a whole second piece -- several seconds on a large-piece release,
+    /// for bytes the player has not asked for yet.
+    #[test]
+    fn the_prebuffer_never_blocks_past_its_own_piece() {
+        // The common case: a piece boundary far away, so nothing changes.
+        assert_eq!(
+            piece_aware_floor(4 * 1024 * 1024, 1024 * 1024),
+            PREBUFFER_MIN_BYTES
+        );
+
+        // Landing 100 KB before a boundary: block for the 100 KB rather than
+        // the usual 128 KB, and a second piece is never involved.
+        assert_eq!(piece_aware_floor(100 * 1024, 1024 * 1024), 100 * 1024);
+
+        // Landing almost exactly on a boundary. Crossing it is unavoidable
+        // here, and returning a near-empty body is the worse failure -- so the
+        // floor wins. See `PREBUFFER_FLOOR_BYTES`.
+        assert_eq!(
+            piece_aware_floor(200, 1024 * 1024),
+            PREBUFFER_FLOOR_BYTES,
+            "a handful of bytes is not a response a player will accept"
+        );
+
+        // Never more than was asked for: a small range request must not be
+        // made to wait for bytes outside it.
+        assert_eq!(piece_aware_floor(4 * 1024 * 1024, 8 * 1024), 8 * 1024);
+
+        // No metadata yet means no geometry to be clever with.
+        assert_eq!(piece_aware_floor(0, 1024 * 1024), PREBUFFER_MIN_BYTES);
+    }
+
     /// The offset the body will re-open at is `range start + prebuffered
     /// bytes`. If that arithmetic is wrong the stream silently resumes at the
     /// wrong place after a stall, which corrupts playback rather than fixing
@@ -577,7 +952,8 @@ mod tests {
     async fn prebuffered_length_is_the_offset_the_body_resumes_from() {
         let range_start = 1_000_000u64;
         let reader = Box::new(std::io::Cursor::new(vec![3u8; 8192]));
-        let (head, _rest) = prebuffer(reader, 2048, Duration::from_secs(5)).await;
+        let (head, _rest) =
+            prebuffer(reader, 2048, 2048, Duration::from_secs(5), &never_cancelled()).await;
 
         assert_eq!(head.len(), 2048);
         assert_eq!(
