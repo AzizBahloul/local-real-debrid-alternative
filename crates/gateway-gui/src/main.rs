@@ -35,7 +35,7 @@ use std::time::{Duration, Instant};
 use serde::Deserialize;
 use server_process::{find_server_binary, LogTail, ServerProcess};
 
-use theme::{AMBER, CYAN, PHOSPHOR, RED, TEXT, TEXT_DIM};
+use theme::{AMBER, PHOSPHOR, RED, TEXT, TEXT_DIM};
 
 const MAX_LOG_LINES: usize = 500;
 /// One second rather than the two it used to be: this is now the sample rate
@@ -991,46 +991,28 @@ impl GatewayApp {
 
         ui.add_space(6.0);
 
-        // Both secondary actions are enabled on "a server answered /health",
-        // not on "this app started it" -- the gateway is often launched from
-        // a terminal, and a button that silently does nothing is worse than
-        // one that is plainly unavailable.
+        // Enabled on "a server answered /health", not on "this app started
+        // it" -- the gateway is often launched from a terminal, and a button
+        // that silently does nothing is worse than one that is plainly
+        // unavailable. (The log dump lives in the tty panel with the logs.)
         let live = self.health.is_some();
         let clearing = self.clear_rx.is_some();
-        let exporting = self.export_rx.is_some();
 
-        let mut clear_clicked = false;
-        let mut export_clicked = false;
-        ui.columns(2, |columns| {
-            let clear_label = if clearing {
-                "purging ..."
-            } else if self.clear_armed {
-                "confirm: erase all"
-            } else {
-                "purge cache"
-            };
-            clear_clicked = widgets::command_button(
-                &mut columns[0],
-                clear_label,
-                if self.clear_armed { RED } else { AMBER },
-                live && !clearing,
-                30.0,
-            )
-            .clicked();
-
-            export_clicked = widgets::command_button(
-                &mut columns[1],
-                if exporting {
-                    "dumping ..."
-                } else {
-                    "dump logs"
-                },
-                CYAN,
-                live && !exporting,
-                30.0,
-            )
-            .clicked();
-        });
+        let clear_label = if clearing {
+            "purging ..."
+        } else if self.clear_armed {
+            "confirm: erase all"
+        } else {
+            "purge cache"
+        };
+        let clear_clicked = widgets::command_button(
+            ui,
+            clear_label,
+            if self.clear_armed { RED } else { AMBER },
+            live && !clearing,
+            30.0,
+        )
+        .clicked();
 
         if clear_clicked {
             if self.clear_armed {
@@ -1039,9 +1021,6 @@ impl GatewayApp {
             } else {
                 self.clear_armed = true;
             }
-        }
-        if export_clicked {
-            self.export_logs();
         }
 
         if self.clear_armed {
@@ -1056,10 +1035,7 @@ impl GatewayApp {
                 }
             });
         }
-        for message in [&self.clear_result, &self.export_result]
-            .into_iter()
-            .flatten()
-        {
+        if let Some(message) = &self.clear_result {
             ui.label(
                 egui::RichText::new(message)
                     .font(egui::FontId::monospace(10.0))
@@ -1137,7 +1113,7 @@ impl GatewayApp {
                     toggle_tray = widgets::ghost_button(
                         ui,
                         if autostart { "turn off" } else { "turn on" },
-                        CYAN,
+                        TEXT_DIM,
                     )
                     .clicked();
                 });
@@ -1198,7 +1174,7 @@ impl GatewayApp {
                     ui.label(
                         egui::RichText::new(format!("{up:.2} MiB/s"))
                             .font(egui::FontId::monospace(12.0))
-                            .color(CYAN),
+                            .color(TEXT),
                     );
                 });
             });
@@ -1212,9 +1188,11 @@ impl GatewayApp {
                         color: PHOSPHOR,
                         label: "down",
                     },
+                    // Pale against bright: the two traces stay tellable apart
+                    // by weight rather than by a second hue.
                     widgets::Trace {
                         samples: self.up_history.samples(),
-                        color: CYAN,
+                        color: TEXT,
                         label: "up",
                     },
                 ],
@@ -1270,7 +1248,7 @@ impl GatewayApp {
             ui.horizontal(|ui| {
                 for (label, value, color) in [
                     ("STREAMS", health.active_streams.to_string(), PHOSPHOR),
-                    ("PEERS", health.peers().to_string(), CYAN),
+                    ("PEERS", health.peers().to_string(), TEXT),
                     ("SWARMS", health.active_torrents.len().to_string(), TEXT),
                 ] {
                     ui.label(
@@ -1329,7 +1307,7 @@ impl GatewayApp {
 
     fn endpoint_panel(&mut self, ui: &mut egui::Ui, url: String, time: f64) {
         let addon = self.addon_url.clone();
-        theme::section(ui, "endpoints", CYAN, |ui| {
+        theme::section(ui, "endpoints", PHOSPHOR, |ui| {
             // The addon URL goes first and the plain-http one is labelled for
             // what it is: the http address is not a usable addon URL on a
             // phone, and showing it as one is the single most common way this
@@ -1337,7 +1315,7 @@ impl GatewayApp {
             ui.label(
                 egui::RichText::new("STREMIO ADDON  (phone / tablet / tv)")
                     .font(egui::FontId::monospace(10.0))
-                    .color(CYAN),
+                    .color(TEXT_DIM),
             );
             match &addon {
                 Some(addon) => {
@@ -1357,7 +1335,7 @@ impl GatewayApp {
             ui.label(
                 egui::RichText::new("DIRECT ADDRESS  (vlc / browsers)")
                     .font(egui::FontId::monospace(10.0))
-                    .color(CYAN),
+                    .color(TEXT_DIM),
             );
             self.copyable_line(ui, &url, time);
         });
@@ -1380,7 +1358,7 @@ impl GatewayApp {
             let (label, color) = if just_copied {
                 ("copied", PHOSPHOR)
             } else {
-                ("copy", CYAN)
+                ("copy", TEXT_DIM)
             };
             if widgets::ghost_button(ui, label, color).clicked() {
                 self.copy(ui, text, time);
@@ -1388,8 +1366,32 @@ impl GatewayApp {
         });
     }
 
-    fn tty_panel(&self, ui: &mut egui::Ui, time: f64) {
+    fn tty_panel(&mut self, ui: &mut egui::Ui, time: f64) {
+        // The dump belongs with the logs it dumps. Only offered while a
+        // server is answering /health: the export is served by the gateway's
+        // own /audit/export endpoint, so without a server there is nothing to
+        // dump from.
+        let live = self.health.is_some();
+        let exporting = self.export_rx.is_some();
+        let mut export_clicked = false;
         theme::section(ui, "tty // gateway stdout", PHOSPHOR, |ui| {
+            ui.horizontal(|ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if live {
+                        let label = if exporting { "dumping ..." } else { "dump logs" };
+                        if widgets::ghost_button(ui, label, TEXT_DIM).clicked() && !exporting {
+                            export_clicked = true;
+                        }
+                    }
+                    if let Some(message) = &self.export_result {
+                        ui.label(
+                            egui::RichText::new(message.as_str())
+                                .font(egui::FontId::monospace(10.0))
+                                .color(TEXT_DIM),
+                        );
+                    }
+                });
+            });
             ui.set_min_height(ui.available_height().max(40.0));
             egui::ScrollArea::vertical()
                 .stick_to_bottom(true)
@@ -1427,6 +1429,9 @@ impl GatewayApp {
                     });
                 });
         });
+        if export_clicked {
+            self.export_logs();
+        }
     }
 }
 

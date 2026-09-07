@@ -7,6 +7,7 @@
 //! thing librqbit intentionally does *not* do on its own: enforcing a size
 //! cap by deleting old, unwatched torrents.
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -25,6 +26,9 @@ const ACTIVE_STREAM_GRACE_PERIOD: Duration = Duration::from_secs(300);
 pub struct CacheManager {
     downloads_dir: PathBuf,
     max_size_bytes: u64,
+    /// Keep at most this many torrents on disk, newest first; 0 disables the
+    /// count rule and leaves only the size cap.
+    max_torrents: usize,
     auto_cleanup: bool,
     engine: Arc<TorrentEngine>,
 }
@@ -40,12 +44,14 @@ impl CacheManager {
     pub fn new(
         downloads_dir: PathBuf,
         max_size_bytes: u64,
+        max_torrents: usize,
         auto_cleanup: bool,
         engine: Arc<TorrentEngine>,
     ) -> Arc<Self> {
         Arc::new(Self {
             downloads_dir,
             max_size_bytes,
+            max_torrents,
             auto_cleanup,
             engine,
         })
@@ -80,6 +86,8 @@ impl CacheManager {
         }
 
         let mut entries = list_torrent_dirs(&self.downloads_dir).await?;
+        entries = self.enforce_retention_count(entries).await;
+
         let mut total: u64 = entries.iter().map(|e| e.size).sum();
         if total <= self.max_size_bytes {
             return Ok(());
@@ -144,6 +152,95 @@ impl CacheManager {
         }
 
         Ok(())
+    }
+
+    /// The count rule: keep the `max_torrents` most recently used torrents,
+    /// purge the rest, and return the survivors for the size pass.
+    ///
+    /// This runs even when the cache is nowhere near its size cap -- it *is*
+    /// the retention policy; the size cap is only the backstop for the case
+    /// where the few survivors are themselves enormous.
+    async fn enforce_retention_count(
+        &self,
+        mut entries: Vec<TorrentDirEntry>,
+    ) -> Vec<TorrentDirEntry> {
+        if self.max_torrents == 0 || entries.len() <= self.max_torrents {
+            return entries;
+        }
+
+        // "Most recent" prefers the engine's own last-request record over the
+        // directory mtime: writing pieces touches files inside the directory,
+        // not the directory itself, so mtime alone would misorder a re-watch
+        // of something cached days ago.
+        let now = SystemTime::now();
+        let last_request: HashMap<String, SystemTime> = self
+            .engine
+            .recent_streams()
+            .await
+            .into_iter()
+            .map(|(hash, _, age_secs)| (hash, now - Duration::from_secs(age_secs)))
+            .collect();
+        entries.sort_by_key(|e| {
+            let used = last_request
+                .get(&e.info_hash)
+                .copied()
+                .unwrap_or(e.modified)
+                .max(e.modified);
+            std::cmp::Reverse(used)
+        });
+
+        let victims = entries.split_off(self.max_torrents);
+        for entry in victims {
+            // A victim is spared only while someone is provably still reading
+            // it. `is_running` is deliberately not consulted here, unlike the
+            // size pass: a finished torrent sits unpaused ("live") forever,
+            // and honouring that would exempt exactly the watched-and-done
+            // backlog this rule exists to throw away. Whatever is actually
+            // being watched holds an open reader or a recent request -- and is
+            // the freshest entry anyway, so it is in the keep set above.
+            if self.engine.has_open_stream(&entry.info_hash)
+                || self
+                    .engine
+                    .is_recently_active(&entry.info_hash, ACTIVE_STREAM_GRACE_PERIOD)
+                    .await
+            {
+                entries.push(entry);
+                continue;
+            }
+
+            match self.engine.discard_cached(&entry.info_hash).await {
+                Ok(true) => {
+                    info!(
+                        info_hash = %entry.info_hash,
+                        bytes = entry.size,
+                        "cache: purged torrent beyond the retention count"
+                    );
+                }
+                // The session never heard of it (left over from an earlier
+                // run), so the directory is reclaimed directly.
+                Ok(false) => match tokio::fs::remove_dir_all(&entry.path).await {
+                    Ok(()) => info!(
+                        info_hash = %entry.info_hash,
+                        bytes = entry.size,
+                        "cache: purged orphaned torrent dir beyond the retention count"
+                    ),
+                    Err(e) => {
+                        warn!(
+                            info_hash = %entry.info_hash,
+                            path = %entry.path.display(),
+                            "cache: failed to purge orphaned torrent dir: {e}"
+                        );
+                        entries.push(entry);
+                    }
+                },
+                Err(e) => {
+                    warn!(info_hash = %entry.info_hash, "cache: {e:#}");
+                    entries.push(entry);
+                }
+            }
+        }
+
+        entries
     }
 }
 

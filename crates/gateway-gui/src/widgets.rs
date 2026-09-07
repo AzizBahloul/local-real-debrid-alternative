@@ -8,7 +8,7 @@
 use egui::{Color32, FontId, Rect, Response, Rounding, Sense, Stroke, Ui, Vec2};
 
 use crate::fx;
-use crate::theme::{self, AMBER, CYAN, GRID, PHOSPHOR, PHOSPHOR_DIM, RED, TEXT, TEXT_DIM};
+use crate::theme::{self, AMBER, GRID, PHOSPHOR, PHOSPHOR_DIM, RED, TEXT, TEXT_DIM};
 
 /// 5x5 cells per letter. Only the nine letters of NOVASTREAM exist -- a full
 /// font would be dead weight for one wordmark.
@@ -73,18 +73,20 @@ pub fn wordmark(ui: &mut Ui, text: &str, cell: f32, boot: f32, glitch: f32) -> R
                 let cell_rect = Rect::from_min_size(pos, Vec2::splat(lit));
 
                 if glitch > 0.0 {
-                    // Chromatic split: the two side-bands a misconverged tube
-                    // throws either side of the beam.
+                    // Convergence split: the two side-bands a misconverged
+                    // tube throws either side of the beam. Both stay in the
+                    // green family -- a red/blue flash here was the one
+                    // rainbow moment in an otherwise mono-green window.
                     let bleed = 2.0 * glitch;
                     painter.rect_filled(
                         cell_rect.translate(Vec2::new(-bleed, 0.0)),
                         Rounding::ZERO,
-                        Color32::from_rgba_unmultiplied(255, 40, 90, 90),
+                        Color32::from_rgba_unmultiplied(190, 255, 210, 70),
                     );
                     painter.rect_filled(
                         cell_rect.translate(Vec2::new(bleed, 0.0)),
                         Rounding::ZERO,
-                        Color32::from_rgba_unmultiplied(40, 200, 255, 90),
+                        Color32::from_rgba_unmultiplied(26, 110, 56, 110),
                     );
                 }
                 // Bloom, then the cell itself.
@@ -489,7 +491,7 @@ fn state_color(state: &str) -> Color32 {
         "live" | "seeding" => PHOSPHOR,
         "initializing" | "paused" => AMBER,
         "error" => RED,
-        _ => CYAN,
+        _ => TEXT,
     }
 }
 
@@ -509,7 +511,8 @@ pub fn log_color(line: &str) -> Color32 {
     } else if lower.contains("warn") {
         AMBER
     } else if lower.contains("http://") || lower.contains("https://") {
-        CYAN
+        // URLs step up from the dim chatter, but stay in the green family.
+        TEXT
     } else if lower.contains(" ok") || lower.contains("ready") || lower.contains("listening") {
         PHOSPHOR
     } else {
@@ -547,7 +550,7 @@ mod tests {
     fn log_severity_wins_over_the_url_highlight() {
         assert_eq!(log_color("[stderr] failed to bind http://x"), RED);
         assert_eq!(log_color("WARN slow peer"), AMBER);
-        assert_eq!(log_color("   http://192.168.1.67:8080"), CYAN);
+        assert_eq!(log_color("   http://192.168.1.67:8080"), TEXT);
         assert_eq!(log_color("plain chatter"), TEXT_DIM);
     }
 

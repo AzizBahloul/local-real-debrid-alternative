@@ -54,7 +54,11 @@ build/test/lint. Run build+test+clippy before calling any change done.
   switching titles discards only the torrent you just left (if it has no open
   stream and isn't finished) — never the whole unfinished backlog. An earlier
   version swept everything on every switch and wiped queued titles; see the
-  `action_for_abandoned` doc-comment before changing this.
+  `action_for_abandoned` doc-comment before changing this. Separately, the
+  cache janitor *does* sweep the backlog on purpose: `MAX_CACHED_TORRENTS`
+  (default 2) keeps only the most recently used torrents and purges the rest,
+  even under the size cap — that's the requested retention policy, not the old
+  bug coming back. See "Retention is a count" in README's Design decisions.
 - **A live reader blocks the idle reaper regardless of recency** — players
   buffer ahead and go quiet, and librqbit's reader has no timeout of its own,
   so treating "quiet" as "idle" freezes an actively-watched stream.

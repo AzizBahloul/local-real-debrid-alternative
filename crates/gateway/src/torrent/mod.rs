@@ -1686,6 +1686,49 @@ impl TorrentEngine {
         }
     }
 
+    /// Deletes one torrent and its data because cache retention decided it is
+    /// too old to keep. `Ok(true)` means deleted, `Ok(false)` means the
+    /// session never heard of the hash (an orphaned directory the caller has
+    /// to reclaim itself), and `Err` means the session owns it but the delete
+    /// failed -- the caller must then leave the files alone rather than pull
+    /// them out from under a live handle.
+    ///
+    /// Unlike [`discard_abandoned`](Self::discard_abandoned) this spares
+    /// nothing for being finished: retention exists precisely to throw
+    /// finished backlog away. The caller owns the "is anyone reading this"
+    /// checks.
+    pub async fn discard_cached(&self, info_hash: &str) -> Result<bool> {
+        let matches: Vec<(TorrentIdOrHash, f64)> = self.api.session().with_torrents(|iter| {
+            iter.filter_map(|(_, handle)| {
+                if handle.info_hash().as_string() != info_hash {
+                    return None;
+                }
+                let stats = handle.stats();
+                let progress = if stats.total_bytes > 0 {
+                    stats.progress_bytes as f64 / stats.total_bytes as f64 * 100.0
+                } else {
+                    0.0
+                };
+                Some((handle.info_hash().into(), progress))
+            })
+            .collect()
+        });
+
+        let Some((idx, progress)) = matches.into_iter().next() else {
+            return Ok(false);
+        };
+        self.api
+            .api_torrent_action_delete(idx)
+            .await
+            .map_err(|e| anyhow::anyhow!("retention could not delete torrent: {e}"))?;
+        self.audit().record(crate::audit::Event::TorrentDiscarded {
+            info_hash: info_hash.to_string(),
+            progress_percent: progress,
+        });
+        self.forget_activity(info_hash).await;
+        Ok(true)
+    }
+
     /// Deletes every torrent and all of its data. Returns how many went.
     ///
     /// Unlike the automatic paths this spares nothing — not a finished

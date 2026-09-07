@@ -206,6 +206,7 @@ pub async fn run() -> anyhow::Result<()> {
     let cache = CacheManager::new(
         config.downloads_dir(),
         config.max_cache_size_bytes(),
+        config.max_cached_torrents,
         config.auto_cleanup,
         Arc::clone(&engine),
     );

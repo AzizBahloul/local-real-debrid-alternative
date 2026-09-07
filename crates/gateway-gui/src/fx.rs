@@ -313,7 +313,7 @@ struct BootLine {
 const BOOT_LINES: &[BootLine] = &[
     BootLine {
         text: "NOVASTREAM BIOS  --  local torrent gateway",
-        accent: Some(theme::CYAN),
+        accent: Some(theme::PHOSPHOR),
     },
     BootLine {
         text: "[  OK  ] cpu: detecting cores",

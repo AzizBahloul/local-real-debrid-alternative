@@ -54,6 +54,17 @@ pub struct AppConfig {
     #[arg(long, env = "AUTO_CLEANUP", default_value_t = true)]
     pub auto_cleanup: bool,
 
+    /// How many torrents to keep on disk at most, newest first. Anything
+    /// older is purged automatically even while the cache is under its size
+    /// cap -- the size cap then only matters when the survivors are huge.
+    /// 0 disables count-based retention and leaves the size cap in charge.
+    ///
+    /// The default keeps the title being watched plus the one before it
+    /// (back-to-back episodes, or "go back and finish the other one"), which
+    /// is the whole re-watch horizon a small disk actually needs.
+    #[arg(long, env = "MAX_CACHED_TORRENTS", default_value_t = 2)]
+    pub max_cached_torrents: usize,
+
     /// How often (seconds) the cache janitor checks disk usage.
     #[arg(long, env = "CACHE_CLEANUP_INTERVAL_SECS", default_value_t = 60)]
     pub cleanup_interval_secs: u64,

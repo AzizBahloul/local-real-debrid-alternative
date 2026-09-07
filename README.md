@@ -468,6 +468,16 @@ setup.sh   Dockerfile
   `len()` reports a 5 GB movie as 5 GB of cache the moment playback starts —
   which both looked absurd and made the janitor evict torrents to get under a
   cap it was nowhere near.
+- **Retention is a count, and the size cap is only the backstop.** The janitor
+  keeps the `MAX_CACHED_TORRENTS` most recently used torrents (default 2: the
+  title being watched plus the one before it) and purges the rest — session
+  entry and data together — even with the cache far under its size limit.
+  "Most recently used" prefers the engine's own last-request record over
+  directory mtime, because writing pieces touches files inside the directory,
+  not the directory itself. A victim is spared only while a reader is open or
+  a request landed within the grace window; being unpaused is deliberately not
+  enough, since finished torrents sit "live" forever and would otherwise be
+  exactly the backlog the rule can never remove.
 - **Responses are withheld until data exists.** Players treat "headers, then a
   stalled body" as a broken stream, but wait patiently on a slow request.
 - **The top stream is fetched while you are still reading the list.** Pulling a

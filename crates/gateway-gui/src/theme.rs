@@ -1,10 +1,12 @@
 //! The phosphor-CRT look: palette, egui visuals, and the shared "terminal
 //! chrome" used by every panel.
 //!
-//! The palette is the classic P1-phosphor green of a 1980s monitor, with amber
-//! and cyan as the two secondary phosphors -- the same three a real
-//! multi-phosphor terminal could produce, which is why they read as one system
-//! rather than three unrelated highlight colours.
+//! The palette is the classic P1-phosphor green of a 1980s monitor and almost
+//! nothing else: bright green for what is alive, pale/dim green for text, and
+//! two semantic exceptions -- amber strictly for transitional/warning states
+//! and red strictly for failure. A cyan accent used to sit alongside them and
+//! was removed on request: three hues across one small window read as
+//! decoration, and the point of a terminal is that colour *means* something.
 //!
 //! Two rules hold the whole look together and are worth keeping:
 //!
@@ -25,8 +27,6 @@ pub const PHOSPHOR: Color32 = Color32::from_rgb(51, 255, 102);
 pub const PHOSPHOR_DIM: Color32 = Color32::from_rgb(26, 110, 56);
 /// Amber phosphor: transitional states (starting, stopping, warnings).
 pub const AMBER: Color32 = Color32::from_rgb(255, 176, 0);
-/// Cyan phosphor: addresses, links, upload traffic -- anything outbound.
-pub const CYAN: Color32 = Color32::from_rgb(51, 235, 255);
 /// Failure only. Never used decoratively, so it always means something.
 pub const RED: Color32 = Color32::from_rgb(255, 74, 74);
 
@@ -66,7 +66,7 @@ pub fn apply(ctx: &egui::Context) {
 
     visuals.selection.bg_fill = PHOSPHOR.linear_multiply(0.25);
     visuals.selection.stroke = Stroke::new(1.0, PHOSPHOR);
-    visuals.hyperlink_color = CYAN;
+    visuals.hyperlink_color = PHOSPHOR;
 
     for widget in [
         &mut visuals.widgets.noninteractive,
@@ -185,13 +185,18 @@ mod tests {
     use super::*;
 
     /// The look depends on staying inside a small palette; a stray colour is
-    /// the way a themed UI rots. This pins the phosphor triad so a "small
-    /// tweak" to one constant has to be a deliberate edit here too.
+    /// the way a themed UI rots. This pins the surviving hues so a "small
+    /// tweak" to one constant has to be a deliberate edit here too -- and so
+    /// the removed cyan cannot quietly come back as a fourth hue.
     #[test]
-    fn palette_is_the_phosphor_triad() {
+    fn palette_is_green_plus_two_semantic_hues() {
         assert_eq!((PHOSPHOR.r(), PHOSPHOR.g(), PHOSPHOR.b()), (51, 255, 102));
         assert_eq!((AMBER.r(), AMBER.g(), AMBER.b()), (255, 176, 0));
-        assert_eq!((CYAN.r(), CYAN.g(), CYAN.b()), (51, 235, 255));
+        assert_eq!((RED.r(), RED.g(), RED.b()), (255, 74, 74));
+        // Every non-semantic colour is a green: text, dim text, grid, panels.
+        for c in [TEXT, TEXT_DIM, PHOSPHOR_DIM, GRID, BG_PANEL, BG_VOID] {
+            assert!(c.g() >= c.r() && c.g() >= c.b(), "a non-green crept in");
+        }
     }
 
     /// The void must never be pure black -- see `BG_VOID`.
