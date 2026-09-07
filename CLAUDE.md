@@ -21,12 +21,45 @@ Build (release, both crates):  cargo build --release
 Test:                          cargo test --release       # integration tests, real router+engine, temp dir — never touches a live swarm
 Lint:                          cargo clippy --release --all-targets -- -D warnings
 Package .deb:                  cargo deb -p streaming-gateway-gui
-Full clean-machine setup:      ./setup.sh [--gui] [--no-build]
+Package .rpm:                  cargo generate-rpm -p crates/gateway-gui -o out.rpm   # build FIRST, it does not
+Package Arch:                  cd packaging/arch && makepkg -si
+Full clean-machine setup:      ./setup.sh [--gui] [--no-build] [--service]
 ```
 No CI config in this repo — these commands are the only source of truth for
 build/test/lint. Run build+test+clippy before calling any change done.
 
 ## Gotchas
+- **The build needs a C compiler and Rust. Nothing else, on any distro.**
+  Do not add `-dev` packages to `setup.sh` on the assumption something links
+  against them — measured 2026-09-07, `ldd` on both release binaries reports
+  only libc/libm/libgcc_s. winit and glutin `dlopen` X11, Wayland, xkbcommon
+  and GL at *runtime* (the `libloading`/`x11-dl`/`wayland-sys` dlopen
+  features), there is no GTK in the tree at all (the tray is `ksni`, pure-Rust
+  D-Bus), and aws-lc-sys builds with the `cc` crate — a full rebuild with
+  cmake, perl, pkg-config, nasm and go stubbed to exit 127 succeeds. The only
+  distro packages `setup.sh` installs beyond a toolchain are the GUI's
+  dlopened runtime libs, and only under `--gui`.
+- **`setup.sh` dispatches on the package manager, never on the os-release ID.**
+  There are six managers and hundreds of distro IDs; a derivative is handled
+  by whichever manager it inherited. Adding a branch means adding *both*
+  `BUILD_PACKAGES` and `GUI_RUNTIME_PACKAGES` — `tests/packaging.rs` counts
+  them and fails if one is missing, because a branch with build deps and no
+  runtime deps compiles fine and then cannot open a window.
+- **The install is described in four places** — `[package.metadata.deb]` and
+  `[package.metadata.generate-rpm]` in `gateway-gui/Cargo.toml`,
+  `packaging/arch/PKGBUILD`, and `install_manually()` in `setup.sh`. They must
+  agree on all four files; `crates/gateway-gui/tests/packaging.rs` fails the
+  build when they drift. A package that puts the binary where the `.desktop`
+  entry does not point still installs cleanly and does nothing when clicked.
+  Note `cargo generate-rpm -p` takes a **path**, despite `--help` saying crate
+  name, and `find -newermt` is GNU-only (bfs ships as `find` on some distros).
+- **Immutable/atomic distros are out of scope** (Silverblue, Kinoite, Bazzite,
+  SteamOS): no host package manager, read-only `/usr`. `setup.sh` correctly
+  stops at the "no C compiler" check instead of half-installing. Don't add a
+  branch that claims to support them without testing on one.
+- Always-on mode needs systemd. On Alpine/Void/Devuan/Artix the switch greys
+  itself out by design (`service::available()`), and `setup.sh --service`
+  says so rather than writing a unit nothing reads.
 - **The `./cache` shown in the GUI is relative to the process's CWD, not the
   repo root.** The installed `.deb` binaries run from wherever they were
   launched, so their actual cache can land in `$HOME/cache/` while the repo's

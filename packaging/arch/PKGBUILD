@@ -1,0 +1,64 @@
+# Maintainer: mohamed aziz bahloul
+#
+# Arch / Manjaro / EndeavourOS / Garuda / CachyOS.
+#
+# Build and install with:
+#     cd packaging/arch && makepkg -si
+#
+# `makepkg` refuses to run as root and wants its own clean checkout, which is
+# why setup.sh does a plain /usr/local install on Arch instead of calling this
+# -- but this is the packaged path for anyone who wants pacman to own the
+# files. It installs exactly what the .deb and .rpm do, to the same paths;
+# tests/packaging.rs fails the build if the three ever disagree.
+
+pkgname=novastream
+pkgver=1.0.1
+pkgrel=1
+pkgdesc="Local Stremio streaming gateway: turns a torrent into an HTTP video stream over LAN"
+arch=('x86_64' 'aarch64')
+url="https://github.com/AzizBahloul/local-real-debrid-alternative"
+license=('MIT')
+# Nothing is linked at build time beyond libc -- winit/glutin dlopen the
+# windowing and GL stacks at runtime, so these are depends (the GUI needs
+# them to start) rather than makedepends.
+depends=('gcc-libs' 'libglvnd' 'libx11' 'libxkbcommon' 'wayland')
+makedepends=('cargo' 'git')
+provides=('streaming-gateway' 'streaming-gateway-gui')
+conflicts=('streaming-gateway')
+source=("$pkgname::git+https://github.com/AzizBahloul/local-real-debrid-alternative.git#tag=v$pkgver")
+sha256sums=('SKIP')
+
+prepare() {
+  cd "$pkgname"
+  # Vendor up front so build() can run offline, which is what makepkg's
+  # sandbox expects.
+  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --locked
+}
+
+build() {
+  cd "$pkgname"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  cargo build --release --frozen --all-features
+}
+
+check() {
+  cd "$pkgname"
+  export RUSTUP_TOOLCHAIN=stable
+  # Integration tests only; they use a temp dir and never touch a live swarm.
+  cargo test --release --frozen
+}
+
+package() {
+  cd "$pkgname"
+  install -Dm755 "target/release/streaming-gateway-gui" "$pkgdir/usr/bin/streaming-gateway-gui"
+  install -Dm755 "target/release/streaming-gateway" "$pkgdir/usr/bin/streaming-gateway"
+  install -Dm644 "crates/gateway-gui/assets/streaming-gateway-gui.desktop" \
+    "$pkgdir/usr/share/applications/streaming-gateway-gui.desktop"
+  # pixmaps, not the hicolor theme tree: read directly by icon lookup with no
+  # gtk-update-icon-cache step, so the menu icon is right immediately.
+  install -Dm644 "crates/gateway-gui/assets/icon-256.png" \
+    "$pkgdir/usr/share/pixmaps/streaming-gateway-gui.png"
+  install -Dm644 "LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

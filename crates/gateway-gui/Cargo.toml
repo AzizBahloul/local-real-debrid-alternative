@@ -1,6 +1,6 @@
 [package]
 name = "streaming-gateway-gui"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2021"
 description = "Local Stremio streaming gateway + GUI launcher to start/stop it"
 license = "MIT"
@@ -30,6 +30,16 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 # to host.
 ksni = { version = "0.3", default-features = false, features = ["tokio", "blocking"] }
 
+# ---------------------------------------------------------------------------
+# Packaging.
+#
+# Three manifests describe the same install: the `.deb` below, the `.rpm`
+# after it, and `packaging/arch/PKGBUILD`. All four files land in the same
+# freedesktop locations in every one of them, and `tests/packaging.rs` fails
+# the build if they drift -- a package that installs the binary somewhere the
+# `.desktop` entry does not point still installs cleanly and simply does
+# nothing when clicked.
+# ---------------------------------------------------------------------------
 [package.metadata.deb]
 name = "streaming-gateway"
 maintainer = "mohamed aziz bahloul"
@@ -47,12 +57,36 @@ priority = "optional"
 # binary is picked up from the *other* workspace member's build output --
 # `cargo deb` runs the workspace build first, so it exists by the time this
 # manifest's assets are collected.
+#
+# Destinations are spelled out in full rather than as a trailing-slash
+# directory. cargo-deb accepts both and infers the basename from the source
+# for the directory form, but that form cannot be compared against the rpm
+# and PKGBUILD manifests, which have no such shorthand -- and the icon line
+# already has to be explicit because it renames the file.
 assets = [
-    ["target/release/streaming-gateway-gui", "usr/bin/", "755"],
-    ["target/release/streaming-gateway", "usr/bin/", "755"],
-    ["assets/streaming-gateway-gui.desktop", "usr/share/applications/", "644"],
+    ["target/release/streaming-gateway-gui", "usr/bin/streaming-gateway-gui", "755"],
+    ["target/release/streaming-gateway", "usr/bin/streaming-gateway", "755"],
+    ["assets/streaming-gateway-gui.desktop", "usr/share/applications/streaming-gateway-gui.desktop", "644"],
     # /usr/share/pixmaps is read directly by icon lookup with no theme-cache
     # refresh required, so the menu/desktop icon is correct immediately after
     # install (unlike the hicolor theme tree, which needs `gtk-update-icon-cache`).
     ["assets/icon-256.png", "usr/share/pixmaps/streaming-gateway-gui.png", "644"],
+]
+
+# Fedora / RHEL / Rocky / Alma / Nobara / openSUSE, via `cargo generate-rpm`.
+# Paths are relative to the workspace root, exactly like the deb assets above,
+# because both packagers run from there.
+[package.metadata.generate-rpm]
+name = "streaming-gateway"
+summary = "Local Stremio streaming gateway + GUI launcher"
+# The binary links only libc, libm and libgcc_s (verified with ldd), all of
+# which are part of any base install. Leaving auto-req on would make the
+# package depend on whichever rpm find-requires helper the *build* machine
+# has, which is the wrong machine to ask.
+auto-req = "no"
+assets = [
+    { source = "target/release/streaming-gateway-gui", dest = "/usr/bin/streaming-gateway-gui", mode = "755" },
+    { source = "target/release/streaming-gateway", dest = "/usr/bin/streaming-gateway", mode = "755" },
+    { source = "crates/gateway-gui/assets/streaming-gateway-gui.desktop", dest = "/usr/share/applications/streaming-gateway-gui.desktop", mode = "644" },
+    { source = "crates/gateway-gui/assets/icon-256.png", dest = "/usr/share/pixmaps/streaming-gateway-gui.png", mode = "644" },
 ]

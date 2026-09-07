@@ -65,6 +65,81 @@ your desktop and in your applications menu.
 **Server only, no desktop app?** Use `./setup.sh` instead. Good for a headless
 home server or NAS.
 
+### Which Linux does this work on?
+
+All of them. `setup.sh` detects your **package manager** rather than your
+distro name, so derivatives work without being listed — Mint, Pop!\_OS, Zorin
+and Kali are all "apt"; Nobara is "dnf"; EndeavourOS, Garuda and CachyOS are
+"pacman".
+
+| Package manager | Distros | Native package | Always-on |
+|---|---|---|---|
+| `apt` | Debian, Ubuntu, Mint, Pop!\_OS, Zorin, elementary, Kali, Raspberry Pi OS | `.deb` via `cargo deb` | ✅ |
+| `dnf` | Fedora Workstation, RHEL, Rocky, Alma, CentOS Stream, Nobara | `.rpm` via `cargo generate-rpm` | ✅ |
+| `zypper` | openSUSE Leap & Tumbleweed | `.rpm` | ✅ |
+| `pacman` | Arch, Manjaro, EndeavourOS, Garuda, CachyOS | [`packaging/arch/PKGBUILD`](packaging/arch/PKGBUILD) | ✅ |
+| *none* | Gentoo, NixOS, anything source-built | — | ✅ |
+| `apk` | Alpine | — | ❌ no systemd |
+| `xbps` | Void | — | ❌ no systemd |
+| `apt` | Devuan, MX Linux (default init), Artix | `.deb` | ❌ no systemd |
+
+Always-on ❌ means only that the "starts at boot" switch is greyed out — the
+gateway installs and runs normally, you just start it yourself.
+
+> [!WARNING]
+> **Immutable / atomic distros are not supported**: Fedora Silverblue,
+> Kinoite, **Bazzite**, and SteamOS. They have no `dnf`/`pacman` on the host
+> (packages go through `rpm-ostree`), and `/usr` is read-only, so neither the
+> native package nor the `/usr/local` fallback applies as written. `setup.sh`
+> stops with "no C compiler" rather than half-installing. Building inside a
+> `toolbox`/`distrobox` and installing to `/usr/local` (which is writable on
+> ostree systems) is likely to work but is **untested** — no claim either way.
+
+Where there is no native package, `setup.sh` installs the same four files to
+the same freedesktop locations under `/usr/local` instead of `/usr`. That
+fallback is not a lesser path — the menu entry, the icon and always-on mode
+behave identically. A test (`crates/gateway-gui/tests/packaging.rs`) fails the
+build if the four manifests ever disagree about where anything goes.
+
+### What it actually needs
+
+**A C compiler and Rust 1.75+. That is the entire list.**
+
+This surprises people, so it is worth spelling out: there are **no `-dev`
+packages to install**, on any distro.
+
+- `ldd` on both release binaries reports only `libc`, `libm` and `libgcc_s`.
+  winit and glutin `dlopen` X11, Wayland, xkbcommon and GL at *runtime* — none
+  of them are linked at build time, so there is nothing to compile against.
+- There is no GTK anywhere in the tree. The tray icon is `ksni`, which speaks
+  the StatusNotifierItem D-Bus protocol in pure Rust, specifically to avoid
+  the libappindicator/GTK development packages.
+- `aws-lc-sys` builds with the `cc` crate, not CMake. A full rebuild with
+  `cmake`, `perl`, `pkg-config`, `nasm` and `go` all stubbed to exit 127
+  succeeds.
+
+The only distro-specific packages `setup.sh` installs are the *runtime*
+libraries the GUI dlopens (`libGL`, `libX11`, `libxkbcommon`,
+`libwayland-client`), and only with `--gui`, and only because a minimal
+install with no desktop won't already have them.
+
+> [!IMPORTANT]
+> **Always-on mode needs systemd.** It installs a *user* unit — no root, no
+> polkit prompt. On Alpine (OpenRC), Void (runit), Artix or Devuan the app
+> greys the switch out and says so rather than writing a unit nothing will
+> read; the gateway itself still runs normally, you just start it yourself.
+
+### Building a native package by hand
+
+```bash
+cargo deb -p streaming-gateway-gui                        # .deb
+cargo generate-rpm -p crates/gateway-gui -o out.rpm       # .rpm
+cd packaging/arch && makepkg -si                          # Arch
+```
+
+`cargo generate-rpm`'s `-p` takes a **path** to the crate, despite its
+`--help` calling it a crate name.
+
 ## Step 2 — Start the server
 
 Click the **NovaStream** icon on your desktop, then click the big green
@@ -280,7 +355,7 @@ then open **NovaStream** from your applications menu again.
 <details>
 <summary><b>Rebuilding without <code>setup.sh</code></b></summary>
 
-Three commands, no backgrounding:
+Three commands, no backgrounding. On a `.deb` distro:
 
 ```bash
 cargo deb -p streaming-gateway-gui
@@ -288,8 +363,24 @@ sudo dpkg -i target/debian/streaming-gateway_*_amd64.deb
 systemctl --user restart novastream
 ```
 
+On Fedora/RHEL/openSUSE, swap the first two for:
+
+```bash
+cargo generate-rpm -p crates/gateway-gui -o target/novastream.rpm
+sudo dnf install -y target/novastream.rpm      # or: sudo zypper install --allow-unsigned-rpm
+```
+
+And on anything without a native package (Arch, Alpine, Void, Gentoo, NixOS),
+where `setup.sh` installed to `/usr/local`:
+
+```bash
+cargo build --release
+sudo install -Dm755 target/release/streaming-gateway{,-gui} -t /usr/local/bin/
+systemctl --user restart novastream
+```
+
 `cargo deb` runs the release build itself, so there is no separate
-`cargo build` step. A restart takes up to a minute — the server shuts its
+`cargo build` step (`cargo generate-rpm` does **not** — build first). A restart takes up to a minute — the server shuts its
 torrent engine down cleanly first, and `systemctl --user is-active novastream`
 reports `deactivating` for that whole time. That is normal, not a hang.
 
@@ -618,10 +709,15 @@ setup.sh   Dockerfile
 
 ```bash
 cargo build --release              # both crates
-cargo test --release               # 149 tests
+cargo test --release               # 154 tests
 cargo clippy --release --all-targets -- -D warnings
-cargo deb -p streaming-gateway-gui # .deb package
+cargo deb -p streaming-gateway-gui                   # .deb package
+cargo generate-rpm -p crates/gateway-gui -o out.rpm  # .rpm package (build first)
 ```
+
+Only a C compiler and Rust are needed to build — see
+[What it actually needs](#what-it-actually-needs). No `-dev` packages, no
+CMake, no pkg-config, on any distro.
 
 Docker (server only):
 ```bash
