@@ -199,16 +199,46 @@ pub fn absolute_cache_dir(raw: &str, home: &Path) -> PathBuf {
     home.join(relative)
 }
 
-pub fn render_env(port: &str, cache_dir: &Path) -> String {
-    format!(
-        "# Written by the NovaStream desktop app. Edited values survive a\n\
-         # restart of the service; the app rewrites this file when you change\n\
-         # the port or cache directory in Advanced settings.\n\
-         GATEWAY_PORT={}\n\
-         CACHE_DIRECTORY={}\n",
-        port.trim(),
-        cache_dir.display()
-    )
+/// Settings the Advanced panel owns. Everything else in the file is the
+/// operator's and is carried across untouched.
+const MANAGED_KEYS: [&str; 2] = ["GATEWAY_PORT", "CACHE_DIRECTORY"];
+
+/// Renders the env file, preserving any line the app does not manage.
+///
+/// The server reads a dozen tuning knobs from this same file -- the ones in
+/// `AppConfig` with an `env = "..."`, like `READAHEAD_EXTRA_MB` -- and none of
+/// them have a GUI control. Rendering from scratch deleted every one of them
+/// the next time somebody nudged the port, and did it silently: the setting
+/// does not fail, it just stops existing, and the symptom is a machine that
+/// was fast last week. The old header even promised "edited values survive a
+/// restart", which was true and beside the point -- what they did not survive
+/// was the Advanced panel.
+pub fn render_env(port: &str, cache_dir: &Path, existing: &str) -> String {
+    let mut out = String::from(
+        "# Written by the NovaStream desktop app. The two values below are\n\
+         # managed by Advanced settings; anything else you add here is kept\n\
+         # as-is, so server tuning knobs (READAHEAD_EXTRA_MB, ...) are safe.\n",
+    );
+    out.push_str(&format!("GATEWAY_PORT={}\n", port.trim()));
+    out.push_str(&format!("CACHE_DIRECTORY={}\n", cache_dir.display()));
+
+    // Comments are dropped rather than preserved: the header above is rewritten
+    // every time, so keeping old ones stacks a new copy of it on every save.
+    // A hand-written comment is worth less than a file that stops growing.
+    for line in existing.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let is_managed = MANAGED_KEYS
+            .iter()
+            .any(|key| trimmed.strip_prefix(key).is_some_and(|r| r.starts_with('=')));
+        if !is_managed {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out
 }
 
 /// The unit file.
@@ -280,7 +310,11 @@ pub fn write_settings(port: &str, cache_dir: &str) -> Result<PathBuf> {
     let home = home()?;
     let resolved = absolute_cache_dir(cache_dir, &home);
     let env_file = env_path()?;
-    write_file(&env_file, &render_env(port, &resolved))?;
+    // Read-before-write: this is what carries the operator's own tuning knobs
+    // across a settings change. Missing file reads as empty, which is correct
+    // for a first install.
+    let existing = std::fs::read_to_string(&env_file).unwrap_or_default();
+    write_file(&env_file, &render_env(port, &resolved, &existing))?;
     Ok(resolved)
 }
 
@@ -517,7 +551,7 @@ mod tests {
         // the renderer writes, comments and all. They drift apart silently --
         // the symptom is a window polling the default port for a service that
         // was moved.
-        let rendered = render_env("9000", Path::new("/mnt/big/cache"));
+        let rendered = render_env("9000", Path::new("/mnt/big/cache"), "");
         let mut port = None;
         let mut cache = None;
         for line in rendered.lines().map(str::trim) {
@@ -531,12 +565,41 @@ mod tests {
         assert_eq!(cache.as_deref(), Some("/mnt/big/cache"));
     }
 
+    /// The server reads its tuning knobs from this file and the app owns two
+    /// lines of it. Rewriting it from scratch deleted the rest, silently, on
+    /// any port change -- the setting does not error, it stops existing.
+    #[test]
+    fn tuning_knobs_the_app_does_not_manage_survive_a_settings_change() {
+        let existing = "# hand-written note\n\
+                        GATEWAY_PORT=8080\n\
+                        CACHE_DIRECTORY=/home/someone/cache\n\
+                        READAHEAD_EXTRA_MB=96\n\
+                        COLD_START_PEER_LIMIT=100\n";
+        let rendered = render_env("9000", Path::new("/mnt/big/cache"), existing);
+
+        assert!(rendered.contains("READAHEAD_EXTRA_MB=96"));
+        assert!(rendered.contains("COLD_START_PEER_LIMIT=100"));
+
+        // The managed pair is replaced, not duplicated -- two GATEWAY_PORT
+        // lines would leave the last one winning by luck of ordering.
+        assert_eq!(rendered.matches("GATEWAY_PORT=").count(), 1);
+        assert_eq!(rendered.matches("CACHE_DIRECTORY=").count(), 1);
+        assert!(rendered.contains("GATEWAY_PORT=9000"));
+        assert!(rendered.contains("CACHE_DIRECTORY=/mnt/big/cache"));
+        assert!(!rendered.contains("8080"), "the old port must be gone");
+
+        // Saving twice must not grow the file: the header is re-emitted each
+        // time, so preserving comments would stack a copy of it per save.
+        let twice = render_env("9000", Path::new("/mnt/big/cache"), &rendered);
+        assert_eq!(twice, rendered, "rendering must be idempotent");
+    }
+
     #[test]
     fn settings_reach_the_service_as_the_env_vars_the_server_actually_reads() {
         // These two names are a contract with `AppConfig`'s `env = "..."`
         // attributes -- renaming one there without this file is a silent
         // reversion to the defaults.
-        let env = render_env("8080", Path::new("/home/someone/cache"));
+        let env = render_env("8080", Path::new("/home/someone/cache"), "");
         assert!(env.contains("GATEWAY_PORT=8080"));
         assert!(env.contains("CACHE_DIRECTORY=/home/someone/cache"));
     }
