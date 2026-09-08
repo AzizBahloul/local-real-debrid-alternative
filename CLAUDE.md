@@ -23,8 +23,46 @@ Lint:                          cargo clippy --release --all-targets -- -D warnin
 Package .deb:                  cargo deb -p streaming-gateway-gui
 Package .rpm:                  cargo generate-rpm -p crates/gateway-gui -o out.rpm   # build FIRST, it does not
 Package Arch:                  cd packaging/arch && makepkg -si
-Full clean-machine setup:      ./setup.sh [--gui] [--no-build] [--service]
+Full clean-machine setup:      ./setup.sh [--gui] [--no-build] [--service] [--user]
 ```
+
+## Rebuilding, installing and relaunching without a password
+
+**This is the loop to use after changing anything, and it needs no `sudo` at
+all — so do it yourself rather than handing the user a command to paste.**
+
+```
+systemctl --user stop novastream          # stop the server
+pkill -f streaming-gateway-gui            # and the window / tray, if open
+./setup.sh --gui --user                   # build + install into ~/.local
+setsid ~/.local/bin/streaming-gateway-gui >/dev/null 2>&1 &   # relaunch
+```
+
+Why this works, and the traps:
+
+- `--user` installs the same four files to the same freedesktop locations
+  under `$HOME/.local` instead of `/usr`, and skips the distro-package step
+  (the only part that genuinely needs root). It reuses `install_manually`, so
+  the four-places invariant below still covers it.
+- `~/.profile` **prepends** `~/.local/bin` to `PATH` on every mainstream
+  distro, so the user copy shadows any older `/usr/bin` one — which matters
+  because the `.desktop` entry's `Exec=` is a bare program name resolved
+  through `PATH`. A leftover `.deb` is therefore harmless but confusing;
+  clear it with `sudo dpkg -r streaming-gateway-gui` when convenient.
+- **The unit records an absolute `ExecStart`**, so switching prefixes leaves
+  the service running the *old* binary until the unit is regenerated. Running
+  `~/.local/bin/streaming-gateway-gui --enable-always-on` rewrites it (the GUI
+  owns the only definition of that unit — never hand-write one).
+- Under `--user` the icon is installed to the hicolor theme **as well as**
+  `share/pixmaps`, because `~/.local/share/pixmaps` is not on any icon-lookup
+  search path (`/usr/share/pixmaps` is a legacy fallback that is).
+- Launching the window is enough to start the server: `ensure_always_on`
+  installs the unit if missing and starts it if it is installed but stopped.
+- The release profile is `lto = true` + `codegen-units = 1`, so each of the
+  three binaries takes 1.5–2 minutes to *link*, single-threaded, with the
+  progress bar apparently frozen at the last crate. That is normal, not a
+  hang. For a throwaway iteration build only:
+  `cargo build --release --config profile.release.lto=false --config profile.release.codegen-units=16`.
 No CI config in this repo — these commands are the only source of truth for
 build/test/lint. Run build+test+clippy before calling any change done.
 

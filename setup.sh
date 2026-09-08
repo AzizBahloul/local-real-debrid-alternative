@@ -11,6 +11,15 @@
 #   ./setup.sh --gui        # also build the desktop GUI launcher and install it
 #   ./setup.sh --gui --service  # ...and run the gateway as an always-on user service
 #   ./setup.sh --no-build   # only install system/Rust deps, skip compiling
+#   ./setup.sh --gui --user # install into ~/.local instead of /usr -- no root at all
+#
+# --user exists because rebuilding is the common case and typing a password
+# every time is not. It installs the same four files to the same freedesktop
+# locations, just under $HOME/.local, which needs no privilege whatsoever --
+# so an unattended rebuild-and-install is possible without granting anything
+# passwordless root. It also skips the distro package step, since installing
+# system packages is the one part that genuinely does need root; on a machine
+# that has already built once, there is nothing left for it to install.
 #
 # The server itself has no GUI dependencies at all (it's a headless HTTP
 # service) -- --gui is separate and optional specifically so this script
@@ -47,11 +56,13 @@ set -euo pipefail
 BUILD=1
 GUI=0
 SERVICE=0
+USER_PREFIX=0
 for arg in "$@"; do
   case "$arg" in
     --no-build) BUILD=0 ;;
     --gui) GUI=1 ;;
     --service) SERVICE=1 ;;
+    --user) USER_PREFIX=1 ;;
     *)
       echo "unknown argument: $arg" >&2
       exit 1
@@ -74,7 +85,13 @@ cd "$SCRIPT_DIR"
 #    already. Resolving this once means every privileged call below is just
 #    "$SUDO cmd" and works everywhere.
 # ---------------------------------------------------------------------------
-if [ "$(id -u)" -eq 0 ]; then
+if [ "$USER_PREFIX" -eq 1 ]; then
+  # Nothing a --user run does needs privilege, so it must never ask for any.
+  # Emptying SUDO here rather than at the install site also makes the package
+  # step below take its own "cannot install packages" branch, which is the
+  # correct outcome: a home-directory install has no business touching /usr.
+  SUDO=""
+elif [ "$(id -u)" -eq 0 ]; then
   SUDO=""
 elif command -v sudo >/dev/null 2>&1; then
   SUDO="sudo"
@@ -180,6 +197,10 @@ if [ -z "$PM" ]; then
   command -v cc >/dev/null 2>&1 || command -v gcc >/dev/null 2>&1 \
     || die "No C compiler on PATH either -- install a C toolchain and re-run."
   log "A C compiler is present, which is the only system requirement. Continuing."
+elif [ "$USER_PREFIX" -eq 1 ]; then
+  log "--user: skipping distro packages (they need root). Checking the toolchain instead."
+  command -v cc >/dev/null 2>&1 || command -v gcc >/dev/null 2>&1 \
+    || die "No C compiler on PATH -- run this once without --user, or install a C toolchain."
 elif [ -z "$SUDO" ] && [ "$(id -u)" -ne 0 ]; then
   warn "Cannot install packages without root. Assuming a C toolchain is already present."
 else
@@ -286,10 +307,19 @@ log "OK: $BIN runs."
 #    service behave identically. That is what makes "every distro" true
 #    rather than "the six distros with a packager".
 # ---------------------------------------------------------------------------
-PREFIX="/usr/local"
+#    --user swaps the prefix for $HOME/.local, which needs no privilege. On
+#    every mainstream distro ~/.profile *prepends* ~/.local/bin to PATH, so
+#    the user copy also shadows any older system one rather than losing to it
+#    -- which matters, because `Exec=` in the .desktop entry is a bare program
+#    name resolved through PATH.
+if [ "$USER_PREFIX" -eq 1 ]; then
+  PREFIX="$HOME/.local"
+else
+  PREFIX="/usr/local"
+fi
 
 install_manually() {
-  log "Installing to $PREFIX (no native package for this distro)..."
+  log "Installing to $PREFIX..."
   $SUDO install -Dm755 "$SCRIPT_DIR/target/release/streaming-gateway-gui" "$PREFIX/bin/streaming-gateway-gui"
   $SUDO install -Dm755 "$SCRIPT_DIR/target/release/streaming-gateway"     "$PREFIX/bin/streaming-gateway"
   $SUDO install -Dm644 "$SCRIPT_DIR/crates/gateway-gui/assets/streaming-gateway-gui.desktop" \
@@ -299,6 +329,15 @@ install_manually() {
   # of after the next gtk-update-icon-cache.
   $SUDO install -Dm644 "$SCRIPT_DIR/crates/gateway-gui/assets/icon-256.png" \
     "$PREFIX/share/pixmaps/streaming-gateway-gui.png"
+  # ...and again into the hicolor theme, but only under a home prefix.
+  # `/usr/share/pixmaps` is a legacy location every icon lookup still falls
+  # back to; `~/.local/share/pixmaps` is not searched by anything. Without
+  # this the menu entry under --user renders a blank square, which reads as a
+  # broken icon theme rather than as a packaging choice.
+  if [ "$USER_PREFIX" -eq 1 ]; then
+    install -Dm644 "$SCRIPT_DIR/crates/gateway-gui/assets/icon-256.png" \
+      "$PREFIX/share/icons/hicolor/256x256/apps/streaming-gateway-gui.png"
+  fi
   INSTALLED_GUI="$PREFIX/bin/streaming-gateway-gui"
 }
 
@@ -321,6 +360,11 @@ if [ "$GUI" -eq 1 ]; then
   log "OK: $GUI_BIN built (a GUI app can't be verified headlessly the same way; launch it to check)."
 
   INSTALLED_GUI=""
+  if [ "$USER_PREFIX" -eq 1 ]; then
+    # No packager branch under --user: every native package installs into
+    # /usr, which is the one thing this mode exists to avoid.
+    install_manually
+  else
   case "$PM" in
     apt)
       if ensure_cargo_packager cargo-deb; then
@@ -367,6 +411,7 @@ if [ "$GUI" -eq 1 ]; then
       install_manually
       ;;
   esac
+  fi
 
   # Drop a real, clickable icon on the Desktop too, not just the app menu
   # entry the install above created.

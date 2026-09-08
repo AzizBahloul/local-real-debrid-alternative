@@ -1137,12 +1137,19 @@ impl GatewayApp {
         );
     }
 
-    /// Installs the service and the login tray icon if they are not there yet.
+    /// Brings always-on mode up to date the moment the window opens: installs
+    /// the unit and login tray icon if they are missing, and starts the
+    /// gateway if the unit exists but is not running.
     ///
     /// Runs from the update loop rather than from a button, because always-on
-    /// is now the only mode: a fresh install, or a machine where the unit was
-    /// removed by hand, should converge on it without anyone being asked.
-    /// Guarded on `service_busy` so the poll cannot stack installs, and on
+    /// is now the only mode: a fresh install, a machine where the unit was
+    /// removed by hand, or a gateway stopped from the tray should all converge
+    /// on "running" without anyone being asked. Opening the app is itself the
+    /// request for the gateway to be up -- there is nothing else the window is
+    /// for -- so making someone then press start is a step that only ever
+    /// costs them a confused minute wondering why their phone sees nothing.
+    ///
+    /// Guarded on `service_busy` so the poll cannot stack actions, and on
     /// `always_on_attempted` so a genuine failure (no binary, systemd refusing
     /// the unit) is reported once instead of retried every frame.
     fn ensure_always_on(&mut self) {
@@ -1155,12 +1162,14 @@ impl GatewayApp {
         if self.service_rx.is_some() && !self.service.installed {
             return;
         }
-        if self.service.installed && self.autostart {
-            self.always_on_attempted = true;
-            return;
-        }
+
         self.always_on_attempted = true;
-        self.enable_always_on();
+        if !self.service.installed || !self.autostart {
+            // Installs, starts, and leaves the tray icon at login.
+            self.enable_always_on();
+        } else if !self.service.active {
+            self.start_server();
+        }
     }
 
     fn traffic_panel(&self, ui: &mut egui::Ui) {
