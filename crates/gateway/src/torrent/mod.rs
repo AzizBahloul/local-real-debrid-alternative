@@ -67,6 +67,17 @@ const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(15);
 /// gets the fast, honest "still no peers" instead of another full wait.
 const START_FAILURE_COOLDOWN: Duration = Duration::from_secs(45);
 
+/// How long a metadata search may keep running after the request that started
+/// it has already given up. See `spawn_search`.
+///
+/// Generous on purpose, because the thing it is waiting for is genuinely slow:
+/// a magnet with no trackers has to bootstrap DHT, iterate `get_peers` across
+/// the routing table, and then pull the metadata from whichever peer answers.
+/// Two minutes is comfortably past the point where a sparsely-seeded release
+/// either shows up or does not, while still bounding the task and its
+/// concurrency permit so a dead hash cannot park either indefinitely.
+const BACKGROUND_SEARCH_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// How long after its last read a torrent is still considered "being watched"
 /// for the purpose of *deleting* it — see `action_for_abandoned`.
 ///
@@ -260,6 +271,14 @@ impl MetadataArchive {
             let _ = tokio::fs::remove_file(&path).await;
         }
     }
+}
+
+/// A live torrent's assembled `.torrent` blob, or `None` if the session does
+/// not hold it or has not resolved it yet.
+fn session_metadata(api: &Api, info_hash: &str) -> Option<bytes::Bytes> {
+    let idx = TorrentIdOrHash::parse(info_hash).ok()?;
+    let handle = api.session().get(idx)?;
+    handle.with_metadata(|m| m.torrent_bytes.clone()).ok()
 }
 
 /// Stamps a file as used just now, so `MetadataArchive::prune` evicts by last
@@ -709,7 +728,7 @@ pub struct TorrentEngine {
     /// swapping in a different provider (e.g. resolving a `.torrent` file URL)
     /// only means constructing `TorrentEngine` with a different `Box` here.
     source: Box<dyn TorrentSource>,
-    max_concurrent: Semaphore,
+    max_concurrent: Arc<Semaphore>,
     active_streams: Mutex<HashMap<String, StreamActivity>>,
     advertised: Mutex<AdvertisedHashes>,
     /// Where the advertised set is kept between runs.
@@ -744,7 +763,11 @@ pub struct TorrentEngine {
     /// weeks ago still needs no swarm lookup. See `MetadataArchive`.
     metadata_archive: MetadataArchive,
     /// When a hash last failed to find any peers. See `START_FAILURE_COOLDOWN`.
-    failed_starts: StdMutex<HashMap<String, Instant>>,
+    /// Shared with the background search tasks, which are what record it.
+    failed_starts: Arc<StdMutex<HashMap<String, Instant>>>,
+    /// Hashes with a metadata search running right now, so a retry joins it
+    /// instead of starting a competing one. See `spawn_search`.
+    searching: Arc<StdMutex<HashSet<String>>>,
     /// Torrents the operator paused by hand, which the download queue must
     /// leave alone. See `hold_paused`.
     held: StdMutex<HashSet<String>>,
@@ -975,7 +998,7 @@ impl TorrentEngine {
         let engine = Arc::new(Self {
             api,
             source: Box::new(MagnetSource),
-            max_concurrent: Semaphore::new(config.max_concurrent_torrents.max(1)),
+            max_concurrent: Arc::new(Semaphore::new(config.max_concurrent_torrents.max(1))),
             // At least one, or nothing could ever download -- including the
             // title on screen, which would look like the gateway hanging.
             max_active_downloads: config.max_active_downloads.max(1),
@@ -994,7 +1017,8 @@ impl TorrentEngine {
             starts: Mutex::new(HashMap::new()),
             resolved_metadata: Mutex::new(MetadataCache::default()),
             metadata_archive: MetadataArchive::new(config.session_state_dir().join("metadata")),
-            failed_starts: StdMutex::new(HashMap::new()),
+            failed_starts: Arc::new(StdMutex::new(HashMap::new())),
+            searching: Arc::new(StdMutex::new(HashSet::new())),
             held: StdMutex::new(HashSet::new()),
             audit: StdMutex::new(crate::audit::AuditLog::disabled()),
             readers: StdMutex::new(Vec::new()),
@@ -1226,20 +1250,32 @@ impl TorrentEngine {
         phases.was_cold = true;
         phases.from_cached_metadata = cached_metadata.is_some();
 
-        // A hash that just failed to find any peers fails the same way every
-        // time, for the same 25 seconds -- so a client auto-retrying a dead
-        // stream (a resumed "continue watching", or its own error recovery)
-        // gets an instant, honest failure instead of paying that wait again
-        // on every retry. Skipped when we already hold the metadata, since
-        // that cooldown exists to avoid re-running a search this add does not
-        // need to run. See `START_FAILURE_COOLDOWN`.
+        // A search already running for this hash is joined, not duplicated:
+        // the answer it is about to produce is the same answer this request
+        // wants, and a second concurrent search only splits the same peers
+        // between two lookups. Reported as "still looking", because that is
+        // what is true -- see `search_in_flight`.
+        if self.search_in_flight(&info_hash) {
+            anyhow::bail!(
+                "still searching the swarm for this release -- it keeps looking in the \
+                 background, so try again in a moment"
+            );
+        }
+
+        // A hash whose search just came back empty is not asked again for a
+        // short while, so a client auto-retrying a dead stream (a resumed
+        // "continue watching", or its own error recovery) gets an instant
+        // answer rather than queueing another full search behind the last
+        // one. Skipped when we already hold the metadata, since that cooldown
+        // exists to avoid re-running a search this add does not need to run.
+        // See `START_FAILURE_COOLDOWN`.
         if let Some(remaining) = self
             .recent_start_failure(&info_hash)
             .filter(|_| cached_metadata.is_none())
         {
             anyhow::bail!(
-                "no reachable peers as of {}s ago; not searching again for another {}s -- \
-                 try a release with more seeders",
+                "found no peers {}s ago; waiting {}s before searching again -- if this \
+                 release stays dead, pick another source for the same episode",
                 (START_FAILURE_COOLDOWN - remaining).as_secs(),
                 remaining.as_secs()
             );
@@ -1247,10 +1283,10 @@ impl TorrentEngine {
 
         // Throttles how many torrents can be *added* concurrently (each add
         // does a burst of tracker/DHT/peer-handshake work) -- not how many
-        // can stream at once, so the permit is dropped as soon as add returns.
-        let _permit = self
-            .max_concurrent
-            .acquire()
+        // can stream at once, so the permit is released as soon as the add
+        // returns, background or not.
+        let permit = Arc::clone(&self.max_concurrent)
+            .acquire_owned()
             .await
             .context("torrent concurrency limiter closed")?;
 
@@ -1279,32 +1315,38 @@ impl TorrentEngine {
             None => AddTorrent::from_url(magnet),
         };
 
+        // The search runs on its own task so that *this request* timing out
+        // does not cancel it.
+        //
+        // It used to be awaited inline under a 25-second timeout, and dropping
+        // that future is what killed the fetch. For a magnet with no trackers
+        // -- which is nearly every replayed link, since the index only reports
+        // trackers on the browse that first offered the stream -- 25 seconds
+        // is simply not long enough to bootstrap DHT, iterate get_peers, and
+        // pull the metadata from whoever answers. So a title that was merely
+        // slow to find was declared to have "no reachable peers", nothing was
+        // left in the session, and every retry re-ran the same doomed 25
+        // seconds from scratch. Letting it run means the swarm list shows the
+        // torrent the moment metadata lands, and the viewer's next tap takes
+        // the warm path above and plays.
         let metadata_began = Instant::now();
-        let added = tokio::time::timeout(
-            ADD_TORRENT_TIMEOUT,
-            self.api.api_add_torrent(source, Some(opts)),
-        )
-        .await;
+        let search = self.spawn_search(info_hash.clone(), source, opts, permit);
+        let added = tokio::time::timeout(ADD_TORRENT_TIMEOUT, search).await;
         phases.metadata_ms = metadata_began.elapsed().as_millis() as u64;
 
-        if added.is_err() {
-            self.record_start_failure(&info_hash);
+        match added {
+            // Still going. Deliberately no `record_start_failure`: nothing has
+            // failed, and marking it would gag the retry that is about to
+            // succeed.
+            Err(_elapsed) => anyhow::bail!(
+                "no metadata yet after {}s -- still searching in the background, so press \
+                 play again shortly",
+                ADD_TORRENT_TIMEOUT.as_secs()
+            ),
+            Ok(Err(join)) => anyhow::bail!("torrent search task failed: {join}"),
+            Ok(Ok(Err(e))) => return Err(e).context("failed to start torrent"),
+            Ok(Ok(Ok(()))) => {}
         }
-
-        added
-            .map_err(|_| {
-                anyhow::anyhow!(
-                    "timed out fetching torrent metadata after {}s -- the torrent likely has no \
-                     reachable peers (try a release with more seeders)",
-                    ADD_TORRENT_TIMEOUT.as_secs()
-                )
-            })?
-            .context("failed to start torrent")?;
-
-        // Reaching here means peers answered, so any earlier failure is
-        // stale -- a later retry must not be judged by a search that no
-        // longer reflects the swarm.
-        self.clear_start_failure(&info_hash);
 
         // Bank the metadata this start just proved good. `resolve` only covers
         // the browse path; a viewer who taps straight through to a stream
@@ -1326,6 +1368,97 @@ impl TorrentEngine {
         streamable?;
 
         Ok(info_hash)
+    }
+
+    /// Whether a background metadata search is already running for this hash.
+    fn search_in_flight(&self, info_hash: &str) -> bool {
+        self.searching
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(info_hash)
+    }
+
+    /// Starts the add on a detached task and returns a handle to it.
+    ///
+    /// The caller waits on that handle under a timeout; letting the handle go
+    /// abandons the *wait*, not the work, because tokio keeps a spawned task
+    /// running after its `JoinHandle` is dropped. That asymmetry is the whole
+    /// point: an HTTP request cannot hang for two minutes, but the swarm
+    /// lookup behind it can happily take that long and still be worth having.
+    ///
+    /// Bounded by `BACKGROUND_SEARCH_TIMEOUT` so a genuinely dead hash cannot
+    /// leave a task and a concurrency permit parked forever.
+    fn spawn_search(
+        &self,
+        info_hash: String,
+        source: AddTorrent<'static>,
+        opts: AddTorrentOptions,
+        permit: tokio::sync::OwnedSemaphorePermit,
+    ) -> tokio::task::JoinHandle<Result<()>> {
+        self.searching
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(info_hash.clone());
+
+        let api = self.api.clone();
+        let searching = Arc::clone(&self.searching);
+        let failed_starts = Arc::clone(&self.failed_starts);
+        let archive = self.metadata_archive.clone();
+
+        tokio::spawn(async move {
+            let outcome = tokio::time::timeout(
+                BACKGROUND_SEARCH_TIMEOUT,
+                api.api_add_torrent(source, Some(opts)),
+            )
+            .await;
+
+            // Released here rather than at the caller's timeout, so a search
+            // that outlives its request still counts against the add limit.
+            drop(permit);
+            searching
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&info_hash);
+
+            let failed = |reason: &str| {
+                failed_starts
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .insert(info_hash.clone(), Instant::now());
+                warn!(info_hash = %info_hash, "swarm search gave up: {reason}");
+            };
+
+            match outcome {
+                Err(_) => {
+                    failed("no peers answered within the background search window");
+                    anyhow::bail!(
+                        "no peers found for this release after {}s of searching",
+                        BACKGROUND_SEARCH_TIMEOUT.as_secs()
+                    );
+                }
+                Ok(Err(e)) => {
+                    failed("the torrent engine refused the add");
+                    return Err(anyhow::anyhow!("{e}"));
+                }
+                Ok(Ok(_)) => {}
+            }
+
+            // Peers answered, so any earlier failure is stale -- a later retry
+            // must not be judged by a search that no longer reflects the swarm.
+            failed_starts
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&info_hash);
+
+            // Bank the metadata this search just paid for, whether or not the
+            // request that asked for it is still waiting. A search that landed
+            // after its viewer gave up is exactly the one worth keeping.
+            if let Some(bytes) = session_metadata(&api, &info_hash) {
+                archive.store(&info_hash, &bytes).await;
+            }
+            info!(info_hash = %info_hash, "swarm search found metadata; torrent is in the session");
+            Ok(())
+        })
     }
 
     /// Copies a live torrent's assembled `.torrent` blob into the archive.
@@ -1367,19 +1500,10 @@ impl TorrentEngine {
         )
     }
 
-    fn record_start_failure(&self, info_hash: &str) {
-        self.failed_starts
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(info_hash.to_string(), Instant::now());
-    }
-
-    fn clear_start_failure(&self, info_hash: &str) {
-        self.failed_starts
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(info_hash);
-    }
+    // Recording and clearing a start failure now happens inside the background
+    // search task (see `spawn_search`), which is the only thing that knows how
+    // the search actually ended -- the request that kicked it off has usually
+    // timed out and gone by then.
 
     /// The lock guarding starts of one particular torrent, creating it on
     /// first use.
@@ -3155,6 +3279,27 @@ mod tests {
         assert!(set.contains("one"));
         assert!(set.contains("two"));
         assert_eq!(set.order.len(), 2);
+    }
+
+    /// The background search must outlast the request that started it, or the
+    /// fix is not a fix: a 25-second foreground wait is shorter than a
+    /// trackerless DHT lookup usually takes, so cancelling on that boundary is
+    /// what made a merely-slow release look permanently dead.
+    #[test]
+    fn a_swarm_search_may_run_far_longer_than_the_request_that_started_it() {
+        assert!(
+            BACKGROUND_SEARCH_TIMEOUT > ADD_TORRENT_TIMEOUT,
+            "a search that dies with its request cannot find anything the \
+             request could not have found itself"
+        );
+    }
+
+    /// The cooldown only makes sense once a search has actually concluded. If
+    /// it could outlast the search window, a hash would sit refused while
+    /// nothing was looking for it -- the stall this whole path exists to end.
+    #[test]
+    fn the_failure_cooldown_never_outlives_the_search_that_justifies_it() {
+        assert!(START_FAILURE_COOLDOWN < BACKGROUND_SEARCH_TIMEOUT);
     }
 
     fn archive_tempdir() -> PathBuf {
