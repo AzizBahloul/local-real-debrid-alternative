@@ -70,6 +70,14 @@ struct TorrentInfo {
     download_speed_mib_s: f64,
     upload_speed_mib_s: f64,
     peers: u32,
+    /// Needed to address the row's own pause/resume/delete calls.
+    #[serde(default)]
+    info_hash: String,
+    /// Paused by hand rather than by the download queue. Defaulted so this
+    /// window still reads an older server's `/health` -- every row then simply
+    /// offers Pause, which is true of a server that has no hand-pause concept.
+    #[serde(default)]
+    held: bool,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -350,6 +358,12 @@ struct GatewayApp {
     service_error: Option<String>,
     /// Whether the tray icon is set to come back at the next login.
     autostart: bool,
+    /// Whether `ensure_always_on` has already had its one go this session, so
+    /// a failure is reported once rather than retried on every frame.
+    always_on_attempted: bool,
+    /// The swarm row whose delete button has been pressed once. See
+    /// `act_on_torrent`.
+    delete_armed: Option<String>,
     /// `journalctl -f` on the unit -- the log panel's source when the server
     /// belongs to systemd rather than to this window.
     journal: Option<LogTail>,
@@ -406,6 +420,8 @@ impl Default for GatewayApp {
             service_action_rx: None,
             service_error: None,
             autostart: service::autostart_enabled(),
+            always_on_attempted: false,
+            delete_armed: None,
             journal: None,
             next_journal_attempt: Instant::now(),
             quitting: false,
@@ -510,24 +526,9 @@ impl GatewayApp {
         self.autostart = true;
     }
 
-    fn disable_always_on(&mut self) {
-        self.run_service_action(service::uninstall);
-    }
-
-    fn toggle_autostart(&mut self) {
-        let result = if self.autostart {
-            service::remove_autostart()
-        } else {
-            match self.exe.clone() {
-                Some(exe) => service::install_autostart(&exe),
-                None => Err(anyhow::anyhow!("cannot locate this application's own path")),
-            }
-        };
-        match result {
-            Ok(()) => self.autostart = !self.autostart,
-            Err(e) => self.service_error = Some(format!("{e:#}")),
-        }
-    }
+    // Turning always-on *off* is deliberately not reachable from the window --
+    // see `service_panel`. The `--disable-always-on` command-line flag remains
+    // the escape hatch, and it calls `service::uninstall` directly.
 
     /// Attaches the log panel to the service's journal.
     ///
@@ -731,6 +732,7 @@ impl GatewayApp {
 
     fn poll_background_work(&mut self) {
         self.poll_service_state();
+        self.ensure_always_on();
 
         if self.service_mode() {
             // systemd owns the process; this window only reports on it.
@@ -972,24 +974,23 @@ impl GatewayApp {
         }
     }
 
+    /// The main actions, side by side on one line and all in the house green.
+    ///
+    /// One row rather than a stack of full-width bars, and one colour rather
+    /// than one per button: colour here was decoration, and three differently
+    /// coloured bars read as three different kinds of thing when they are just
+    /// three buttons.
+    ///
+    /// The single exception is a *destructive* action that has been armed --
+    /// "confirm: erase all" stays red. That red is not decoration; it is the
+    /// only warning between a click and every download on the disk.
     fn controls(&mut self, ui: &mut egui::Ui, status: Status) {
-        let (label, color, enabled) = match status {
-            Status::Stopped => ("./gateway --start", PHOSPHOR, true),
-            Status::Starting => ("linking ...", AMBER, false),
-            Status::Running => ("./gateway --stop", RED, true),
-            Status::Stopping => ("unlinking ...", AMBER, false),
+        let (label, enabled) = match status {
+            Status::Stopped => ("./gateway --start", true),
+            Status::Starting => ("linking ...", false),
+            Status::Running => ("./gateway --stop", true),
+            Status::Stopping => ("unlinking ...", false),
         };
-        if widgets::command_button(ui, label, color, enabled && self.binary.is_some(), 52.0)
-            .clicked()
-        {
-            match status {
-                Status::Stopped => self.start_server(),
-                Status::Running => self.stop_server(),
-                _ => {}
-            }
-        }
-
-        ui.add_space(6.0);
 
         // Enabled on "a server answered /health", not on "this app started
         // it" -- the gateway is often launched from a terminal, and a button
@@ -1005,14 +1006,38 @@ impl GatewayApp {
         } else {
             "purge cache"
         };
-        let clear_clicked = widgets::command_button(
-            ui,
-            clear_label,
-            if self.clear_armed { RED } else { AMBER },
-            live && !clearing,
-            30.0,
-        )
-        .clicked();
+
+        let mut power_clicked = false;
+        let mut clear_clicked = false;
+        // `columns` divides the available width evenly, and `command_button`
+        // fills whatever width it is handed -- so the row stays even as the
+        // window resizes, without any button knowing its own size.
+        ui.columns(2, |cols| {
+            power_clicked = widgets::command_button(
+                &mut cols[0],
+                label,
+                PHOSPHOR,
+                enabled && self.binary.is_some(),
+                40.0,
+            )
+            .clicked();
+            clear_clicked = widgets::command_button(
+                &mut cols[1],
+                clear_label,
+                if self.clear_armed { RED } else { PHOSPHOR },
+                live && !clearing,
+                40.0,
+            )
+            .clicked();
+        });
+
+        if power_clicked {
+            match status {
+                Status::Stopped => self.start_server(),
+                Status::Running => self.stop_server(),
+                _ => {}
+            }
+        }
 
         if clear_clicked {
             if self.clear_armed {
@@ -1044,21 +1069,26 @@ impl GatewayApp {
         }
     }
 
-    /// The always-on switch, and an honest report of what it is currently
-    /// buying: a unit that is installed but not lingering comes back at the
-    /// next login and not at the next reboot, and saying "on" for that is how
-    /// someone finds the gateway down after a power cut.
+    /// Reports always-on mode, which is no longer a choice.
+    ///
+    /// There is no off switch here on purpose. Always-on is what makes the
+    /// product work the way it is used -- the phone expects the addon to
+    /// answer whether or not this window happens to be open -- and a toggle
+    /// that turns it off is a way to break that by accident and then wonder
+    /// why Stremio cannot find the gateway. The gateway is stopped from the
+    /// tray's Exit entry, which is where someone looks for an off switch when
+    /// the window is closed anyway.
+    ///
+    /// The panel still reports honestly rather than just claiming "on": a unit
+    /// that is installed but not lingering comes back at the next login and
+    /// not at the next reboot, and saying "on" for that is how someone finds
+    /// the gateway down after a power cut.
     fn service_panel(&mut self, ui: &mut egui::Ui) {
-        let installed = self.service.installed;
         let busy = self.service_busy();
         let summary = self.service.summary();
         let always_on = self.service.always_on();
         let systemd = self.systemd;
-        let autostart = self.autostart;
         let error = self.service_error.clone();
-
-        let mut toggle_service = false;
-        let mut toggle_tray = false;
 
         theme::section(
             ui,
@@ -1078,52 +1108,20 @@ impl GatewayApp {
                 }
 
                 ui.label(
-                    egui::RichText::new(format!("service :: {summary}"))
-                        .font(egui::FontId::monospace(11.0))
-                        .color(if always_on { PHOSPHOR } else { TEXT }),
+                    egui::RichText::new(if busy {
+                        "service :: installing ...".to_string()
+                    } else {
+                        format!("service :: {summary}")
+                    })
+                    .font(egui::FontId::monospace(11.0))
+                    .color(if always_on { PHOSPHOR } else { TEXT }),
                 );
-                ui.add_space(6.0);
-
-                let label = if busy {
-                    "working ..."
-                } else if installed {
-                    "disable always-on"
-                } else {
-                    "enable always-on (survives reboot)"
-                };
-                toggle_service = widgets::command_button(
-                    ui,
-                    label,
-                    if installed { AMBER } else { PHOSPHOR },
-                    !busy,
-                    34.0,
-                )
-                .clicked();
-
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "tray icon at login :: {}",
-                            if autostart { "on" } else { "off" }
-                        ))
-                        .font(egui::FontId::monospace(10.0))
-                        .color(TEXT_DIM),
-                    );
-                    toggle_tray = widgets::ghost_button(
-                        ui,
-                        if autostart { "turn off" } else { "turn on" },
-                        TEXT_DIM,
-                    )
-                    .clicked();
-                });
 
                 ui.label(
-                    egui::RichText::new(if installed {
-                        "closing this window leaves the icon in the tray; the gateway keeps running"
-                    } else {
-                        "without this, the gateway stops when this window does"
-                    })
+                    egui::RichText::new(
+                        "always on :: starts at boot, keeps running when this window closes\n\
+                         to stop it: tray icon -> Exit NovaStream",
+                    )
                     .font(egui::FontId::monospace(10.0))
                     .color(TEXT_DIM),
                 );
@@ -1137,17 +1135,32 @@ impl GatewayApp {
                 }
             },
         );
+    }
 
-        if toggle_service {
-            if installed {
-                self.disable_always_on();
-            } else {
-                self.enable_always_on();
-            }
+    /// Installs the service and the login tray icon if they are not there yet.
+    ///
+    /// Runs from the update loop rather than from a button, because always-on
+    /// is now the only mode: a fresh install, or a machine where the unit was
+    /// removed by hand, should converge on it without anyone being asked.
+    /// Guarded on `service_busy` so the poll cannot stack installs, and on
+    /// `always_on_attempted` so a genuine failure (no binary, systemd refusing
+    /// the unit) is reported once instead of retried every frame.
+    fn ensure_always_on(&mut self) {
+        if !self.systemd || self.always_on_attempted || self.service_busy() {
+            return;
         }
-        if toggle_tray {
-            self.toggle_autostart();
+        // Never act on a "not installed" that a poll in flight is about to
+        // contradict -- installing on top of a unit that already exists would
+        // restart a gateway somebody is streaming from.
+        if self.service_rx.is_some() && !self.service.installed {
+            return;
         }
+        if self.service.installed && self.autostart {
+            self.always_on_attempted = true;
+            return;
+        }
+        self.always_on_attempted = true;
+        self.enable_always_on();
     }
 
     fn traffic_panel(&self, ui: &mut egui::Ui) {
@@ -1267,7 +1280,10 @@ impl GatewayApp {
         });
     }
 
-    fn swarm_panel(&self, ui: &mut egui::Ui, health: &HealthInfo) {
+    fn swarm_panel(&mut self, ui: &mut egui::Ui, health: &HealthInfo) {
+        let armed = self.delete_armed.clone();
+        let mut requested: Option<(String, widgets::RowAction)> = None;
+
         theme::section(
             ui,
             &format!("swarm [{}]", health.active_torrents.len()),
@@ -1285,10 +1301,11 @@ impl GatewayApp {
                     if index > 0 {
                         ui.add_space(8.0);
                     }
-                    widgets::swarm_row(
+                    let action = widgets::swarm_row(
                         ui,
                         &torrent.name,
                         &torrent.state,
+                        torrent.held,
                         (torrent.progress_percent / 100.0) as f32,
                         &format!(
                             "{:.1}%  {} / {}  {} peers  {:.2} MiB/s dn  {:.2} MiB/s up",
@@ -1299,10 +1316,57 @@ impl GatewayApp {
                             torrent.download_speed_mib_s,
                             torrent.upload_speed_mib_s,
                         ),
+                        armed.as_deref() == Some(torrent.info_hash.as_str()),
                     );
+                    if let Some(action) = action {
+                        requested = Some((torrent.info_hash.clone(), action));
+                    }
                 }
             },
         );
+
+        if let Some((info_hash, action)) = requested {
+            self.act_on_torrent(info_hash, action);
+        }
+    }
+
+    /// Applies one swarm-row button.
+    ///
+    /// Delete is armed first and confirmed second, matching the whole-cache
+    /// purge: it destroys a download that may have taken an hour to fetch, and
+    /// the button sits inches from Pause. Any other click disarms, so an
+    /// armed row cannot be confirmed later by accident.
+    fn act_on_torrent(&mut self, info_hash: String, action: widgets::RowAction) {
+        if info_hash.is_empty() {
+            self.clear_result =
+                Some("this server is too old to control torrents individually".to_string());
+            return;
+        }
+        let verb = match action {
+            widgets::RowAction::Pause => "pause",
+            widgets::RowAction::Resume => "resume",
+            widgets::RowAction::Delete => {
+                if self.delete_armed.as_deref() != Some(info_hash.as_str()) {
+                    self.delete_armed = Some(info_hash);
+                    return;
+                }
+                "delete"
+            }
+        };
+        self.delete_armed = None;
+
+        let port = self.port.clone();
+        let hash = info_hash.clone();
+        let verb = verb.to_string();
+        // Fire and forget: the next `/health` poll is what redraws the row, so
+        // there is no reply worth blocking the UI thread for. A failure shows
+        // up as the row simply not changing, and in the log panel.
+        thread::spawn(move || {
+            let url = format!("http://127.0.0.1:{port}/torrents/{hash}/{verb}");
+            if let Err(e) = ureq::post(&url).timeout(Duration::from_secs(20)).call() {
+                eprintln!("{verb} {hash} failed: {e}");
+            }
+        });
     }
 
     fn endpoint_panel(&mut self, ui: &mut egui::Ui, url: String, time: f64) {
@@ -1545,7 +1609,7 @@ impl eframe::App for GatewayApp {
                 });
         });
 
-        fx::crt_overlay(ctx, screen, time);
+        fx::crt_overlay(ctx, screen);
 
         if self.boot.paint(ctx, screen, time) && ctx.input(|i| i.pointer.any_click()) {
             self.boot.skip();
@@ -1833,6 +1897,8 @@ mod tests {
                     download_speed_mib_s: 1.5,
                     upload_speed_mib_s: 0.25,
                     peers: 12,
+                    info_hash: "a".repeat(40),
+                    held: false,
                 },
                 TorrentInfo {
                     name: "b".into(),
@@ -1843,6 +1909,8 @@ mod tests {
                     download_speed_mib_s: 2.0,
                     upload_speed_mib_s: 0.75,
                     peers: 30,
+                    info_hash: "b".repeat(40),
+                    held: false,
                 },
             ],
         };

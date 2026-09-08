@@ -445,17 +445,48 @@ pub fn status_lamp(ui: &mut Ui, label: &str, color: Color32, pulse: bool) {
 
 /// One torrent in the swarm panel: name, animated progress bar, and the live
 /// numbers underneath.
-pub fn swarm_row(ui: &mut Ui, name: &str, state: &str, progress: f32, stats: &str) {
+/// What the buttons on one swarm row can ask for.
+///
+/// `Delete` is armed in two steps by the caller rather than here, because the
+/// widget is redrawn from scratch every frame and has nowhere to keep the
+/// "asked once already" bit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowAction {
+    Pause,
+    Resume,
+    Delete,
+}
+
+/// One torrent: name, state, progress bar, stats, and its own controls.
+///
+/// `held` is the operator's own pause, which is not the same question as
+/// `state == "paused"`: the download queue parks whatever is beyond its width,
+/// and offering Resume for one of those would promise something the queue
+/// immediately undoes. So a queue-parked row offers Pause (make it stay
+/// parked) and a hand-paused one offers Resume.
+pub fn swarm_row(
+    ui: &mut Ui,
+    name: &str,
+    state: &str,
+    held: bool,
+    progress: f32,
+    stats: &str,
+    delete_armed: bool,
+) -> Option<RowAction> {
     let font = FontId::monospace(11.0);
     let width = ui.available_width();
     let char_width = ui.fonts(|f| f.glyph_width(&font, 'M')).max(1.0);
+    let mut action = None;
 
     ui.horizontal(|ui| {
         // Truncated rather than wrapped: a release name is 90 characters of
         // tags and wrapping it buries the bar. Cut by *characters*, never by
         // bytes -- a release title carrying one accented word would panic a
         // byte slice, and this string comes straight off the wire.
-        let room = ((width - 70.0) / char_width).floor().max(8.0) as usize;
+        //
+        // The reserve grew with the buttons: the state word plus three
+        // controls, or the name runs under them.
+        let room = ((width - 210.0) / char_width).floor().max(8.0) as usize;
         let shown = if name.chars().count() > room {
             let head: String = name.chars().take(room.saturating_sub(1)).collect();
             format!("{head}~")
@@ -464,10 +495,30 @@ pub fn swarm_row(ui: &mut Ui, name: &str, state: &str, progress: f32, stats: &st
         };
         ui.label(egui::RichText::new(shown).font(font.clone()).color(TEXT));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            // Right-to-left, so these read delete, pause/resume, STATE from
+            // the right edge inward.
+            if delete_armed {
+                if ghost_button(ui, "confirm delete", RED).clicked() {
+                    action = Some(RowAction::Delete);
+                }
+            } else if ghost_button(ui, "delete", TEXT_DIM).clicked() {
+                action = Some(RowAction::Delete);
+            }
+            if held {
+                if ghost_button(ui, "resume", PHOSPHOR).clicked() {
+                    action = Some(RowAction::Resume);
+                }
+            } else if ghost_button(ui, "pause", TEXT_DIM).clicked() {
+                action = Some(RowAction::Pause);
+            }
             ui.label(
-                egui::RichText::new(state.to_uppercase())
-                    .font(FontId::monospace(10.0))
-                    .color(state_color(state)),
+                egui::RichText::new(if held {
+                    "HELD".to_string()
+                } else {
+                    state.to_uppercase()
+                })
+                .font(FontId::monospace(10.0))
+                .color(if held { AMBER } else { state_color(state) }),
             );
         });
     });
@@ -484,6 +535,14 @@ pub fn swarm_row(ui: &mut Ui, name: &str, state: &str, progress: f32, stats: &st
             .font(FontId::monospace(10.0))
             .color(TEXT_DIM),
     );
+    if delete_armed {
+        ui.label(
+            egui::RichText::new("!! deletes this title's downloaded data")
+                .font(FontId::monospace(10.0))
+                .color(RED),
+        );
+    }
+    action
 }
 
 fn state_color(state: &str) -> Color32 {

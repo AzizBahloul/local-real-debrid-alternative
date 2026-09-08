@@ -59,10 +59,19 @@ pub struct AppConfig {
     /// cap -- the size cap then only matters when the survivors are huge.
     /// 0 disables count-based retention and leaves the size cap in charge.
     ///
-    /// The default keeps the title being watched plus the one before it
-    /// (back-to-back episodes, or "go back and finish the other one"), which
-    /// is the whole re-watch horizon a small disk actually needs.
-    #[arg(long, env = "MAX_CACHED_TORRENTS", default_value_t = 2)]
+    /// Must be at least `max_active_downloads`, or retention is fighting the
+    /// download queue: the janitor would purge a torrent the queue is still
+    /// filling. Nothing enforces that at startup because the janitor spares
+    /// anything actively downloading anyway (see `CacheManager`), but setting
+    /// it lower means the queue's own output is deleted the moment it
+    /// finishes, which is not a useful configuration.
+    ///
+    /// The default holds a run of ten titles -- most of a season, or a few
+    /// films -- which is the horizon a 100 GB cap comfortably covers at
+    /// roughly 1.5 GB an episode. It is well clear of the download queue's
+    /// four, so nothing the queue fetches ahead is thrown away before it can
+    /// be watched.
+    #[arg(long, env = "MAX_CACHED_TORRENTS", default_value_t = 10)]
     pub max_cached_torrents: usize,
 
     /// How often (seconds) the cache janitor checks disk usage.
@@ -72,6 +81,30 @@ pub struct AppConfig {
     /// Maximum number of torrents actively managed (downloading/seeding) at once.
     #[arg(long, env = "MAX_CONCURRENT_TORRENTS", default_value_t = 8)]
     pub max_concurrent_torrents: usize,
+
+    /// How many torrents may be downloading at the same time.
+    ///
+    /// Distinct from `MAX_CONCURRENT_TORRENTS`, which only throttles how many
+    /// *adds* run at once (a burst of tracker/DHT work) and releases its
+    /// permit the moment the add returns. This one governs the steady state:
+    /// how many torrents are left unpaused and pulling bytes.
+    ///
+    /// The set is filled in admission order -- the title being watched always
+    /// holds a slot, and the rest go to the oldest unfinished torrents, so a
+    /// queue of episodes downloads front-to-back rather than all at once and
+    /// none of them finishing. Everything past the cap is paused, not
+    /// deleted, and takes its slot as those ahead of it complete.
+    ///
+    /// 1 reproduces the old behaviour (only the title on screen ever
+    /// downloads). Raising it trades the watched stream's share of the link
+    /// for having the next episodes ready: librqbit interleaves piece
+    /// requests across running torrents, so four downloads means the stream
+    /// on screen gets roughly a quarter of the peers' attention. 4 is the
+    /// shipped value because the common case is a series and the machine is
+    /// usually idle between episodes; drop it to 1 or 2 on a link that is
+    /// only just keeping up with playback.
+    #[arg(long, env = "MAX_ACTIVE_DOWNLOADS", default_value_t = 4)]
+    pub max_active_downloads: usize,
 
     /// Maximum peers to keep connected per torrent.
     ///
@@ -505,6 +538,44 @@ mod tests {
         assert_eq!(config.idle_pause_secs, 1800);
         assert!(config.seek_supersede, "scrub bursts otherwise keep every abandoned reader's piece-priority claim");
         assert!(config.mp4_tail_warm);
+    }
+
+    /// Retention below the download queue's width is self-defeating: the
+    /// janitor's count rule would purge the queue's own output as fast as it
+    /// arrived. The janitor spares anything still downloading, so the damage
+    /// lands the moment a title *finishes* -- which is the point at which it
+    /// was finally worth keeping.
+    #[test]
+    fn the_cache_keeps_at_least_as_many_titles_as_the_queue_downloads() {
+        let config = defaults();
+        assert!(
+            config.max_cached_torrents >= config.max_active_downloads,
+            "retention ({}) must cover the download queue ({}) or finished \
+             downloads are deleted on arrival",
+            config.max_cached_torrents,
+            config.max_active_downloads,
+        );
+    }
+
+    /// The shipped queue width. Pinned because changing it is a bandwidth
+    /// trade nobody sees directly: more downloads at once means the title on
+    /// screen gets a smaller share of the peers' attention, which surfaces as
+    /// buffering rather than as anything pointing at this number.
+    #[test]
+    fn the_download_queue_ships_four_wide() {
+        assert_eq!(defaults().max_active_downloads, 4);
+    }
+
+    /// The shipped retention policy, as asked for: ten titles inside a 100 GB
+    /// cap. Pinned as a pair because they only make sense together -- ten
+    /// titles at roughly 1.5 GB an episode is what the cap was sized for, and
+    /// lowering either one silently shortens how far back the re-watch
+    /// horizon reaches.
+    #[test]
+    fn the_cache_ships_ten_titles_inside_a_hundred_gigabytes() {
+        let config = defaults();
+        assert_eq!(config.max_cached_torrents, 10);
+        assert_eq!(config.max_cache_size_gb, 100);
     }
 
     #[test]

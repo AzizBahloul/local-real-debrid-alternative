@@ -191,19 +191,30 @@ impl CacheManager {
 
         let victims = entries.split_off(self.max_torrents);
         for entry in victims {
-            // A victim is spared only while someone is provably still reading
-            // it. `is_running` is deliberately not consulted here, unlike the
+            // A victim is spared while someone is provably still reading it,
+            // or while it is still being written.
+            //
+            // `is_running` is deliberately not consulted here, unlike the
             // size pass: a finished torrent sits unpaused ("live") forever,
             // and honouring that would exempt exactly the watched-and-done
             // backlog this rule exists to throw away. Whatever is actually
             // being watched holds an open reader or a recent request -- and is
             // the freshest entry anyway, so it is in the keep set above.
-            if self.engine.has_open_stream(&entry.info_hash)
-                || self
-                    .engine
+            //
+            // `is_downloading` is the narrower question and must be asked,
+            // because a queued download passes neither of the other two
+            // tests: it has no reader and issues no HTTP requests, since
+            // nobody is watching it yet. Without this the janitor deletes the
+            // download queue's own output every 60 seconds -- the files are
+            // half-written, so the size cap is nowhere near, and it happens
+            // silently under the retention rule instead.
+            if !may_purge(
+                self.engine.has_open_stream(&entry.info_hash),
+                self.engine.is_downloading(&entry.info_hash),
+                self.engine
                     .is_recently_active(&entry.info_hash, ACTIVE_STREAM_GRACE_PERIOD)
-                    .await
-            {
+                    .await,
+            ) {
                 entries.push(entry);
                 continue;
             }
@@ -242,6 +253,25 @@ impl CacheManager {
 
         entries
     }
+}
+
+/// Whether a torrent that fell beyond the retention count may actually be
+/// deleted. Pure, so the three exemptions can be tested without a live engine.
+///
+/// Each one covers a case the others miss:
+///
+/// * **an open stream** is a response body reading those bytes right now.
+/// * **still downloading** is the queue's own output. This one has no reader
+///   and no recent request -- nobody is watching it yet, which is the entire
+///   point of fetching it ahead -- so without this test it looks exactly like
+///   cold backlog and gets deleted mid-write, on a cache that is nowhere near
+///   its size cap. Note this asks "downloading", not "running": a *finished*
+///   torrent sits unpaused forever, and sparing those would exempt precisely
+///   the watched-and-done backlog retention exists to reclaim.
+/// * **recent activity** covers the gap between a client's last range request
+///   and its next one, where there is no connection at all.
+fn may_purge(has_open_stream: bool, is_downloading: bool, recently_active: bool) -> bool {
+    !(has_open_stream || is_downloading || recently_active)
 }
 
 /// Lists top-level `downloads_dir/<info_hash>/` directories. Anything not
@@ -395,6 +425,38 @@ mod tests {
         );
 
         tokio::fs::remove_dir_all(&tmp).await.unwrap();
+    }
+
+    /// The regression the download queue would otherwise introduce.
+    ///
+    /// Retention orders by recency and purges everything past the count. A
+    /// torrent the queue is still fetching is not recent by either of the
+    /// other two measures -- no reader, no HTTP request, because nobody is
+    /// watching it yet -- so it sorts to the bottom and gets deleted on the
+    /// next janitor pass, sixty seconds after it started, with the cache
+    /// nowhere near its size cap.
+    #[test]
+    fn retention_never_deletes_a_download_still_in_progress() {
+        assert!(
+            !may_purge(false, true, false),
+            "a torrent still being written must survive the retention sweep"
+        );
+    }
+
+    #[test]
+    fn retention_reclaims_a_finished_torrent_nobody_is_reading() {
+        // The whole point of the count rule: a watched-and-done episode is
+        // exactly what it exists to throw away. A finished torrent is left
+        // unpaused ("live") by librqbit forever, so this is the case that
+        // breaks if the exemption above is ever widened from "downloading" to
+        // "running".
+        assert!(may_purge(false, false, false));
+    }
+
+    #[test]
+    fn retention_spares_whatever_is_being_read_or_was_just_read() {
+        assert!(!may_purge(true, false, false), "a live reader");
+        assert!(!may_purge(false, false, true), "between range requests");
     }
 
     #[tokio::test]

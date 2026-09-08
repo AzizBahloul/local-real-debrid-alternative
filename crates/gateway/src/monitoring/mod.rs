@@ -123,6 +123,53 @@ pub async fn export_audit_log(
     Ok(out)
 }
 
+#[derive(Serialize)]
+pub struct TorrentActionResponse {
+    info_hash: String,
+    action: String,
+    /// False when the session holds no such torrent — the caller's view of the
+    /// swarm list was stale, which is worth saying rather than reporting a
+    /// success that changed nothing.
+    applied: bool,
+}
+
+/// `POST /torrents/{info_hash}/{action}` — pause, resume or delete one title.
+///
+/// **Loopback only**, for the same reason as `clear_cache`: `delete` destroys
+/// data and the gateway has no authentication, so this must not be reachable
+/// from the WiFi the phone is on. The desktop app runs on this machine.
+///
+/// Deliberately one route rather than three: the three actions share their
+/// guard, their argument and their response, and splitting them only spreads
+/// that agreement across three places to keep in step.
+pub async fn torrent_action(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    axum::extract::Path((info_hash, action)): axum::extract::Path<(String, String)>,
+) -> Result<Json<TorrentActionResponse>, StatusCode> {
+    if !addr.ip().is_loopback() {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let info_hash = info_hash.to_ascii_lowercase();
+
+    let applied = match action.as_str() {
+        "pause" => state.engine.hold_paused(&info_hash).await,
+        "resume" => state.engine.release_hold(&info_hash).await,
+        // Deletes the torrent *and* its files, which is what "delete the
+        // cache for this one" means to whoever pressed it -- pausing already
+        // covers "stop, but keep what you have".
+        "delete" => state.engine.discard_cached(&info_hash).await,
+        _ => return Err(StatusCode::BAD_REQUEST),
+    }
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(TorrentActionResponse {
+        info_hash,
+        action,
+        applied,
+    }))
+}
+
 fn self_process_usage() -> (u64, f32) {
     let pid = Pid::from_u32(std::process::id());
     let mut sys = System::new();
@@ -132,22 +179,55 @@ fn self_process_usage() -> (u64, f32) {
         .unwrap_or((0, 0.0))
 }
 
+/// How recently a client must have asked for something to be described as
+/// streaming rather than merely remembered.
+///
+/// The activity map is keyed by torrent and is never cleared while the
+/// torrent lives, which is right for the cache janitor -- it wants the last
+/// time anything touched those bytes, however long ago. It is wrong for a
+/// status block: it listed a phone that stopped watching two hours earlier
+/// under "Connected clients", which reads as a live viewer and is the exact
+/// thing someone consults this block to find out.
+const ACTIVE_CLIENT_WINDOW: Duration = Duration::from_secs(300);
+
 /// Spawns the periodic terminal status printer (the "Gateway Status" block).
 /// Purely informational -- a failure here must never affect streaming.
 pub fn spawn_terminal_monitor(state: AppState, interval: Duration) {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
+        // Fingerprint of the last block printed, so an unchanged one is not
+        // printed again. See `print_status`.
+        let mut last = String::new();
         loop {
             ticker.tick().await;
-            print_status(&state).await;
+            print_status(&state, &mut last).await;
         }
     });
 }
 
-async fn print_status(state: &AppState) {
+/// Prints the status block, but only when something in it actually moved.
+///
+/// In always-on mode this goes to the journal, and at the default five-second
+/// interval an idle gateway wrote a seventeen-line block twelve times a
+/// minute forever. The cost is not the disk, it is that every real event --
+/// an eviction, a failed start, the shutdown -- ends up buried under
+/// thousands of identical blocks, so the log cannot be read at the moment it
+/// is actually needed.
+///
+/// The fingerprint deliberately covers `progress_bytes` and peer counts, so
+/// this stays fully verbose while anything is downloading (those change every
+/// tick) and goes quiet only when the gateway is genuinely doing nothing.
+async fn print_status(state: &AppState, last: &mut String) {
     let torrents = state.engine.list_active();
     let recent = state.engine.recent_streams().await;
     let cache_usage = state.cache.usage_bytes().await;
+
+    let fingerprint = status_fingerprint(&torrents, &recent, cache_usage);
+    if fingerprint == *last {
+        return;
+    }
+    *last = fingerprint;
+
     let (mem_bytes, cpu) = self_process_usage();
 
     println!("\n----- Gateway Status --------------------------------------");
@@ -171,15 +251,61 @@ async fn print_status(state: &AppState) {
         }
     }
 
-    if recent.is_empty() {
-        println!("  Connected clients: none");
+    let window = ACTIVE_CLIENT_WINDOW.as_secs();
+    let (active, past): (Vec<_>, Vec<_>) =
+        recent.iter().partition(|(_, _, secs_ago)| *secs_ago <= window);
+
+    if active.is_empty() {
+        println!("  Streaming now: none");
     } else {
-        println!("  Connected clients:");
-        for (hash, ip, secs_ago) in &recent {
+        println!("  Streaming now:");
+        for (hash, ip, secs_ago) in &active {
             println!("    {ip}  streaming {hash}  (last request {secs_ago}s ago)");
         }
     }
+    // Kept, but under a heading that does not claim they are watching. These
+    // are what the cache janitor is ordering its retention by, so seeing them
+    // explains an eviction; calling them connected explains nothing.
+    if !past.is_empty() {
+        println!("  Seen earlier:");
+        for (hash, ip, secs_ago) in &past {
+            println!("    {ip}  last read {hash}  ({}m ago)", secs_ago / 60);
+        }
+    }
     println!("-------------------------------------------------------------");
+}
+
+/// What has to change before the block is worth printing again.
+///
+/// Speeds are excluded on purpose: they jitter by a few hundred bytes on an
+/// otherwise idle torrent, which would defeat the whole suppression. Progress
+/// and peer count cover everything that is actually happening.
+fn status_fingerprint(
+    torrents: &[ActiveTorrentSummary],
+    recent: &[(String, std::net::IpAddr, u64)],
+    cache_usage: u64,
+) -> String {
+    let mut out = format!("{cache_usage}|");
+    for t in torrents {
+        out.push_str(&format!(
+            "{}:{}:{}:{};",
+            t.info_hash, t.state, t.progress_bytes, t.peers
+        ));
+    }
+    out.push('|');
+    for (_, ip, secs_ago) in recent {
+        // Bucketed, so the seconds-ago counter ticking up on an idle client
+        // does not by itself count as news.
+        out.push_str(&format!(
+            "{ip}:{};",
+            if *secs_ago <= ACTIVE_CLIENT_WINDOW.as_secs() {
+                "active"
+            } else {
+                "past"
+            }
+        ));
+    }
+    out
 }
 
 fn human_bytes(bytes: u64) -> String {

@@ -45,6 +45,13 @@ pub enum TrayEvent {
     Stop,
     /// Leave the tray entirely. The gateway service keeps running.
     Quit,
+    /// Stop the gateway *and* leave the tray -- the actual off switch.
+    ///
+    /// Distinct from `Quit` because always-on mode makes them different
+    /// things, and this is the one someone means by "exit": with the window
+    /// gone and the service surviving reboots, `Quit` alone leaves a gateway
+    /// running with nothing on screen that admits it.
+    Exit,
 }
 
 /// The icon, converted once from the same PNG the window uses.
@@ -168,13 +175,26 @@ impl ksni::Tray for NovaTray {
                 // whole point of the service is that this menu entry is not
                 // the off switch for the stream someone is watching.
                 label: if self.status.active {
-                    "Quit tray (gateway keeps running)".into()
+                    "Hide tray (gateway keeps running)".into()
                 } else {
-                    "Quit tray".to_string()
+                    "Hide tray".to_string()
                 },
-                icon_name: "application-exit".into(),
                 activate: Box::new(|this: &mut Self| {
                     let _ = this.tx.send(TrayEvent::Quit);
+                }),
+                ..Default::default()
+            }
+            .into(),
+        );
+        items.push(
+            StandardItem {
+                // The one entry that ends everything, named so it reads as
+                // such next to the hide-only one above. This is the off
+                // switch now that the window no longer offers one.
+                label: "Exit NovaStream (stops the gateway)".into(),
+                icon_name: "application-exit".into(),
+                activate: Box::new(|this: &mut Self| {
+                    let _ = this.tx.send(TrayEvent::Exit);
                 }),
                 ..Default::default()
             }
@@ -311,6 +331,16 @@ pub fn run_tray_daemon(exe: PathBuf) -> i32 {
                 return 0;
             }
             Ok(TrayEvent::Quit) => {
+                let _ = std::fs::remove_file(pid_file());
+                return 0;
+            }
+            Ok(TrayEvent::Exit) => {
+                // Stop first, then drop the icon: if the stop fails, the tray
+                // is still there to say so and to try again, rather than
+                // vanishing while the gateway carries on.
+                if let Err(e) = service::stop() {
+                    eprintln!("{e:#}");
+                }
                 let _ = std::fs::remove_file(pid_file());
                 return 0;
             }

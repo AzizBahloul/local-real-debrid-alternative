@@ -187,13 +187,20 @@ impl MatrixRain {
     }
 }
 
-/// Scanlines + a slow refresh sweep + vignette + mains flicker, painted over
-/// the finished frame.
+/// Scanlines + vignette, painted over the finished frame.
 ///
 /// Order matters: this goes in a foreground layer so it sits on top of *every*
 /// widget. Half-applied (behind the panels) it just looks like a dirty
 /// background; over the top it reads as glass.
-pub fn crt_overlay(ctx: &egui::Context, rect: Rect, time: f64) {
+///
+/// There used to be a third element here: a soft green band travelling down
+/// the screen every seven seconds, imitating how a phone camera catches a CRT
+/// mid-refresh. It is gone by request. On a real tube the sweep is a artifact
+/// of the *camera*, not something an eye sees, so on a desktop it reads as a
+/// glitch crawling over the text rather than as period detail -- and it did it
+/// over the log panel, where the text is the thing you are trying to read.
+/// Scanlines and vignette carry the look on their own without moving.
+pub fn crt_overlay(ctx: &egui::Context, rect: Rect) {
     let painter = ctx.layer_painter(egui::LayerId::new(
         egui::Order::Foreground,
         egui::Id::new("crt_overlay"),
@@ -209,34 +216,6 @@ pub fn crt_overlay(ctx: &egui::Context, rect: Rect, time: f64) {
             line,
         );
         y += CELL;
-    }
-
-    // The refresh sweep: a soft bright band travelling down the tube every
-    // few seconds, the way a phone camera catches a CRT mid-refresh.
-    let period = 7.0;
-    let sweep_y = rect.top() + ((time % period) / period) as f32 * rect.height();
-    let band = 44.0;
-    let steps = 10;
-    for step in 0..steps {
-        let t = step as f32 / steps as f32;
-        let alpha = ((1.0 - t) * 9.0) as u8;
-        if alpha == 0 {
-            continue;
-        }
-        let offset = t * band;
-        painter.rect_filled(
-            Rect::from_min_max(
-                egui::pos2(rect.left(), sweep_y + offset),
-                egui::pos2(rect.right(), sweep_y + offset + band / steps as f32 + 1.0),
-            ),
-            Rounding::ZERO,
-            Color32::from_rgba_unmultiplied(
-                theme::PHOSPHOR.r(),
-                theme::PHOSPHOR.g(),
-                theme::PHOSPHOR.b(),
-                alpha,
-            ),
-        );
     }
 
     vignette(&painter, rect);

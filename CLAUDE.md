@@ -89,12 +89,54 @@ build/test/lint. Run build+test+clippy before calling any change done.
   version swept everything on every switch and wiped queued titles; see the
   `action_for_abandoned` doc-comment before changing this. Separately, the
   cache janitor *does* sweep the backlog on purpose: `MAX_CACHED_TORRENTS`
-  (default 2) keeps only the most recently used torrents and purges the rest,
+  (default 10) keeps only the most recently used torrents and purges the rest,
   even under the size cap — that's the requested retention policy, not the old
   bug coming back. See "Retention is a count" in README's Design decisions.
+- **`MAX_CACHED_TORRENTS` must stay ≥ `MAX_ACTIVE_DOWNLOADS`, and retention
+  must keep sparing torrents that are still downloading.** The download queue
+  (`torrent::download_slots`, default 4 wide, ordered by librqbit's
+  incrementing `TorrentId`) deliberately runs titles nobody is watching yet —
+  so a queued download has no open reader and no recent HTTP request, which is
+  exactly the shape the janitor's retention rule treats as cold backlog. The
+  `is_downloading` exemption in `cache::may_purge` is the only thing standing
+  between the queue and the janitor deleting its output mid-write, on a cache
+  nowhere near its size cap. `cache::tests::retention_never_deletes_a_download_
+  still_in_progress` and `config::tests::the_cache_keeps_at_least_as_many_
+  titles_as_the_queue_downloads` pin both halves. Note `is_downloading` is
+  narrower than `is_running` on purpose: a *finished* torrent sits unpaused
+  forever, so sparing everything running would exempt the watched-and-done
+  backlog retention exists to reclaim.
 - **A live reader blocks the idle reaper regardless of recency** — players
   buffer ahead and go quiet, and librqbit's reader has no timeout of its own,
   so treating "quiet" as "idle" freezes an actively-watched stream.
+- **`torrent::MetadataArchive` is why replaying an old title works at all, and
+  it must stay in its own subdirectory.** librqbit writes `<hash>.torrent` into
+  the session dir and *deletes it with the torrent*, so once the janitor
+  reclaims a title every trace of its metadata is gone and the next play falls
+  back to resolving the magnet from the swarm — a DHT-only lookup (257 of 263
+  advertised hashes carry no trackers) against a release whose seeders have
+  moved on. That times out at `ADD_TORRENT_TIMEOUT`, the torrent never enters
+  the session, and the visible symptom is the gateway not reacting to pressing
+  play at all, with the 45s `START_FAILURE_COOLDOWN` then instant-500ing every
+  retry so nothing ever appears in the swarm list. The archive is written on
+  resolve, on a successful start, and for everything restored at startup
+  (`archive_session_metadata`). Do not "tidy" it into the session directory.
+- **A hand pause is not librqbit's paused flag.** `TorrentEngine::held` is a
+  separate set, because the download queue's timer resumes anything inside
+  `download_slots` about a second later — a pause that only called
+  `api_torrent_action_pause` would visibly undo itself. `download_slots`
+  excludes held hashes (so the hold hands its slot to the next title rather
+  than wasting it), `enforce_download_slots` skips them in both directions,
+  and `start_file`/`forget_activity` clear the hold. `/health` reports it as
+  `held` so the GUI only offers Resume for a pause the viewer can actually
+  undo — offering it for a queue-parked torrent promises something the queue
+  immediately reverses.
+- **Always-on has no off switch in the window, by design.** `ensure_always_on`
+  installs the unit and the login tray icon once per session; the off switch is
+  the tray's "Exit NovaStream", and `--disable-always-on` remains the headless
+  escape hatch. Re-adding a disable button in `service_panel` puts back the
+  failure mode where the addon silently stops answering the phone because
+  someone toggled it.
 - The GUI has no persistent log file — logs only exist in the GUI's in-memory
   Log panel and the server's stdout (piped, not written to disk). Use
   `GET /health` on the running port for a live sanity check instead of

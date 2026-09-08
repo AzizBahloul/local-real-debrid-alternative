@@ -406,7 +406,8 @@ Everything has a sensible default. Change these only if you need to:
 | `TLS_CERT_FILE` | — | Use your own certificate instead of the published one |
 | `CACHE_DIRECTORY` | `./cache` | Where movies are stored. **Relative to wherever the app was launched from** — check the GUI's "Cache directory" line for the real path |
 | `MAX_CACHE_SIZE_GB` | `100` | Disk limit before old movies are deleted |
-| `MAX_CACHED_TORRENTS` | `2` | Keep only this many movies, newest first, even under the size cap |
+| `MAX_CACHED_TORRENTS` | `10` | Keep only this many movies, newest first, even under the size cap. Keep it at or above `MAX_ACTIVE_DOWNLOADS` |
+| `MAX_ACTIVE_DOWNLOADS` | `4` | How many titles download at once, oldest request first. `1` restores "only what you are watching" |
 | `IDLE_PAUSE_SECS` | `1800` | Pause a movie you stopped watching, to free bandwidth |
 | `PREBUFFER_BYTES` | `1 MB` | Data to gather before playback starts |
 | `PREBUFFER_TIMEOUT_SECS` | `15` | Give up gathering it after this long. If nothing at all arrived, the player is asked to retry rather than handed an empty stream |
@@ -643,15 +644,45 @@ setup.sh   Dockerfile
   which both looked absurd and made the janitor evict torrents to get under a
   cap it was nowhere near.
 - **Retention is a count, and the size cap is only the backstop.** The janitor
-  keeps the `MAX_CACHED_TORRENTS` most recently used torrents (default 2: the
-  title being watched plus the one before it) and purges the rest — session
-  entry and data together — even with the cache far under its size limit.
-  "Most recently used" prefers the engine's own last-request record over
-  directory mtime, because writing pieces touches files inside the directory,
-  not the directory itself. A victim is spared only while a reader is open or
-  a request landed within the grace window; being unpaused is deliberately not
-  enough, since finished torrents sit "live" forever and would otherwise be
-  exactly the backlog the rule can never remove.
+  keeps the `MAX_CACHED_TORRENTS` most recently used torrents (default 10 —
+  roughly a season inside the 100 GB cap, and well clear of the download queue
+  below) and purges the rest — session entry and data
+  together — even with the cache far under its size limit. "Most recently
+  used" prefers the engine's own last-request record over directory mtime,
+  because writing pieces touches files inside the directory, not the directory
+  itself. A victim is spared while a reader is open, while a request landed
+  within the grace window, **or while it is still downloading**; being merely
+  unpaused is deliberately not enough, since finished torrents sit "live"
+  forever and would otherwise be exactly the backlog the rule can never
+  remove. That third exemption is what the download queue needs: a queued
+  title has no reader and issues no requests — nobody is watching it yet — so
+  without it retention deletes the queue's own output sixty seconds after it
+  starts, on a cache nowhere near its cap.
+- **Four titles download at once, in the order they were asked for.** Only the
+  title on screen used to download; everything else was paused the moment the
+  viewer switched, so the next episode always paid a full cold start. The
+  gateway now keeps `MAX_ACTIVE_DOWNLOADS` (default 4) unpaused: anything
+  being read, then the focused title, then the oldest unfinished torrents.
+  Order matters more than it looks — admitting an arbitrary four leaves every
+  episode part-downloaded and none of them watchable, while taking the oldest
+  four finishes them front-to-back. The ordering is librqbit's own
+  incrementing `TorrentId`, so it *is* the request order with no second
+  bookkeeping to drift. Everything past the cap is paused, not deleted, and
+  takes a slot as those ahead of it finish; a timer re-checks, because a
+  download completing is not an event this process otherwise sees. The trade
+  is real: librqbit interleaves piece requests across running torrents, so
+  four downloads means the stream on screen gets roughly a quarter of the
+  peers' attention. Set `MAX_ACTIVE_DOWNLOADS=1` on a link that is only just
+  keeping up with playback.
+- **The status block prints only when something changed.** In always-on mode
+  it goes to the journal, and at the default five-second interval an idle
+  gateway wrote a seventeen-line block twelve times a minute forever — burying
+  every eviction, failed start and shutdown under thousands of identical
+  blocks. The change fingerprint covers download progress and peer counts, so
+  it stays fully verbose while anything is happening and goes quiet only when
+  the gateway genuinely is. The client list also no longer calls a phone that
+  stopped watching two hours ago a connected client: those move to "Seen
+  earlier", which is what the janitor is ordering its retention by.
 - **Responses are withheld until data exists.** Players treat "headers, then a
   stalled body" as a broken stream, but wait patiently on a slow request.
 - **The top stream is fetched while you are still reading the list.** Pulling a

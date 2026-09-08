@@ -83,6 +83,12 @@ pub fn build_router(state: AppState) -> Router {
         .route(HEALTH_PATH, get(monitoring::health))
         // Loopback-only; see the handler. The desktop app's "clear" button.
         .route("/cache/clear", post(monitoring::clear_cache))
+        // Loopback-only; see the handler. The desktop app's per-title
+        // pause/resume/delete buttons.
+        .route(
+            "/torrents/{info_hash}/{action}",
+            post(monitoring::torrent_action),
+        )
         // Loopback-only; see the handler. The desktop app's "export logs".
         .route("/audit/export", get(monitoring::export_audit_log))
         // Records every request with its time-to-first-byte. Added here, so it
@@ -225,6 +231,15 @@ pub async fn run() -> anyhow::Result<()> {
         Arc::clone(&engine),
     );
     cache.spawn_janitor(Duration::from_secs(config.cleanup_interval_secs));
+
+    // Unconditional, unlike the idle reaper below: this is what hands a
+    // finished download's slot to the next title in the queue, and a viewer
+    // who turned idle pausing off still wants their episodes to arrive.
+    engine.spawn_download_queue(Duration::from_secs(config.idle_check_interval_secs.max(1)));
+    info!(
+        max_active_downloads = config.max_active_downloads,
+        "downloading titles in request order, this many at a time"
+    );
 
     if config.idle_pause_secs > 0 {
         engine.spawn_idle_reaper(

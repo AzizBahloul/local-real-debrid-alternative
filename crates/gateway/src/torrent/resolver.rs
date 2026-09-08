@@ -107,6 +107,15 @@ impl TorrentSource for MagnetSource {
     }
 }
 
+/// Whether a string is shaped like a v1 BitTorrent info hash: 40 hex digits.
+///
+/// Public because callers outside this module use it as a guard before letting
+/// caller-supplied text reach a filename or a session lookup, and the shape of
+/// an info hash belongs here with the rest of the parsing.
+pub fn is_hex40(value: &str) -> bool {
+    value.len() == 40 && value.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 /// Accepts either a full `magnet:?xt=urn:btih:...` URI or a bare 40-char hex
 /// (or 32-char base32) BitTorrent info hash, and returns a magnet URI.
 pub fn normalize_to_magnet(input: &str) -> Result<String> {
@@ -125,7 +134,7 @@ pub fn normalize_to_magnet(input: &str) -> Result<String> {
         return Ok(trimmed.to_string());
     }
 
-    let is_hex40 = trimmed.len() == 40 && trimmed.bytes().all(|b| b.is_ascii_hexdigit());
+    let is_hex40 = is_hex40(trimmed);
     let is_base32_32 = trimmed.len() == 32
         && trimmed
             .bytes()
