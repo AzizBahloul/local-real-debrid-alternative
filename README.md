@@ -394,6 +394,169 @@ curl -s http://127.0.0.1:8080/health | grep -o '"version":"[^"]*"'
 
 ---
 
+<div align="center">
+
+# 📦 Release history
+
+<img alt="Latest" src="https://img.shields.io/badge/latest-v1.2.0-2ea043?style=for-the-badge">
+<img alt="Tests" src="https://img.shields.io/badge/tests-175_passing-2ea043?style=for-the-badge">
+<img alt="Clippy" src="https://img.shields.io/badge/clippy-clean-2ea043?style=for-the-badge">
+
+</div>
+
+Every release below names **the symptom that was reported**, not the diff. If
+you are here because something is broken, read the symptoms — one of them is
+probably yours, and the fix may already be a version away.
+
+<table>
+<tr>
+<td width="120" align="center"><h3>🟢<br>v1.2.0</h3><sub><b>current</b></sub></td>
+<td>
+
+### The phone loads forever on a movie that is already downloaded
+
+**Symptom** — Stremio on Android sits on `00:00 / 00:00` and spins, on a title
+100% present in the cache. The same file plays instantly on the PC. `/health`
+looks perfect: torrent live, cache warm, no errors anywhere.
+
+**Cause** — `Range: bytes=-65536` ("send the last 64 KB") never parsed. The
+spec splits into `("", "65536")`, `"".parse::<u64>()` fails, and the whole
+header was discarded — which is *indistinguishable from no `Range` header at
+all*, so the gateway answered `200` and began streaming all 1.9 GB from byte 0.
+An MKV keeps its Cues/SeekHead index at the **end** of the file, and Android
+players read that tail before they can report a duration or draw a frame. They
+were handed the head of a multi-gigabyte stream and waited for an index that
+would arrive last.
+
+It could not be reproduced with `curl` using ordinary ranges — which is exactly
+why the server kept measuring healthy at 830 MB/s while the phone hung.
+`TAIL_PROBE_ZONE` already existed downstream to serve this read cheaply; it had
+been unreachable dead code the whole time.
+
+### The addon URL goes stale after the PC sleeps
+
+**Symptom** — works all day with the window open; leave it in the tray
+overnight and Stremio can no longer reach the addon until the app is quit and
+relaunched.
+
+**Cause** — `local_ip_address::local_ip()` enumerates interfaces and returned a
+**dead libvirt bridge** (`virbr0`, `192.168.122.1`) instead of the real Wi-Fi
+address. Interface order is not a routing decision. `detect_lan_ip()` now asks
+the kernel's routing table (the same lookup `ip route get` performs), which no
+inactive bridge can win.
+
+A genuine IP change now restarts the gateway to rebind — but only after the new
+address is confirmed on **two consecutive checks** a minute apart, and **never
+while a stream is open**, so a one-tick flap can't cut off someone mid-episode.
+
+### Also in 1.2.0
+
+- TLS certificate refresh retries with **exponential backoff** instead of
+  waiting a full day for the next tick, so a cert that failed during a network
+  blip recovers in minutes rather than silently expiring into "Stremio won't
+  load the addon".
+- `enable_linger`'s failure is no longer swallowed during install — a
+  half-configured always-on setup now says so instead of dying unexplained days
+  later.
+
+</td>
+</tr>
+
+<tr>
+<td width="120" align="center"><h3>🔵<br>v1.1.0</h3></td>
+<td>
+
+### Pressing play on an old title did nothing at all
+
+**Symptom** — after a long gap, tapping play produced no download, nothing in
+the swarm list, and no error. Only restarting the app appeared to help.
+
+**Cause** — replaying a title watched a day earlier has to re-add its torrent,
+and by then everything that made the first play fast is gone: the janitor
+reclaimed the files, librqbit deletes its own `<hash>.torrent` alongside the
+torrent, and the metadata cache was memory-only. The add fell back to resolving
+the magnet from the swarm — and **257 of 263 advertised hashes carry no
+trackers**, making it a DHT-only lookup against a release whose seeders had
+moved on. It timed out at 25 s, the torrent never entered the session, and the
+45 s start-failure cooldown then instant-500'd every retry: four full searches
+and several hundred 500s in five minutes, with nothing on screen ever admitting
+a torrent had been asked for.
+
+**Fix** — `MetadataArchive` keeps the assembled `.torrent` blob in its own
+directory, written on resolve, on a successful start, and for everything
+restored at startup. That blob *is* the answer the swarm lookup was for, so
+`AddTorrent::from_bytes` needs no peers — finding seeders becomes a background
+concern rather than a precondition for reacting to the tap.
+
+### Also in 1.1.0
+
+- Retention raised to **ten titles** inside the 100 GB cap (was four) — roughly
+  a season at 1.5 GB an episode.
+- **Per-title pause / resume / delete** on each swarm row. A hand pause is
+  tracked separately from librqbit's paused flag, because the download queue's
+  timer would otherwise resume it a second later.
+- **Always-on installs itself** and lost its in-window off switch; the off
+  switch is the tray's "Exit NovaStream".
+
+</td>
+</tr>
+
+<tr>
+<td width="120" align="center"><h3>🟣<br>v1.0.1</h3></td>
+<td>
+
+### Effectively Ubuntu-only, for no reason
+
+**Symptom** — `setup.sh` dispatched on `apt`/`dpkg` and installed 15
+Debian-named `-dev` packages. On anything else it simply didn't work.
+
+**Cause** — none of those packages were ever needed. Measured rather than
+assumed: `ldd` on both release binaries reports only `libc`, `libm` and
+`libgcc_s`. winit and glutin `dlopen` X11/Wayland/xkbcommon/GL at **runtime**,
+there is no GTK in the tree at all (the tray is `ksni`, pure-Rust D-Bus), and
+`aws-lc-sys` builds with the `cc` crate — a full rebuild with `cmake`, `perl`,
+`pkg-config`, `nasm` and `go` all stubbed to exit 127 succeeds.
+
+**Fix** — `setup.sh` now dispatches on the **package manager, never the
+os-release ID**. There are six managers and hundreds of distro IDs, so
+Mint/Pop!\_OS/Zorin fall out of `apt` for free, Nobara out of `dnf`,
+EndeavourOS/Garuda/CachyOS out of `pacman`. Adds `.rpm` and Arch `PKGBUILD`
+manifests plus a `/usr/local` fallback, and opens **firewalld** as well as
+`ufw` — the likeliest reason a Fedora gateway was unreachable from a phone.
+
+</td>
+</tr>
+
+<tr>
+<td width="120" align="center"><h3>⚪<br>v1.0.0</h3></td>
+<td>
+
+### First stable release
+
+The start path was measured against a real swarm rather than argued about, the
+two defects that measurement found were fixed, and the result ran as an
+installed service without incident. That is what the version number claims —
+nothing more.
+
+Documentation corrections shipped alongside, all of them things that were
+**wrong**, not prose polish:
+
+- Five settings defaults had drifted from the code — `MAX_CACHE_SIZE_GB`
+  (20 → 100), `PREBUFFER_BYTES` (4 MB → 1 MB), `IDLE_PAUSE_SECS` (300 → 1800),
+  `BROWSE_PREFETCH_COUNT` (1 → 0), `MAX_UPLOAD_MB_S` (0 → 2). *A default nobody
+  has checked is worse than no default documented, because it gets quoted back
+  as fact.*
+- The speed knobs were undocumented entirely, including the one that most
+  changes how this feels: `READAHEAD_EXTRA_MB`. Each now says when **not** to
+  use it.
+- The test count said 67; it was 149.
+
+</td>
+</tr>
+</table>
+
+---
+
 ## Settings
 
 Everything has a sensible default. Change these only if you need to:
@@ -740,7 +903,7 @@ setup.sh   Dockerfile
 
 ```bash
 cargo build --release              # both crates
-cargo test --release               # 154 tests
+cargo test --release               # 175 tests
 cargo clippy --release --all-targets -- -D warnings
 cargo deb -p streaming-gateway-gui                   # .deb package
 cargo generate-rpm -p crates/gateway-gui -o out.rpm  # .rpm package (build first)
