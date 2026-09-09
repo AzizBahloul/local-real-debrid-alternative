@@ -214,7 +214,7 @@ pub async fn stream_video(
     let range = headers
         .get(header::RANGE)
         .and_then(|v| v.to_str().ok())
-        .and_then(parse_range_header);
+        .and_then(|v| parse_range_header(v, file_len));
 
     let (start, end) = match range {
         Some((start, end)) => {
@@ -757,9 +757,34 @@ pub fn validate_info_hash(value: &str) -> Result<(), String> {
 /// requests (`bytes=0-10,20-30`) are not supported (no player used in
 /// practice sends them for video) and fall back to a full-content response,
 /// same as the header being absent.
-fn parse_range_header(value: &str) -> Option<(u64, Option<u64>)> {
-    let spec = value.strip_prefix("bytes=")?;
+///
+/// Handles the RFC 7233 *suffix* form `bytes=-N` ("the last N bytes"), which
+/// needs `file_len` to resolve into an absolute offset. That form is not
+/// exotic: an MKV stores its Cues/SeekHead index at the *end* of the file, so
+/// Android players routinely ask for the tail first to learn the duration
+/// before playing a frame. Failing to parse it here did not produce an error
+/// -- it looked identical to a request with no `Range` header at all, so the
+/// gateway answered `200` and began streaming the whole file from byte 0. The
+/// player then waited forever for an index that would only arrive gigabytes
+/// later, which is exactly the "spins on 00:00 / 00:00 and never plays"
+/// symptom. `TAIL_PROBE_ZONE` downstream exists to serve this read cheaply and
+/// was unreachable while this returned `None`.
+fn parse_range_header(value: &str, file_len: u64) -> Option<(u64, Option<u64>)> {
+    let spec = value.strip_prefix("bytes=")?.trim();
     let (start, end) = spec.split_once('-')?;
+    let (start, end) = (start.trim(), end.trim());
+
+    if start.is_empty() {
+        // Suffix form: `bytes=-N` is the last N bytes, always running to EOF.
+        // A zero-length suffix is unsatisfiable rather than "the whole file",
+        // and N larger than the file legitimately means the entire file.
+        let n = end.parse::<u64>().ok()?;
+        if n == 0 {
+            return None;
+        }
+        return Some((file_len.saturating_sub(n), None));
+    }
+
     let start = start.parse::<u64>().ok()?;
     let end = if end.is_empty() {
         None
@@ -789,20 +814,60 @@ mod tests {
         // 41 chars
     }
 
+    const TEST_LEN: u64 = 1_000_000;
+
     #[test]
     fn parses_open_ended_range() {
-        assert_eq!(parse_range_header("bytes=100-"), Some((100, None)));
+        assert_eq!(parse_range_header("bytes=100-", TEST_LEN), Some((100, None)));
     }
 
     #[test]
     fn parses_closed_range_as_exclusive_end() {
-        assert_eq!(parse_range_header("bytes=0-99"), Some((0, Some(100))));
+        assert_eq!(
+            parse_range_header("bytes=0-99", TEST_LEN),
+            Some((0, Some(100)))
+        );
     }
 
     #[test]
     fn rejects_malformed_range_headers() {
-        assert_eq!(parse_range_header("nonsense"), None);
-        assert_eq!(parse_range_header("bytes=abc-def"), None);
+        assert_eq!(parse_range_header("nonsense", TEST_LEN), None);
+        assert_eq!(parse_range_header("bytes=abc-def", TEST_LEN), None);
+    }
+
+    /// The regression that made Android sit on `00:00 / 00:00` forever.
+    ///
+    /// An MKV keeps its Cues index at the end, so a player asks for the tail
+    /// before it can report a duration. This form used to fail to parse, which
+    /// was indistinguishable from "no Range header" -- the gateway answered
+    /// `200` with the whole file from byte 0 and the player waited on an index
+    /// that was gigabytes away. It must resolve to an absolute offset running
+    /// to EOF, so the response is a `206` covering only the tail.
+    #[test]
+    fn parses_suffix_range_as_the_last_n_bytes() {
+        assert_eq!(
+            parse_range_header("bytes=-65536", TEST_LEN),
+            Some((TEST_LEN - 65536, None))
+        );
+    }
+
+    /// A suffix larger than the file is not an error -- RFC 7233 says it means
+    /// the whole file. Clamping to 0 rather than underflowing is what keeps it
+    /// from becoming a wild offset near u64::MAX.
+    #[test]
+    fn a_suffix_longer_than_the_file_starts_at_zero() {
+        assert_eq!(
+            parse_range_header("bytes=-99999999", TEST_LEN),
+            Some((0, None))
+        );
+    }
+
+    /// `bytes=-0` requests the last zero bytes, which is unsatisfiable. It must
+    /// not fall through to "start at the end of the file", nor be mistaken for
+    /// a request for the entire file.
+    #[test]
+    fn a_zero_length_suffix_is_rejected() {
+        assert_eq!(parse_range_header("bytes=-0", TEST_LEN), None);
     }
 
     /// A reader that yields `chunk` once and then blocks forever -- stands in
