@@ -368,7 +368,7 @@ pub fn install(binary: &Path, port: &str, cache_dir: &str) -> Result<()> {
             String::from_utf8_lossy(&start.stderr).trim()
         );
     }
-    let _ = enable_linger();
+    enable_linger()?;
     Ok(())
 }
 

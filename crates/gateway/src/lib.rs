@@ -10,7 +10,7 @@ pub mod stremio;
 pub mod tls;
 pub mod torrent;
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -21,7 +21,7 @@ use tower_http::cors::CorsLayer;
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use cache::CacheManager;
 use config::AppConfig;
@@ -318,6 +318,7 @@ pub async fn run() -> anyhow::Result<()> {
         state.clone(),
         Duration::from_secs(config.monitor_interval_secs),
     );
+    let ip_check_engine = state.engine.clone();
 
     let app = build_router(state);
 
@@ -333,6 +334,49 @@ pub async fn run() -> anyhow::Result<()> {
         spawn_https(&config, lan_ip, client_timeout, app.clone());
     }
     info!(%lan_ip, port = bound_port, "streaming gateway listening");
+
+    // DHCP can hand this machine a new address (most often after sleep/wake),
+    // which leaves the addon URL Stremio already has stale. There is no way to
+    // rebind the https hostname/cert without a fresh process, so this restarts
+    // the gateway to pick it up -- systemd's Restart=always brings it back.
+    //
+    // Two guards against doing that destructively:
+    //   - the new address must be seen on two consecutive checks a minute
+    //     apart, so a one-tick flap (a virtual bridge like virbr0 briefly
+    //     looking preferred) never fires this; and
+    //   - it never fires while a stream is actually open, so a restart never
+    //     cuts off someone mid-episode -- it waits for the next quiet check
+    //     after they stop instead.
+    let ip_check_lan_ip = lan_ip;
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(60));
+        let mut pending: Option<IpAddr> = None;
+        loop {
+            interval.tick().await;
+            let current_ip = network::detect_lan_ip();
+            if current_ip == ip_check_lan_ip {
+                pending = None;
+                continue;
+            }
+            if pending != Some(current_ip) {
+                warn!(
+                    from = %ip_check_lan_ip,
+                    to = %current_ip,
+                    "lan ip looks changed; confirming on the next check before restarting"
+                );
+                pending = Some(current_ip);
+                continue;
+            }
+            if ip_check_engine.open_stream_count() > 0 {
+                debug!(to = %current_ip, "lan ip change confirmed but a stream is open; deferring restart");
+                continue;
+            }
+            // Panic instead of process::exit so the panic hook records it in the audit log.
+            panic!(
+                "LAN IP changed from {ip_check_lan_ip} to {current_ip} -- exiting to allow systemd to restart and rebind"
+            );
+        }
+    });
 
     let started = std::time::Instant::now();
     let served = axum::serve(

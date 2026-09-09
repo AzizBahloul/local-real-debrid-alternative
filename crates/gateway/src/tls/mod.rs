@@ -207,22 +207,36 @@ pub async fn load(
 /// certificate keeps working until it genuinely expires.
 pub fn spawn_refresh(config: RustlsConfig, cert_url: String, key_url: String, cache_dir: PathBuf) {
     tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(REFRESH_INTERVAL);
-        ticker.tick().await; // the first tick fires immediately
+        tokio::time::sleep(REFRESH_INTERVAL).await;
         loop {
-            ticker.tick().await;
-            match obtain(&cert_url, &key_url, &cache_dir).await {
-                Ok(material) => {
-                    match config
-                        .reload_from_pem(material.cert_pem, material.key_pem)
-                        .await
-                    {
-                        Ok(()) => debug!("refreshed the https certificate"),
-                        Err(e) => warn!("refreshed certificate was unusable: {e}"),
+            let mut backoff = Duration::from_secs(60);
+            let max_backoff = Duration::from_secs(3600);
+            loop {
+                match obtain(&cert_url, &key_url, &cache_dir).await {
+                    Ok(material) => {
+                        match config
+                            .reload_from_pem(material.cert_pem, material.key_pem)
+                            .await
+                        {
+                            Ok(()) => {
+                                debug!("refreshed the https certificate");
+                                break; // Success, break out of retry loop
+                            }
+                            Err(e) => {
+                                warn!("refreshed certificate was unusable: {e}");
+                                tokio::time::sleep(backoff).await;
+                                backoff = (backoff * 2).min(max_backoff);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!("certificate refresh failed, retrying in {}s: {e:#}", backoff.as_secs());
+                        tokio::time::sleep(backoff).await;
+                        backoff = (backoff * 2).min(max_backoff);
                     }
                 }
-                Err(e) => warn!("certificate refresh failed, keeping the current one: {e:#}"),
             }
+            tokio::time::sleep(REFRESH_INTERVAL).await;
         }
     });
 }

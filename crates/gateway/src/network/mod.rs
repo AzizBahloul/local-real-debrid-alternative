@@ -83,8 +83,26 @@ pub fn harden_listener<S>(_listener: &S, _client_timeout: Duration) {}
 /// phones/TVs to type in). Falls back to `127.0.0.1` if it can't be determined
 /// (e.g. no active network interface), in which case only this machine can
 /// connect -- the caller should still start up rather than fail.
+///
+/// This machine also has virtual interfaces (`virbr0` from libvirt, Docker
+/// bridges) that sit `DOWN` but keep an assigned address, e.g. `192.168.122.1`.
+/// `local_ip_address::local_ip()` enumerates interfaces and returned that
+/// dead bridge address instead of the real Wi-Fi IP after one wake-from-sleep,
+/// which broke the addon URL Stremio had cached. Asking the kernel's routing
+/// table which interface it would actually use to reach the internet -- the
+/// same lookup `ip route get` performs -- is what UDP `connect()` does here;
+/// no packet is sent, it only resolves a route. That is immune to unrelated
+/// bridges sitting on the machine, because the kernel would only route
+/// through one of them if it were the real default route.
 pub fn detect_lan_ip() -> IpAddr {
-    local_ip_address::local_ip().unwrap_or_else(|_| IpAddr::from([127, 0, 0, 1]))
+    std::net::UdpSocket::bind("0.0.0.0:0")
+        .and_then(|sock| {
+            sock.connect("1.1.1.1:80")?;
+            sock.local_addr()
+        })
+        .map(|addr| addr.ip())
+        .or_else(|_| local_ip_address::local_ip())
+        .unwrap_or_else(|_| IpAddr::from([127, 0, 0, 1]))
 }
 
 /// What the banner can say about the https addon URL at the moment it prints.
