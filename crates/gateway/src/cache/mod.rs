@@ -7,12 +7,10 @@
 //! thing librqbit intentionally does *not* do on its own: enforcing a size
 //! cap by deleting old, unwatched torrents.
 
-use std::collections::HashMap;
-use std::future::Future;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::pin::Pin;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use tracing::{info, warn};
 
@@ -23,6 +21,15 @@ use crate::torrent::TorrentEngine;
 /// buffer refill could come from a viewer at any moment.
 const ACTIVE_STREAM_GRACE_PERIOD: Duration = Duration::from_secs(300);
 
+/// How long a measured cache size is reused before the disk is walked again.
+///
+/// `/health` is polled by the desktop app every couple of seconds and the
+/// terminal monitor asks too, and each ask used to walk every file of every
+/// cached torrent. A few seconds of staleness is invisible on a number that
+/// moves at download speed, and anything that changes it all at once -- a
+/// clear, a delete, a janitor pass -- refreshes it straight away.
+const USAGE_TTL: Duration = Duration::from_secs(3);
+
 pub struct CacheManager {
     downloads_dir: PathBuf,
     max_size_bytes: u64,
@@ -31,6 +38,10 @@ pub struct CacheManager {
     max_torrents: usize,
     auto_cleanup: bool,
     engine: Arc<TorrentEngine>,
+    /// The last measured usage and when it was taken. A tokio mutex held
+    /// across the walk, so concurrent askers share one walk rather than each
+    /// starting their own.
+    usage: tokio::sync::Mutex<Option<(Instant, u64)>>,
 }
 
 struct TorrentDirEntry {
@@ -38,6 +49,14 @@ struct TorrentDirEntry {
     info_hash: String,
     size: u64,
     modified: SystemTime,
+}
+
+/// One pass over the downloads directory.
+struct DiskScan {
+    /// Every directory shaped like a torrent this gateway created.
+    torrents: Vec<TorrentDirEntry>,
+    /// Everything under the directory, torrent-shaped or not.
+    total: u64,
 }
 
 impl CacheManager {
@@ -54,6 +73,7 @@ impl CacheManager {
             max_torrents,
             auto_cleanup,
             engine,
+            usage: tokio::sync::Mutex::new(None),
         })
     }
 
@@ -72,8 +92,24 @@ impl CacheManager {
         });
     }
 
+    /// Bytes the downloads directory occupies on disk, at most `USAGE_TTL`
+    /// old.
     pub async fn usage_bytes(&self) -> u64 {
-        dir_size(&self.downloads_dir).await.unwrap_or(0)
+        let mut usage = self.usage.lock().await;
+        if let Some((measured_at, bytes)) = *usage {
+            if measured_at.elapsed() < USAGE_TTL {
+                return bytes;
+            }
+        }
+        let bytes = scan(&self.downloads_dir).await.total;
+        *usage = Some((Instant::now(), bytes));
+        bytes
+    }
+
+    /// Forgets the measured usage, so the next ask walks the disk. For
+    /// whatever just changed it all at once.
+    pub async fn invalidate_usage(&self) {
+        *self.usage.lock().await = None;
     }
 
     pub fn max_size_bytes(&self) -> u64 {
@@ -85,18 +121,31 @@ impl CacheManager {
             return Ok(());
         }
 
-        let mut entries = list_torrent_dirs(&self.downloads_dir).await?;
-        entries = self.enforce_retention_count(entries).await;
+        let DiskScan { torrents, total } = scan(&self.downloads_dir).await;
+        // The walk just measured exactly what `usage_bytes` would.
+        *self.usage.lock().await = Some((Instant::now(), total));
+
+        // One look at the activity records for the whole pass.
+        let recently_active = self.engine.recently_active(ACTIVE_STREAM_GRACE_PERIOD);
+        let last_request = self.last_requests();
+
+        let mut entries = self
+            .enforce_retention_count(torrents, &recently_active, &last_request)
+            .await;
 
         let mut total: u64 = entries.iter().map(|e| e.size).sum();
         if total <= self.max_size_bytes {
             return Ok(());
         }
 
-        // Oldest last-modified first: a torrent nobody has touched in the
-        // longest time is the safest thing to reclaim.
-        entries.sort_by_key(|e| e.modified);
+        // Least recently used first, by the same measure retention uses: a
+        // torrent nobody has touched in the longest time is the safest thing
+        // to reclaim. Directory mtime alone misorders a re-watch of something
+        // cached days ago, since writing pieces touches the files inside the
+        // directory and not the directory itself.
+        entries.sort_by_key(|e| last_used(e, &last_request));
 
+        let mut evicted = false;
         for entry in entries {
             if total <= self.max_size_bytes {
                 break;
@@ -113,10 +162,7 @@ impl CacheManager {
             //   request and the torrent actually being registered/unpaused.
             if self.engine.has_open_stream(&entry.info_hash)
                 || self.engine.is_running(&entry.info_hash)
-                || self
-                    .engine
-                    .is_recently_active(&entry.info_hash, ACTIVE_STREAM_GRACE_PERIOD)
-                    .await
+                || recently_active.contains(&entry.info_hash)
             {
                 continue;
             }
@@ -128,6 +174,7 @@ impl CacheManager {
                         "cache: evicted unused torrent to stay under size cap"
                     );
                     total = total.saturating_sub(entry.size);
+                    evicted = true;
                 }
                 Err(e) => warn!(
                     info_hash = %entry.info_hash,
@@ -135,6 +182,9 @@ impl CacheManager {
                     "cache: failed to evict: {e}"
                 ),
             }
+        }
+        if evicted {
+            self.invalidate_usage().await;
         }
 
         if total > self.max_size_bytes {
@@ -154,6 +204,17 @@ impl CacheManager {
         Ok(())
     }
 
+    /// When each torrent last saw a request, as wall-clock time so it can be
+    /// compared with directory timestamps.
+    fn last_requests(&self) -> HashMap<String, SystemTime> {
+        let now = SystemTime::now();
+        self.engine
+            .recent_streams()
+            .into_iter()
+            .map(|(hash, _, age_secs)| (hash, now - Duration::from_secs(age_secs)))
+            .collect()
+    }
+
     /// The count rule: keep the `max_torrents` most recently used torrents,
     /// purge the rest, and return the survivors for the size pass.
     ///
@@ -163,33 +224,17 @@ impl CacheManager {
     async fn enforce_retention_count(
         &self,
         mut entries: Vec<TorrentDirEntry>,
+        recently_active: &HashSet<String>,
+        last_request: &HashMap<String, SystemTime>,
     ) -> Vec<TorrentDirEntry> {
         if self.max_torrents == 0 || entries.len() <= self.max_torrents {
             return entries;
         }
 
-        // "Most recent" prefers the engine's own last-request record over the
-        // directory mtime: writing pieces touches files inside the directory,
-        // not the directory itself, so mtime alone would misorder a re-watch
-        // of something cached days ago.
-        let now = SystemTime::now();
-        let last_request: HashMap<String, SystemTime> = self
-            .engine
-            .recent_streams()
-            .await
-            .into_iter()
-            .map(|(hash, _, age_secs)| (hash, now - Duration::from_secs(age_secs)))
-            .collect();
-        entries.sort_by_key(|e| {
-            let used = last_request
-                .get(&e.info_hash)
-                .copied()
-                .unwrap_or(e.modified)
-                .max(e.modified);
-            std::cmp::Reverse(used)
-        });
+        entries.sort_by_key(|e| std::cmp::Reverse(last_used(e, last_request)));
 
         let victims = entries.split_off(self.max_torrents);
+        let mut purged = false;
         for entry in victims {
             // A victim is spared while someone is provably still reading it,
             // or while it is still being written.
@@ -211,9 +256,7 @@ impl CacheManager {
             if !may_purge(
                 self.engine.has_open_stream(&entry.info_hash),
                 self.engine.is_downloading(&entry.info_hash),
-                self.engine
-                    .is_recently_active(&entry.info_hash, ACTIVE_STREAM_GRACE_PERIOD)
-                    .await,
+                recently_active.contains(&entry.info_hash),
             ) {
                 entries.push(entry);
                 continue;
@@ -226,15 +269,19 @@ impl CacheManager {
                         bytes = entry.size,
                         "cache: purged torrent beyond the retention count"
                     );
+                    purged = true;
                 }
                 // The session never heard of it (left over from an earlier
                 // run), so the directory is reclaimed directly.
                 Ok(false) => match tokio::fs::remove_dir_all(&entry.path).await {
-                    Ok(()) => info!(
-                        info_hash = %entry.info_hash,
-                        bytes = entry.size,
-                        "cache: purged orphaned torrent dir beyond the retention count"
-                    ),
+                    Ok(()) => {
+                        info!(
+                            info_hash = %entry.info_hash,
+                            bytes = entry.size,
+                            "cache: purged orphaned torrent dir beyond the retention count"
+                        );
+                        purged = true;
+                    }
                     Err(e) => {
                         warn!(
                             info_hash = %entry.info_hash,
@@ -250,9 +297,20 @@ impl CacheManager {
                 }
             }
         }
+        if purged {
+            self.invalidate_usage().await;
+        }
 
         entries
     }
+}
+
+/// When a torrent was last used: its last request if the engine remembers
+/// one, its directory's mtime otherwise, whichever is later.
+fn last_used(entry: &TorrentDirEntry, last_request: &HashMap<String, SystemTime>) -> SystemTime {
+    last_request
+        .get(&entry.info_hash)
+        .map_or(entry.modified, |requested| (*requested).max(entry.modified))
 }
 
 /// Whether a torrent that fell beyond the retention count may actually be
@@ -274,44 +332,62 @@ fn may_purge(has_open_stream: bool, is_downloading: bool, recently_active: bool)
     !(has_open_stream || is_downloading || recently_active)
 }
 
-/// Lists top-level `downloads_dir/<info_hash>/` directories. Anything not
-/// shaped like a 40-char hex info hash is left untouched -- it was not
-/// created by this gateway (see `TorrentEngine::start_file`'s `sub_folder`),
-/// so the janitor has no business deleting it.
-async fn list_torrent_dirs(root: &Path) -> anyhow::Result<Vec<TorrentDirEntry>> {
-    let mut out = Vec::new();
-    let mut read_dir = match tokio::fs::read_dir(root).await {
-        Ok(rd) => rd,
-        Err(_) => return Ok(out),
+/// Walks the downloads directory once, on the blocking pool.
+///
+/// One `std::fs` walk on a blocking thread rather than an async walk: every
+/// async directory operation is itself a hop to the blocking pool, so walking
+/// a few thousand files that way cost a few thousand hops, and the size pass
+/// and `usage_bytes` each did it separately.
+async fn scan(root: &Path) -> DiskScan {
+    let root = root.to_path_buf();
+    tokio::task::spawn_blocking(move || scan_blocking(&root))
+        .await
+        .unwrap_or(DiskScan {
+            torrents: Vec::new(),
+            total: 0,
+        })
+}
+
+/// Sizes every top-level entry of `root`, and lists the `<info_hash>/`
+/// directories among them. Anything not shaped like a 40-char hex info hash
+/// is counted but never listed -- it was not created by this gateway (see
+/// `TorrentEngine::start_file`'s `sub_folder`), so the janitor has no
+/// business deleting it.
+fn scan_blocking(root: &Path) -> DiskScan {
+    let mut scan = DiskScan {
+        torrents: Vec::new(),
+        total: 0,
+    };
+    let Ok(read_dir) = std::fs::read_dir(root) else {
+        return scan;
     };
 
-    while let Some(entry) = read_dir.next_entry().await? {
-        let path = entry.path();
-        let Ok(meta) = entry.metadata().await else {
+    for entry in read_dir.flatten() {
+        let Ok(meta) = entry.metadata() else {
             continue;
         };
         if !meta.is_dir() {
+            scan.total += allocated_size(&meta);
             continue;
         }
+        let path = entry.path();
+        let size = dir_size_blocking(&path);
+        scan.total += size;
+
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
-        if name.len() != 40 || !name.bytes().all(|b| b.is_ascii_hexdigit()) {
+        if !crate::torrent::resolver::is_hex40(name) {
             continue;
         }
-        let info_hash = name.to_ascii_lowercase();
-
-        let size = dir_size(&path).await.unwrap_or(0);
-        let modified = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-        out.push(TorrentDirEntry {
+        scan.torrents.push(TorrentDirEntry {
+            info_hash: name.to_ascii_lowercase(),
             path,
-            info_hash,
             size,
-            modified,
+            modified: meta.modified().unwrap_or(SystemTime::UNIX_EPOCH),
         });
     }
-
-    Ok(out)
+    scan
 }
 
 /// How many bytes a file actually occupies on disk.
@@ -343,27 +419,20 @@ fn allocated_size(meta: &std::fs::Metadata) -> u64 {
     meta.len()
 }
 
-/// Recursive directory size. Boxed because an `async fn` cannot recurse into
-/// itself directly (its future would have infinite size).
-fn dir_size(path: &Path) -> Pin<Box<dyn Future<Output = anyhow::Result<u64>> + Send + '_>> {
-    Box::pin(async move {
-        let mut total = 0u64;
-        let mut read_dir = match tokio::fs::read_dir(path).await {
-            Ok(rd) => rd,
-            Err(_) => return Ok(0),
-        };
-        while let Some(entry) = read_dir.next_entry().await? {
-            let Ok(meta) = entry.metadata().await else {
-                continue;
-            };
-            if meta.is_dir() {
-                total += dir_size(&entry.path()).await?;
-            } else {
-                total += allocated_size(&meta);
-            }
-        }
-        Ok(total)
-    })
+/// Recursive directory size, in allocated bytes. Unreadable entries count as
+/// empty: this feeds a cap and a status line, neither worth failing over.
+fn dir_size_blocking(path: &Path) -> u64 {
+    let Ok(read_dir) = std::fs::read_dir(path) else {
+        return 0;
+    };
+    read_dir
+        .flatten()
+        .map(|entry| match entry.metadata() {
+            Ok(meta) if meta.is_dir() => dir_size_blocking(&entry.path()),
+            Ok(meta) => allocated_size(&meta),
+            Err(_) => 0,
+        })
+        .sum()
 }
 
 #[cfg(test)]
@@ -385,7 +454,7 @@ mod tests {
         // is the space the filesystem allocated, which rounds each file up to
         // a block, so this asserts the data is accounted for rather than an
         // exact sum that would only hold on one filesystem.
-        let size = dir_size(&tmp).await.unwrap();
+        let size = dir_size_blocking(&tmp);
         assert!(size >= 350, "both files must be counted, got {size}");
 
         tokio::fs::remove_dir_all(&tmp).await.unwrap();
@@ -406,13 +475,15 @@ mod tests {
         let apparent_len = 512 * 1024 * 1024; // half a gigabyte of nothing
         let written = 64 * 1024;
 
-        let mut file = tokio::fs::File::create(tmp.join("movie.mkv")).await.unwrap();
+        let mut file = tokio::fs::File::create(tmp.join("movie.mkv"))
+            .await
+            .unwrap();
         file.set_len(apparent_len).await.unwrap();
         file.write_all(&vec![7u8; written]).await.unwrap();
         file.sync_all().await.unwrap();
         drop(file);
 
-        let size = dir_size(&tmp).await.unwrap();
+        let size = dir_size_blocking(&tmp);
 
         assert!(
             size >= written as u64,
@@ -459,22 +530,48 @@ mod tests {
         assert!(!may_purge(false, false, true), "between range requests");
     }
 
-    #[tokio::test]
-    async fn list_torrent_dirs_ignores_non_hash_directories() {
+    #[test]
+    fn the_scan_lists_only_torrent_directories_but_counts_everything() {
         let tmp = tempdir();
         let hash = "0123456789abcdef0123456789abcdef01234567";
-        tokio::fs::create_dir(tmp.join(hash)).await.unwrap();
-        tokio::fs::write(tmp.join(hash).join("movie.mkv"), vec![0u8; 10])
-            .await
-            .unwrap();
-        tokio::fs::create_dir(tmp.join("not-a-hash")).await.unwrap();
+        std::fs::create_dir(tmp.join(hash)).unwrap();
+        std::fs::write(tmp.join(hash).join("movie.mkv"), vec![0u8; 10]).unwrap();
+        std::fs::create_dir(tmp.join("not-a-hash")).unwrap();
+        std::fs::write(tmp.join("not-a-hash").join("stray.bin"), vec![0u8; 10]).unwrap();
 
-        let entries = list_torrent_dirs(&tmp).await.unwrap();
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].info_hash, hash);
-        assert!(entries[0].size > 0, "the torrent's data must be measured");
+        let scan = scan_blocking(&tmp);
+        assert_eq!(scan.torrents.len(), 1);
+        assert_eq!(scan.torrents[0].info_hash, hash);
+        assert!(
+            scan.torrents[0].size > 0,
+            "the torrent's data must be measured"
+        );
+        assert!(
+            scan.total > scan.torrents[0].size,
+            "usage covers the whole directory, not only what the janitor may delete"
+        );
 
-        tokio::fs::remove_dir_all(&tmp).await.unwrap();
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    /// Both passes order by the same measure, so the size pass cannot evict
+    /// the title retention just decided was the freshest.
+    #[test]
+    fn a_recent_request_outranks_an_old_directory_timestamp() {
+        let long_ago = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let entry = |hash: &str| TorrentDirEntry {
+            path: PathBuf::from(hash),
+            info_hash: hash.to_string(),
+            size: 0,
+            modified: long_ago,
+        };
+        let rewatched = entry("rewatched");
+        let untouched = entry("untouched");
+        let now = SystemTime::now();
+        let requests = HashMap::from([("rewatched".to_string(), now)]);
+
+        assert_eq!(last_used(&rewatched, &requests), now);
+        assert_eq!(last_used(&untouched, &requests), long_ago);
     }
 
     fn tempdir() -> PathBuf {

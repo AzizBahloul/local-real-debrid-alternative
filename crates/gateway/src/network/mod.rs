@@ -3,7 +3,7 @@
 //! sets the listening sockets up so a client that vanishes actually
 //! disconnects (see `harden_listener`).
 
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::time::Duration;
 
 use tracing::{debug, warn};
@@ -40,6 +40,13 @@ use tracing::{debug, warn};
 /// `/videos/{hash}/{idx}` is addressable and range-capable, so a player that
 /// does get disconnected simply reconnects where it left off.
 ///
+/// `TCP_NODELAY` rides along for a different reason. Every response here
+/// starts with a small write -- the headers, or all of a manifest or stream
+/// list -- and with Nagle's algorithm on, a small write that follows another
+/// can sit waiting for the client's delayed ACK, up to 40 ms, before it goes
+/// out. That is pure added latency on every request, and video gains nothing
+/// from it: its chunks are far larger than a segment anyway.
+///
 /// Set on the *listening* socket, which Linux copies onto every socket it
 /// accepts -- so this covers every connection without the gateway needing an
 /// accept loop of its own. Failures are logged and ignored: worse buffering
@@ -49,6 +56,10 @@ pub fn harden_listener(listener: &impl std::os::fd::AsFd, client_timeout: Durati
     use socket2::{SockRef, TcpKeepalive};
 
     let sock = SockRef::from(listener);
+
+    if let Err(e) = sock.set_tcp_nodelay(true) {
+        debug!("could not set TCP_NODELAY: {e}");
+    }
 
     if !client_timeout.is_zero() {
         if let Err(e) = sock.set_tcp_user_timeout(Some(client_timeout)) {
@@ -94,15 +105,110 @@ pub fn harden_listener<S>(_listener: &S, _client_timeout: Duration) {}
 /// no packet is sent, it only resolves a route. That is immune to unrelated
 /// bridges sitting on the machine, because the kernel would only route
 /// through one of them if it were the real default route.
+///
+/// A LAN with no internet has no default route, so that lookup fails there.
+/// The fallback asks the routing table directly for the subnets this machine
+/// is on, and resolves the address it would use to reach one of them -- the
+/// same question, asked of a route that does exist. This used to be the
+/// `local_ip_address` crate, which enumerates interfaces and is exactly the
+/// lookup that picked the dead bridge above.
 pub fn detect_lan_ip() -> IpAddr {
-    std::net::UdpSocket::bind("0.0.0.0:0")
-        .and_then(|sock| {
-            sock.connect("1.1.1.1:80")?;
-            sock.local_addr()
-        })
-        .map(|addr| addr.ip())
-        .or_else(|_| local_ip_address::local_ip())
-        .unwrap_or_else(|_| IpAddr::from([127, 0, 0, 1]))
+    local_addr_towards(IpAddr::from([1, 1, 1, 1]))
+        .or_else(lan_ip_from_route_table)
+        .unwrap_or(IpAddr::from([127, 0, 0, 1]))
+}
+
+/// The local address the kernel would send from to reach `target`. No packet
+/// is sent: connecting a UDP socket only resolves a route.
+fn local_addr_towards(target: IpAddr) -> Option<IpAddr> {
+    let sock = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    sock.connect((target, 80)).ok()?;
+    let ip = sock.local_addr().ok()?.ip();
+    (!ip.is_unspecified() && !ip.is_loopback()).then_some(ip)
+}
+
+#[cfg(target_os = "linux")]
+fn lan_ip_from_route_table() -> Option<IpAddr> {
+    let table = std::fs::read_to_string("/proc/net/route").ok()?;
+    let is_up = |iface: &str| {
+        std::fs::read_to_string(format!("/sys/class/net/{iface}/operstate"))
+            .is_ok_and(|state| state.trim() == "up")
+    };
+    route_targets(&table, is_up)
+        .into_iter()
+        .find_map(|target| local_addr_towards(IpAddr::V4(target)))
+}
+
+/// Without a routing table to read there is nothing better to try.
+#[cfg(not(target_os = "linux"))]
+fn lan_ip_from_route_table() -> Option<IpAddr> {
+    None
+}
+
+/// Interface-name prefixes of virtual networks that are never the LAN a phone
+/// is on: container and VM bridges, their veth pairs, and VPN tunnels.
+const VIRTUAL_INTERFACE_PREFIXES: [&str; 7] = ["lo", "docker", "br-", "virbr", "veth", "tun", "wg"];
+
+/// Addresses worth routing towards, best first, from the text of
+/// `/proc/net/route`: the gateway of any default route, then the first host of
+/// every subnet route, by metric. Only routes that are up, on interfaces that
+/// are up and not virtual.
+///
+/// Pure, so the parsing is testable without a real routing table.
+fn route_targets(table: &str, is_up: impl Fn(&str) -> bool) -> Vec<Ipv4Addr> {
+    const RTF_UP: u32 = 0x1;
+    // (is not a default route, metric, target): sorts defaults first.
+    let mut targets: Vec<(bool, u32, Ipv4Addr)> = Vec::new();
+
+    for line in table.lines().skip(1) {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        let [iface, destination, gateway, flags, _refcnt, _use, metric, mask, ..] = fields[..]
+        else {
+            continue;
+        };
+        let (Some(destination), Some(gateway), Some(mask)) = (
+            route_address(destination),
+            route_address(gateway),
+            route_address(mask),
+        ) else {
+            continue;
+        };
+        let flags = u32::from_str_radix(flags, 16).unwrap_or(0);
+        let metric = metric.parse().unwrap_or(u32::MAX);
+        if flags & RTF_UP == 0
+            || VIRTUAL_INTERFACE_PREFIXES
+                .iter()
+                .any(|p| iface.starts_with(p))
+            || !is_up(iface)
+        {
+            continue;
+        }
+
+        if destination.is_unspecified() {
+            if !gateway.is_unspecified() {
+                targets.push((false, metric, gateway));
+            }
+            continue;
+        }
+        if destination.is_link_local() || mask.is_unspecified() {
+            continue;
+        }
+        // The first host of the subnet: any address inside it resolves to the
+        // same interface and source address.
+        let network = u32::from(destination) & u32::from(mask);
+        targets.push((true, metric, Ipv4Addr::from(network.wrapping_add(1))));
+    }
+
+    targets.sort_by_key(|(not_default, metric, _)| (*not_default, *metric));
+    targets.into_iter().map(|(_, _, target)| target).collect()
+}
+
+/// One address column of `/proc/net/route`: the kernel prints the address's
+/// network-order bytes read as a host-order integer, so the host-order bytes
+/// of the parsed number are the address.
+fn route_address(hex: &str) -> Option<Ipv4Addr> {
+    let raw = u32::from_str_radix(hex, 16).ok()?;
+    Some(Ipv4Addr::from(raw.to_ne_bytes()))
 }
 
 /// What the banner can say about the https addon URL at the moment it prints.
@@ -143,12 +249,7 @@ pub fn print_banner(lan_ip: IpAddr, port: u16, addon: AddonStatus<'_>) {
     println!("{bar}");
     println!();
     match addon {
-        AddonStatus::Ready(addon) => {
-            println!("   PASTE THIS INTO STREMIO (Addons -> search bar):");
-            println!("   {addon}/manifest.json");
-            println!();
-            println!("   No tunnel needed. Works from any device on this wifi.");
-        }
+        AddonStatus::Ready(addon) => print_paste_instructions(addon),
         AddonStatus::Preparing => {
             println!("   The Stremio addon URL (https) is being prepared and");
             println!("   will be printed below in a few seconds.");
@@ -169,14 +270,24 @@ pub fn print_banner(lan_ip: IpAddr, port: u16, addon: AddonStatus<'_>) {
 /// Printed by the background https task once the certificate is loaded and
 /// the listener is actually serving -- the deferred half of the banner.
 pub fn print_addon_ready(addon_url: &str) {
-    let line = format!("   {addon_url}/manifest.json");
-    let bar = "=".repeat(line.len().max(32));
+    let bar = "=".repeat(manifest_line(addon_url).len().max(32));
     println!("\n{bar}");
+    print_paste_instructions(addon_url);
+    println!("{bar}\n");
+}
+
+/// The addon URL line. The desktop app finds the URL in the log by exactly
+/// this shape (see `gateway-gui`'s `addon_url_from_line`), so both banners
+/// print it from here.
+fn manifest_line(addon_url: &str) -> String {
+    format!("   {addon_url}/manifest.json")
+}
+
+fn print_paste_instructions(addon_url: &str) {
     println!("   PASTE THIS INTO STREMIO (Addons -> search bar):");
-    println!("{line}");
+    println!("{}", manifest_line(addon_url));
     println!();
     println!("   No tunnel needed. Works from any device on this wifi.");
-    println!("{bar}\n");
 }
 
 #[cfg(test)]
@@ -221,6 +332,70 @@ mod tests {
             sock.keepalive().expect("read SO_KEEPALIVE back"),
             "keepalive covers the idle-but-not-wedged case"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn accepted_connections_do_not_wait_on_nagle() {
+        use socket2::SockRef;
+        use std::net::{TcpListener, TcpStream};
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind a loopback listener");
+        let addr = listener.local_addr().expect("listener has an address");
+        harden_listener(&listener, Duration::ZERO);
+
+        let _client = TcpStream::connect(addr).expect("connect to the listener");
+        let (accepted, _) = listener.accept().expect("accept the connection");
+        assert!(
+            SockRef::from(&accepted)
+                .tcp_nodelay()
+                .expect("read TCP_NODELAY back"),
+            "TCP_NODELAY must reach the accepted socket, or it was set for nothing"
+        );
+    }
+
+    /// A real table from a laptop on wifi with docker installed.
+    const ROUTE_TABLE: &str = "\
+Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT
+wlp2s0\t00000000\t0101A8C0\t0003\t0\t0\t600\t00000000\t0\t0\t0
+docker0\t000011AC\t00000000\t0001\t0\t0\t0\t0000FFFF\t0\t0\t0
+wlp2s0\t0001A8C0\t00000000\t0001\t0\t0\t600\t00FFFFFF\t0\t0\t0
+virbr0\t007AA8C0\t00000000\t0001\t0\t0\t0\t00FFFFFF\t0\t0\t0
+eth0\t0000FEA9\t00000000\t0001\t0\t0\t1000\t0000FFFF\t0\t0\t0
+";
+
+    #[test]
+    fn the_route_table_prefers_the_default_gateway_then_real_subnets() {
+        let targets = route_targets(ROUTE_TABLE, |_| true);
+        assert_eq!(
+            targets,
+            vec![Ipv4Addr::new(192, 168, 1, 1), Ipv4Addr::new(192, 168, 1, 1)],
+            "container and VM bridges, and link-local routes, are never the LAN"
+        );
+    }
+
+    #[test]
+    fn routes_on_a_down_interface_are_ignored() {
+        let targets = route_targets(ROUTE_TABLE, |iface| iface != "wlp2s0");
+        assert!(targets.is_empty(), "got {targets:?}");
+    }
+
+    /// A LAN with no internet: no default route, only the subnet.
+    #[test]
+    fn an_offline_lan_still_yields_its_subnet() {
+        let table = "Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\n\
+                     eth0\t0000000A\t00000000\t0001\t0\t0\t100\t000000FF\n";
+        assert_eq!(
+            route_targets(table, |_| true),
+            vec![Ipv4Addr::new(10, 0, 0, 1)]
+        );
+    }
+
+    #[test]
+    fn a_garbled_route_table_yields_nothing_rather_than_panicking() {
+        assert!(route_targets("", |_| true).is_empty());
+        assert!(route_targets("header\nwlp2s0 zz", |_| true).is_empty());
+        assert!(route_targets("header\nwlp2s0\tXYZ\t0\t1\t0\t0\t0\t0", |_| true).is_empty());
     }
 
     /// 0 means "leave the OS default alone", which has to stay a real option:

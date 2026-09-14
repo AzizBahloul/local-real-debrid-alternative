@@ -19,7 +19,7 @@
 //!    someone else's machine is worse than no bar. Every frame, bar and glyph
 //!    that is not plain ASCII is *painted* (see `widgets`), not typed.
 
-use egui::{Color32, FontId, Rounding, Stroke, Ui};
+use egui::{Color32, FontId, RichText, Rounding, Stroke, Ui};
 
 /// P1 phosphor -- the primary "this is alive" colour.
 pub const PHOSPHOR: Color32 = Color32::from_rgb(51, 255, 102);
@@ -46,6 +46,37 @@ pub const TEXT_DIM: Color32 = Color32::from_rgb(92, 146, 108);
 /// Height of one scanline cell; also the grid the matrix rain falls on, so the
 /// two effects line up instead of beating against each other.
 pub const CELL: f32 = 3.0;
+
+/// The type scale. Every label in the window is one of these sizes, all
+/// monospace (rule 1 above).
+///
+/// Hints, units, captions and the small print under a button.
+pub const SIZE_CAPTION: f32 = 10.0;
+/// Messages, URLs and log lines.
+pub const SIZE_BODY: f32 = 11.0;
+/// A secondary readout sitting next to a headline one.
+pub const SIZE_SUBREADOUT: f32 = 12.0;
+/// Counters (streams, peers, swarms).
+pub const SIZE_COUNTER: f32 = 13.0;
+/// The one headline number: download throughput.
+pub const SIZE_READOUT: f32 = 17.0;
+
+/// Monospace text at `size` in `color`.
+pub fn mono(text: impl Into<String>, size: f32, color: Color32) -> RichText {
+    RichText::new(text)
+        .font(FontId::monospace(size))
+        .color(color)
+}
+
+/// [`SIZE_CAPTION`] text.
+pub fn caption(text: impl Into<String>, color: Color32) -> RichText {
+    mono(text, SIZE_CAPTION, color)
+}
+
+/// [`SIZE_BODY`] text.
+pub fn body(text: impl Into<String>, color: Color32) -> RichText {
+    mono(text, SIZE_BODY, color)
+}
 
 /// Installs the CRT visuals and forces every text style onto the monospace
 /// family, so a stray `ui.label` can never break the terminal illusion.
@@ -149,6 +180,10 @@ pub fn corner_brackets(painter: &egui::Painter, rect: egui::Rect, len: f32, stro
 /// Painted rather than typed for the ASCII reason in the module docs: the
 /// border is a stroke, and the title punches a hole in it by drawing its own
 /// backdrop over the line.
+///
+/// `title` is drawn as given, so callers pass it already in capitals -- a
+/// constant, or a string rendered once when its data arrived -- rather than
+/// having it uppercased and re-formatted on every frame.
 pub fn section<R>(ui: &mut Ui, title: &str, accent: Color32, add: impl FnOnce(&mut Ui) -> R) -> R {
     let inner = egui::Frame::none()
         .fill(BG_PANEL)
@@ -165,12 +200,18 @@ pub fn section<R>(ui: &mut Ui, title: &str, accent: Color32, add: impl FnOnce(&m
         });
 
     let rect = inner.response.rect;
-    let font = FontId::monospace(10.0);
-    let label = format!(" {} ", title.to_uppercase());
-    let galley = ui.painter().layout_no_wrap(label, font, accent);
-    let pos = egui::pos2(rect.left() + 10.0, rect.top() - galley.size().y * 0.5);
+    let galley =
+        ui.painter()
+            .layout_no_wrap(title.to_owned(), FontId::monospace(SIZE_CAPTION), accent);
+    // The gap either side of the title, one monospace cell wide: what the
+    // padding spaces around the label used to be.
+    let pad = 6.0;
+    let pos = egui::pos2(rect.left() + 10.0 + pad, rect.top() - galley.size().y * 0.5);
     ui.painter().rect_filled(
-        egui::Rect::from_min_size(pos, galley.size()),
+        egui::Rect::from_min_size(
+            pos - egui::vec2(pad, 0.0),
+            galley.size() + egui::vec2(pad * 2.0, 0.0),
+        ),
         Rounding::ZERO,
         BG_PANEL,
     );

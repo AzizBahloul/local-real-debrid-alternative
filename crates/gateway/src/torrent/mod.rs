@@ -8,27 +8,57 @@
 //! module only adds what librqbit does not provide: restricting downloads to
 //! the file actually being played, picking which file that is, and tracking
 //! who is currently watching what (for the cache janitor).
+//!
+//! Split by concern:
+//!
+//! * this file -- starting torrents and serving reads from them;
+//! * `queue` -- which torrents run: the download queue, the idle reaper, hand
+//!   pauses, and discarding the title the viewer walked away from;
+//! * `metadata` -- `.torrent` metadata in memory and on disk, and the set of
+//!   hashes this gateway has offered;
+//! * `readers` -- bookkeeping for the video responses reading right now.
 
+mod metadata;
+mod queue;
+mod readers;
 pub mod resolver;
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
 use std::io::SeekFrom;
 use std::net::IpAddr;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use bytes::Bytes;
 use librqbit::api::TorrentIdOrHash;
 use librqbit::limits::LimitsConfig;
 use librqbit::{
     AddTorrent, AddTorrentOptions, AddTorrentResponse, Api, DhtSessionConfig, ListenerMode,
-    ListenerOptions, Session, SessionOptions, SessionPersistenceConfig,
+    ListenerOptions, ManagedTorrent, Session, SessionOptions, SessionPersistenceConfig,
 };
 use tokio::io::{AsyncRead, AsyncSeekExt};
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::Semaphore;
 use tracing::{debug, info, warn};
+
+use crate::config::AppConfig;
+use crate::util::lock;
+use metadata::{
+    load_advertised, session_metadata, AdvertisedHashes, MetadataArchive, MetadataCache,
+    ADVERTISED_HASH_CAPACITY,
+};
+use readers::{
+    has_tail_index, OpenStreamCounts, ReaderSlot, LIBRQBIT_STREAM_WINDOW, READAHEAD_ADVANCE_BYTES,
+    READAHEAD_REFRESH, TAIL_WARM_BYTES, TAIL_WARM_TIMEOUT,
+};
+pub use readers::{PieceGeometry, ReadaheadHandle, ReaderCancel, ReaderTicket, StreamGuard};
+use resolver::{
+    info_hash_from_magnet, is_video_file, suggest_video_file, MagnetSource, ResolvedTorrent,
+    TorrentFile, TorrentSource,
+};
 
 /// A boxed read side of a torrent file. `librqbit::FileStream` lives in a
 /// private module and cannot be named from outside the crate, so it is boxed
@@ -37,13 +67,17 @@ pub type BoxedReader = Box<dyn AsyncRead + Send + Unpin>;
 
 // Cold-start budget. A first request for a torrent that is not running yet
 // does three things in sequence, and their sum must stay under the router's
-// 60s request timeout -- otherwise the client gets a 504 having waited the
-// full minute for nothing, which is strictly worse than a fast failure:
+// request timeout (`crate::REQUEST_TIMEOUT`, 60s) -- otherwise the client
+// gets a 504 having waited the full minute for nothing, which is strictly
+// worse than a fast failure:
 //
 //     ADD_TORRENT_TIMEOUT (25s)  fetch metadata from DHT/trackers
 //   + INITIALIZE_TIMEOUT  (15s)  leave `Initializing` (hash-check on disk)
 //   + prebuffer timeout   (15s)  wait for real bytes (see `streaming`)
 //   = 55s worst case
+//
+// The prebuffer timeout is configurable, so `TorrentEngine::new` warns when a
+// configuration breaks the budget, and a test pins the defaults.
 //
 /// Bounds the metadata fetch. Unbounded, a torrent with no reachable peers
 /// hangs here until the router gives up.
@@ -79,7 +113,7 @@ const START_FAILURE_COOLDOWN: Duration = Duration::from_secs(45);
 const BACKGROUND_SEARCH_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// How long after its last read a torrent is still considered "being watched"
-/// for the purpose of *deleting* it — see `action_for_abandoned`.
+/// for the purpose of *deleting* it — see `queue::action_for_abandoned`.
 ///
 /// Sized off the retry cycle rather than off playback: a player that fails to
 /// start re-attempts roughly every 25-30s (the same figure
@@ -91,210 +125,20 @@ const BACKGROUND_SEARCH_TIMEOUT: Duration = Duration::from_secs(120);
 /// the cap, and the idle reaper still parks the torrent in the meantime.
 const ABANDON_GRACE: Duration = Duration::from_secs(90);
 
-
-/// How many recently-advertised info hashes stay startable. Generous relative
-/// to how many streams a browse session shows (15 per title by default).
-const ADVERTISED_HASH_CAPACITY: usize = 512;
-
-/// How many resolved torrents keep their metadata in memory for a later start.
-///
-/// One entry is a whole `.torrent` file (chiefly the piece hashes: 20 bytes
-/// per piece, so a few hundred KB for a large release), which is why this is
-/// small rather than generous — in memory it only has to bridge the gap
-/// between reading a stream list and tapping one of its rows. The on-disk
-/// archive behind it (`METADATA_ARCHIVE_CAPACITY`) is what makes a title
-/// playable weeks later. See `MetadataCache`.
-const RESOLVED_METADATA_CAPACITY: usize = 16;
-
-/// How many `.torrent` blobs the on-disk archive keeps.
-///
-/// Sized against the advertised set rather than against memory: an advertised
-/// hash is a link a client may still tap, and the whole point of the archive
-/// is that tapping one never costs a swarm lookup. At a few hundred KB each
-/// the worst case is well under a gigabyte, against a cache measured in tens
-/// of them. See `MetadataCache::archive_dir`.
-const METADATA_ARCHIVE_CAPACITY: usize = 512;
-
 /// Cap on how many already-known torrents a single browse will wake up. A
 /// title's stream list can name a dozen releases we have partial data for;
 /// resuming all of them would have them compete for the same upstream
 /// bandwidth, which is the exact problem the idle reaper exists to prevent.
 const MAX_WARM_ON_BROWSE: usize = 3;
 
-use crate::config::AppConfig;
-use resolver::{
-    info_hash_from_magnet, is_hex40, is_video_file, suggest_video_file, MagnetSource,
-    ResolvedTorrent, TorrentFile, TorrentSource,
-};
-
-/// Torrent metadata already fetched from the swarm, keyed by info hash.
+/// Upper bound on the activity map.
 ///
-/// Resolving a magnet is the expensive half of a cold start: the magnet
-/// carries only an info hash, so the file list has to be pulled from a peer
-/// that holds it, and `list_only` (how `resolve` asks for it) deliberately
-/// leaves nothing behind in the session. Every caller that resolves goes on to
-/// *start* the same torrent moments later — `/play` immediately, the addon's
-/// magnet path when the viewer taps the row — and without this that start
-/// pays the identical fetch a second time.
-///
-/// What is stored is the full `.torrent` blob librqbit assembled from the
-/// fetched info (trackers included), which `AddTorrent::from_bytes` takes
-/// directly. Adding from it needs no peers at all: the metadata step goes from
-/// a network round-trip to a parse.
-///
-/// Bounded, newest last, oldest evicted — a miss costs only the fetch that
-/// would have happened anyway, or a read from `MetadataArchive` behind it.
-#[derive(Default)]
-struct MetadataCache {
-    order: VecDeque<String>,
-    bytes: HashMap<String, bytes::Bytes>,
-}
-
-impl MetadataCache {
-    fn remember(&mut self, info_hash: String, torrent_bytes: bytes::Bytes) {
-        if torrent_bytes.is_empty() {
-            return;
-        }
-        if self.bytes.insert(info_hash.clone(), torrent_bytes).is_some() {
-            return;
-        }
-        self.order.push_back(info_hash);
-        while self.order.len() > RESOLVED_METADATA_CAPACITY {
-            if let Some(oldest) = self.order.pop_front() {
-                self.bytes.remove(&oldest);
-            }
-        }
-    }
-
-    fn get(&self, info_hash: &str) -> Option<bytes::Bytes> {
-        self.bytes.get(info_hash).cloned()
-    }
-}
-
-/// The same `.torrent` blobs as `MetadataCache`, kept on disk so they outlive
-/// both the process and the cache janitor.
-///
-/// This exists because of a specific, reproducible dead end. Replaying a title
-/// watched days ago has to re-add its torrent, and everything that made the
-/// first play fast is gone by then: the files were reclaimed by the retention
-/// sweep, librqbit deletes its own `<hash>.torrent` alongside the torrent it
-/// belongs to, and the in-memory cache above did not survive the restart. So
-/// the add falls back to resolving the magnet from the swarm — and a magnet
-/// carries nothing but an info hash, so that is a DHT lookup against a release
-/// whose seeders have since moved on. It times out at `ADD_TORRENT_TIMEOUT`,
-/// the torrent never enters the session, and from the sofa the gateway simply
-/// does not react to pressing play.
-///
-/// A `.torrent` blob is the cure because it is the *whole* answer to that
-/// lookup: piece hashes, file list, trackers. `AddTorrent::from_bytes` needs no
-/// peers at all, so the torrent joins the session immediately and shows up as
-/// downloading, and finding seeders becomes a background concern instead of a
-/// precondition for reacting to the tap.
-///
-/// Deliberately its own subdirectory: librqbit writes `<hash>.torrent` into the
-/// session directory itself and removes it when the torrent leaves the session,
-/// which is exactly the deletion this archive exists to survive.
-#[derive(Clone)]
-struct MetadataArchive {
-    dir: PathBuf,
-}
-
-impl MetadataArchive {
-    fn new(dir: PathBuf) -> Self {
-        Self { dir }
-    }
-
-    fn path_for(&self, info_hash: &str) -> PathBuf {
-        self.dir.join(format!("{info_hash}.torrent"))
-    }
-
-    /// Best effort throughout: a missing or unreadable archive only costs the
-    /// swarm lookup that would have happened without it, so nothing here is
-    /// worth failing a request over.
-    async fn load(&self, info_hash: &str) -> Option<bytes::Bytes> {
-        if !is_hex40(info_hash) {
-            return None;
-        }
-        let path = self.path_for(info_hash);
-        let bytes = tokio::fs::read(&path).await.ok()?;
-        if bytes.is_empty() {
-            return None;
-        }
-        // Re-stamp on use so pruning evicts by last *use*, not by when the
-        // blob was first written -- a series you keep coming back to should
-        // not age out behind titles you opened once.
-        touch(&path).await;
-        Some(bytes::Bytes::from(bytes))
-    }
-
-    async fn store(&self, info_hash: &str, torrent_bytes: &bytes::Bytes) {
-        if torrent_bytes.is_empty() || !is_hex40(info_hash) {
-            return;
-        }
-        if let Err(e) = tokio::fs::create_dir_all(&self.dir).await {
-            debug!("could not create torrent metadata archive: {e}");
-            return;
-        }
-        let path = self.path_for(info_hash);
-        if let Err(e) = tokio::fs::write(&path, torrent_bytes.as_ref()).await {
-            debug!("could not archive torrent metadata: {e}");
-            return;
-        }
-        self.prune().await;
-    }
-
-    /// Drops the least recently used blobs once the archive outgrows
-    /// `METADATA_ARCHIVE_CAPACITY`.
-    async fn prune(&self) {
-        let Ok(mut dir) = tokio::fs::read_dir(&self.dir).await else {
-            return;
-        };
-        let mut entries: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
-        while let Ok(Some(entry)) = dir.next_entry().await {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("torrent") {
-                continue;
-            }
-            let used = entry
-                .metadata()
-                .await
-                .ok()
-                .and_then(|m| m.modified().ok())
-                .unwrap_or(std::time::UNIX_EPOCH);
-            entries.push((used, path));
-        }
-        if entries.len() <= METADATA_ARCHIVE_CAPACITY {
-            return;
-        }
-        entries.sort_by(|a, b| b.0.cmp(&a.0));
-        for (_, path) in entries.split_off(METADATA_ARCHIVE_CAPACITY) {
-            let _ = tokio::fs::remove_file(&path).await;
-        }
-    }
-}
-
-/// A live torrent's assembled `.torrent` blob, or `None` if the session does
-/// not hold it or has not resolved it yet.
-fn session_metadata(api: &Api, info_hash: &str) -> Option<bytes::Bytes> {
-    let idx = TorrentIdOrHash::parse(info_hash).ok()?;
-    let handle = api.session().get(idx)?;
-    handle.with_metadata(|m| m.torrent_bytes.clone()).ok()
-}
-
-/// Stamps a file as used just now, so `MetadataArchive::prune` evicts by last
-/// use rather than by first write. Best effort: a failed stamp only means the
-/// blob ages from when it was written, which is the behaviour without this.
-async fn touch(path: &Path) {
-    let path = path.to_path_buf();
-    let _ = tokio::task::spawn_blocking(move || {
-        let now = std::time::SystemTime::now();
-        std::fs::OpenOptions::new()
-            .write(true)
-            .open(&path)
-            .and_then(|f| f.set_times(std::fs::FileTimes::new().set_modified(now)))
-    })
-    .await;
-}
+/// Only hashes the gateway advertised or already holds are ever recorded (see
+/// `touch_stream`), and both of those are bounded, so this is a backstop
+/// rather than a limit anything legitimate reaches: it is what keeps a client
+/// looping over made-up hashes from growing the map for the life of the
+/// process.
+const ACTIVE_STREAMS_CAPACITY: usize = 1024;
 
 /// Recency of activity on a given torrent's stream, so the cache janitor
 /// never evicts something someone is actively watching. HTTP range requests
@@ -338,95 +182,74 @@ pub struct ActiveTorrentSummary {
     pub held: bool,
 }
 
-/// One advertised info hash and the trackers the index reported for exactly
-/// that release. Persisted so both survive a restart.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-struct AdvertisedEntry {
-    hash: String,
-    #[serde(default)]
-    trackers: Vec<String>,
+/// One file inside a running torrent, as a video response needs it.
+#[derive(Debug, Clone)]
+pub struct StreamFile {
+    pub len: u64,
+    /// The file's path inside the torrent; only its extension is ever
+    /// consulted (see `warm_mp4_tail`).
+    pub name: String,
 }
 
-/// Info hashes this gateway has itself offered to a client, newest last.
-///
-/// `/videos/<hash>/<idx>` starts a torrent that isn't running yet, which is
-/// what lets the addon hand out a short URL. Without a gate, that endpoint
-/// would make the gateway join *any* swarm a caller names -- a stranger who
-/// can reach the port could use it to download arbitrary content in your
-/// name. So a hash is only startable if we advertised it first.
-///
-/// Each hash also remembers the trackers the index reported for that
-/// specific release. A lazy start otherwise begins from a bare info hash
-/// with nothing but DHT and the generic default trackers to find peers on --
-/// the release's own trackers are where its seeders actually announce, so
-/// carrying them to the start call is a large part of "press play, get
-/// bytes" being fast the first time.
-///
-/// Bounded so a long-running session cannot grow this without limit; evicting
-/// the oldest entry only costs a re-browse to make it playable again.
-struct AdvertisedHashes {
-    order: VecDeque<String>,
-    trackers: HashMap<String, Vec<String>>,
-    cap: usize,
+/// The configured knobs a video response reads on every request, gathered so
+/// they are converted from the config once rather than on each read.
+#[derive(Debug, Clone)]
+pub struct StreamTuning {
+    /// Ceiling on the pre-buffer, in bytes. 0 disables it.
+    pub prebuffer_bytes: usize,
+    pub prebuffer_timeout: Duration,
+    /// How long a body may produce nothing before its read is re-opened.
+    /// Zero disables that.
+    pub stall_timeout: Duration,
+    /// Whether a new read retires the same client's reads that never produced
+    /// a byte. See `register_reader`.
+    pub seek_supersede: bool,
+    /// Whether a trailing container index is fetched alongside the head. See
+    /// `warm_mp4_tail`.
+    pub tail_warm: bool,
+    /// Extra read-ahead past librqbit's own window, in bytes. 0 disables it.
+    pub readahead_extra: u64,
+    pub readahead_settle: Duration,
 }
 
-impl AdvertisedHashes {
-    fn new(cap: usize) -> Self {
+impl StreamTuning {
+    pub fn from_config(config: &AppConfig) -> Self {
         Self {
-            order: VecDeque::new(),
-            trackers: HashMap::new(),
-            cap,
+            prebuffer_bytes: config.prebuffer_bytes,
+            prebuffer_timeout: Duration::from_secs(config.prebuffer_timeout_secs),
+            stall_timeout: Duration::from_secs(config.stall_timeout_secs),
+            seek_supersede: config.seek_supersede,
+            tail_warm: config.mp4_tail_warm,
+            readahead_extra: config.readahead_extra_mb.saturating_mul(1024 * 1024),
+            readahead_settle: Duration::from_secs(config.readahead_settle_secs),
         }
-    }
-
-    /// Rebuilds the set from what was on disk, newest last, honouring the cap.
-    fn seed(cap: usize, entries: Vec<AdvertisedEntry>) -> Self {
-        let mut set = Self::new(cap);
-        for entry in entries {
-            set.remember(entry.hash, entry.trackers);
-        }
-        set
-    }
-
-    fn snapshot(&self) -> Vec<AdvertisedEntry> {
-        self.order
-            .iter()
-            .map(|hash| AdvertisedEntry {
-                hash: hash.clone(),
-                trackers: self.trackers.get(hash).cloned().unwrap_or_default(),
-            })
-            .collect()
-    }
-
-    fn remember(&mut self, hash: String, trackers: Vec<String>) {
-        if let Some(known) = self.trackers.get_mut(&hash) {
-            // Re-advertised: keep the entry, but adopt trackers if this
-            // sighting knows some and the stored one does not (a legacy
-            // entry, or a magnet-path advert that carried none).
-            if known.is_empty() && !trackers.is_empty() {
-                *known = trackers;
-            }
-            return;
-        }
-        if self.order.len() >= self.cap {
-            if let Some(oldest) = self.order.pop_front() {
-                self.trackers.remove(&oldest);
-            }
-        }
-        self.trackers.insert(hash.clone(), trackers);
-        self.order.push_back(hash);
-    }
-
-    fn contains(&self, hash: &str) -> bool {
-        self.trackers.contains_key(hash)
-    }
-
-    fn trackers_for(&self, hash: &str) -> Vec<String> {
-        self.trackers.get(hash).cloned().unwrap_or_default()
     }
 }
 
-/// How much of `cooldown` is left since `info_hash` was marked in `failures`,
+/// How far along a torrent is, derived once from librqbit's byte counts so
+/// every caller agrees on what "finished" means.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Progress {
+    /// Every wanted byte is on disk. A torrent whose size is still unknown is
+    /// never finished.
+    finished: bool,
+    percent: f64,
+}
+
+impl Progress {
+    fn of(progress_bytes: u64, total_bytes: u64) -> Self {
+        Self {
+            finished: total_bytes > 0 && progress_bytes >= total_bytes,
+            percent: if total_bytes == 0 {
+                0.0
+            } else {
+                progress_bytes as f64 / total_bytes as f64 * 100.0
+            },
+        }
+    }
+}
+
+/// How much of `cooldown` is left for `info_hash` since its last failure,
 /// or `None` if it was never marked or the cooldown already elapsed. Prunes
 /// every expired entry it passes over, so the map cannot grow for the life of
 /// the process. `cooldown` is a parameter (rather than reading the module
@@ -441,6 +264,9 @@ fn remaining_cooldown(
     failures.get(info_hash).map(|at| cooldown - at.elapsed())
 }
 
+/// A per-hash lock held for the whole of a start, across its awaits.
+type StartLock = Arc<tokio::sync::Mutex<()>>;
+
 /// Hands out the start lock for one info hash, creating it on first use.
 ///
 /// Every caller for the same hash must get the *same* `Arc`, or the lock
@@ -448,280 +274,41 @@ fn remaining_cooldown(
 /// as we pass over them, so a long browsing session cannot grow this without
 /// bound -- while a lock somebody is currently holding or waiting on (strong
 /// count above one) is never removed.
-fn lock_for(starts: &mut HashMap<String, Arc<Mutex<()>>>, info_hash: &str) -> Arc<Mutex<()>> {
+fn lock_for(starts: &mut HashMap<String, StartLock>, info_hash: &str) -> StartLock {
     starts.retain(|hash, lock| hash == info_hash || Arc::strong_count(lock) > 1);
-    Arc::clone(
-        starts
-            .entry(info_hash.to_string())
-            .or_insert_with(|| Arc::new(Mutex::new(()))),
-    )
+    Arc::clone(starts.entry(info_hash.to_string()).or_default())
 }
 
-/// Decodes a persisted advertised set, accepting both the current format
-/// (entries with trackers) and the pre-0.9 one (a bare list of hashes).
-/// A file written by the previous version must keep every already-installed
-/// Stremio link startable, not silently reset the whole set.
-fn parse_advertised(bytes: &[u8]) -> Vec<AdvertisedEntry> {
-    if let Ok(entries) = serde_json::from_slice::<Vec<AdvertisedEntry>>(bytes) {
-        return entries;
+/// Every map in the engine is keyed by the lowercase hex form. Borrowed when
+/// the caller already has it, which is nearly always.
+fn lowercase(info_hash: &str) -> Cow<'_, str> {
+    if info_hash.bytes().any(|b| b.is_ascii_uppercase()) {
+        Cow::Owned(info_hash.to_ascii_lowercase())
+    } else {
+        Cow::Borrowed(info_hash)
     }
-    serde_json::from_slice::<Vec<String>>(bytes)
-        .map(|hashes| {
-            hashes
-                .into_iter()
-                .map(|hash| AdvertisedEntry {
-                    hash,
-                    trackers: Vec::new(),
-                })
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
-/// Marks a torrent as "being read right now", for exactly as long as the HTTP
-/// response body that owns it is alive.
+fn parse_idx(info_hash: &str) -> Result<TorrentIdOrHash> {
+    TorrentIdOrHash::parse(info_hash)
+        .map_err(|e| anyhow::anyhow!("invalid info hash {info_hash}: {e}"))
+}
+
+/// The engine.
 ///
-/// The idle reaper must never pause a torrent that has a live reader.
-/// librqbit's reader parks on `Poll::Pending` waiting for one specific piece
-/// and is only ever woken by *that piece completing*; pausing does not wake
-/// it, and there is no timeout. So pausing under a live reader freezes it
-/// permanently -- the video stops dead and only a fresh HTTP request (what a
-/// viewer does by hand when they skip forward) recovers it.
+/// # Locks
 ///
-/// Request recency cannot stand in for this. A player fills its buffer, then
-/// reads nothing for minutes while it plays what it already holds, which is
-/// indistinguishable from an abandoned torrent by that measure.
-pub struct StreamGuard {
-    engine: Arc<TorrentEngine>,
-    info_hash: String,
-}
-
-impl Drop for StreamGuard {
-    fn drop(&mut self) {
-        self.engine.open_streams().release(&self.info_hash);
-    }
-}
-
-/// How many response bodies are reading each torrent right now.
+/// Every `std` mutex here is a leaf. It is held for one map operation and
+/// released: never across an `.await`, never while another engine lock is
+/// held, and never inside `session().with_torrents` -- librqbit holds its own
+/// session lock for the length of that closure, so taking one of ours in
+/// there is how two threads come to wait on each other in opposite orders.
+/// A pass that needs several of them copies what it needs out first; see
+/// `queue_snapshot` and `held_snapshot`.
 ///
-/// Reference-counted rather than a flag because one player legitimately holds
-/// several reads at once -- a container header, an index at the end of the
-/// file, and the playback position -- and the torrent must stay protected
-/// until the last of them is done, not the first.
-#[derive(Default)]
-struct OpenStreamCounts(HashMap<String, usize>);
-
-impl OpenStreamCounts {
-    fn acquire(&mut self, info_hash: &str) {
-        *self.0.entry(info_hash.to_string()).or_insert(0) += 1;
-    }
-
-    fn release(&mut self, info_hash: &str) {
-        if let Some(count) = self.0.get_mut(info_hash) {
-            *count = count.saturating_sub(1);
-            if *count == 0 {
-                // Removed rather than left at zero so the map tracks live
-                // readers only, and cannot grow for the life of the process.
-                self.0.remove(info_hash);
-            }
-        }
-    }
-
-    fn is_open(&self, info_hash: &str) -> bool {
-        self.0.get(info_hash).is_some_and(|count| *count > 0)
-    }
-
-    /// How many distinct torrents have a live reader. Torrents rather than
-    /// readers because one player routinely holds several reads on the same
-    /// file at once (a container header, an index near the end, the playback
-    /// position), and reporting "3 active streams" for one viewer watching one
-    /// episode describes the implementation rather than what is happening.
-    fn torrents_open(&self) -> usize {
-        self.0.values().filter(|count| **count > 0).count()
-    }
-}
-
-/// librqbit's per-stream look-ahead window, from
-/// `torrent_state::streaming::PER_STREAM_BUF_DEFAULT`.
-///
-/// Not configurable from outside the library, which is the whole reason
-/// `spawn_readahead` exists: the only way to prioritise further ahead than
-/// this is to hold a second read positioned there.
-const LIBRQBIT_STREAM_WINDOW: u64 = 32 * 1024 * 1024;
-
-/// How much of an mp4's tail the warmer pulls. One piece is enough to make
-/// the range request the player is about to issue land on data already here;
-/// this is comfortably over the largest piece size in practice.
-const TAIL_WARM_BYTES: u64 = 24 * 1024 * 1024;
-
-/// How long the tail warmer waits for those bytes before giving up. Generous
-/// because it costs nothing to wait -- it is a background read nobody is
-/// watching, and once its pieces arrive it stops asking for anything.
-const TAIL_WARM_TIMEOUT: Duration = Duration::from_secs(120);
-
-/// Containers whose players read the tail of the file before they will play
-/// the head.
-///
-/// For mp4/m4v/mov this is the `moov` atom, and it is a certainty on a
-/// non-faststart file. mkv/webm are here for a measured reason rather than a
-/// structural one: Matroska puts its SeekHead at the front, so the theory says
-/// it needs none of this — but muxers routinely write the Cues at the end, and
-/// players probe for them anyway. On 2026-09-07 a 1.16 GB mkv start spent
-/// **12.2 s of its 20 s** on exactly one such request (`bytes=1162008830-`,
-/// the last 21 KB), serialised after the head read instead of beside it. The
-/// warmer costs one piece when it guesses wrong, and that trade is not close.
-const TAIL_INDEXED_EXTENSIONS: [&str; 5] = ["mp4", "m4v", "mov", "mkv", "webm"];
-
-/// How often the read-ahead claim is re-pointed at the current position.
-const READAHEAD_REFRESH: Duration = Duration::from_secs(5);
-
-/// How far the playback position must move before the read-ahead claim is
-/// re-opened. Re-opening is a real API call, so it is not done per refresh.
-const READAHEAD_ADVANCE_BYTES: u64 = 8 * 1024 * 1024;
-
-/// A one-way "stop what you are doing" signal for a single response.
-///
-/// Built on a closed semaphore rather than a flag plus a `Notify` because the
-/// obvious version of that has a race: check the flag, find it clear, await
-/// the notification, and miss the one that fired in between. A semaphore with
-/// no permits can only ever resolve by being closed, and closing is
-/// idempotent, observable, and cannot be missed by a late waiter.
-pub struct ReaderCancel(Semaphore);
-
-impl ReaderCancel {
-    fn new() -> Self {
-        Self(Semaphore::new(0))
-    }
-
-    /// A signal that will never fire, for callers with nothing to supersede
-    /// them (tests, and any future non-HTTP reader).
-    pub fn never_cancelled() -> Self {
-        Self::new()
-    }
-
-    /// Fires the signal by hand. Only for tests -- in the gateway itself the
-    /// decision to supersede belongs to `register_reader`, which is the one
-    /// place that can see every reader and apply the same rules to all of them.
-    #[cfg(test)]
-    pub fn cancel_for_test(&self) {
-        self.cancel();
-    }
-
-    fn cancel(&self) {
-        self.0.close();
-    }
-
-    pub fn is_cancelled(&self) -> bool {
-        self.0.is_closed()
-    }
-
-    /// Resolves when, and only when, this reader has been superseded.
-    pub async fn cancelled(&self) {
-        let _ = self.0.acquire().await;
-    }
-}
-
-/// One in-flight video response, as far as deciding who still deserves piece
-/// priority is concerned.
-struct ReaderSlot {
-    id: u64,
-    info_hash: String,
-    file_idx: usize,
-    /// Superseding is scoped to one client, so a second device starting the
-    /// same title cannot cancel the first device's cold start (and be
-    /// cancelled in turn by its retry, forever).
-    client: IpAddr,
-    /// An index/tail probe. Exempt, because it is a second read the same
-    /// player genuinely needs at the same time, not a superseded seek.
-    tail_probe: bool,
-    served: Arc<AtomicU64>,
-    cancel: Arc<ReaderCancel>,
-}
-
-impl ReaderSlot {
-    /// Whether a new read of `(info_hash, file_idx)` from `client` makes this
-    /// one redundant.
-    ///
-    /// Every clause is load-bearing; see `register_reader` for why each one is
-    /// there and what breaks without it.
-    fn superseded_by(&self, info_hash: &str, file_idx: usize, client: IpAddr) -> bool {
-        self.info_hash == info_hash
-            && self.file_idx == file_idx
-            && self.client == client
-            && !self.tail_probe
-            && self.served.load(Ordering::Relaxed) == 0
-    }
-}
-
-/// Registration of a live video response. Held for as long as the response is,
-/// and removed from the registry when dropped.
-pub struct ReaderTicket {
-    engine: Arc<TorrentEngine>,
-    id: u64,
-    served: Arc<AtomicU64>,
-    cancel: Arc<ReaderCancel>,
-}
-
-impl ReaderTicket {
-    /// The signal to stop. Selected on by the pre-buffer and by the response
-    /// body, which are the two places a superseded read would otherwise sit
-    /// holding piece priority it is never going to use.
-    pub fn cancel_handle(&self) -> Arc<ReaderCancel> {
-        Arc::clone(&self.cancel)
-    }
-
-    /// Reports progress. A reader that has delivered even one byte is someone
-    /// watching something and is never superseded.
-    pub fn record_served(&self, bytes: u64) {
-        self.served.fetch_add(bytes, Ordering::Relaxed);
-    }
-}
-
-impl Drop for ReaderTicket {
-    fn drop(&mut self) {
-        self.engine
-            .readers
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .retain(|slot| slot.id != self.id);
-    }
-}
-
-/// Keeps an extra read-ahead claim alive for the life of one response.
-///
-/// Dropping it aborts the task, which drops the read it was holding, which is
-/// what removes the claim from librqbit's priority set. There is no other
-/// unregister step — the claim *is* the open read.
-pub struct ReadaheadHandle(tokio::task::JoinHandle<()>);
-
-impl Drop for ReadaheadHandle {
-    fn drop(&mut self) {
-        self.0.abort();
-    }
-}
-
-/// Whether this filename names a container whose player is likely to read the
-/// tail before it will play the head — see `TAIL_INDEXED_EXTENSIONS` for why
-/// that is a claim about observed player behaviour, not about the format.
-fn has_tail_index(name: &str) -> bool {
-    name.rsplit('.')
-        .next()
-        .is_some_and(|ext| TAIL_INDEXED_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()))
-}
-
-/// Where a byte offset sits relative to the piece that contains it.
-///
-/// The piece is the unit BitTorrent actually transfers, so this is the shape
-/// of the floor under every seek: nothing at `offset` can be read until the
-/// whole piece holding it has arrived and passed its hash check.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PieceGeometry {
-    pub piece_len: u64,
-    /// Bytes from the requested offset to the end of its piece, clamped to the
-    /// end of the file.
-    pub remainder: u64,
-}
-
+/// The two tokio mutexes are the exceptions, and are held across awaits by
+/// design: a per-hash start lock (`starts` hands them out), and
+/// `advertised_save`, which keeps two writes of the advertised file in order.
 pub struct TorrentEngine {
     api: Api,
     /// How an identifier turns into a magnet link. Only `MagnetSource` today;
@@ -729,25 +316,20 @@ pub struct TorrentEngine {
     /// only means constructing `TorrentEngine` with a different `Box` here.
     source: Box<dyn TorrentSource>,
     max_concurrent: Arc<Semaphore>,
-    active_streams: Mutex<HashMap<String, StreamActivity>>,
-    advertised: Mutex<AdvertisedHashes>,
+    /// Last request per torrent. Bounded; see `touch_stream`.
+    active_streams: StdMutex<HashMap<String, StreamActivity>>,
+    advertised: StdMutex<AdvertisedHashes>,
+    /// Serialises writes of the advertised file, so a slow older write can
+    /// never land after a newer one.
+    advertised_save: tokio::sync::Mutex<()>,
     /// Where the advertised set is kept between runs.
     advertised_path: PathBuf,
-    /// Which torrents have a response body reading them right now. A plain
-    /// `std` mutex because `StreamGuard::drop` cannot await, and every
-    /// critical section here is a single map lookup.
+    /// Which torrents have a response body reading them right now. See
+    /// `StreamGuard`.
     open_streams: StdMutex<OpenStreamCounts>,
-    /// The torrent the viewer is watching *now*.
-    ///
-    /// Every other unfinished torrent is paused the moment this changes, so
-    /// the whole line goes to the thing on screen. Without it the previous
-    /// title kept downloading until the idle reaper noticed, which is up to
-    /// `idle_pause_secs` (five minutes) of a finished-with title competing
-    /// with the one that just started.
+    /// The torrent the viewer is watching *now*. See `focus_stream`.
     focused: StdMutex<Option<String>>,
-    prebuffer_bytes: usize,
-    prebuffer_timeout: Duration,
-    stall_timeout: Duration,
+    tuning: StreamTuning,
     /// How many unknown torrents a single browse may start fetching metadata
     /// for. See `warm_for_browse`.
     browse_prefetch: usize,
@@ -755,10 +337,10 @@ pub struct TorrentEngine {
     max_active_downloads: usize,
     /// One lock per info hash being started, so the same torrent is never
     /// added twice at once. See `start_lock`.
-    starts: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    starts: StdMutex<HashMap<String, StartLock>>,
     /// Metadata from torrents already resolved, so starting one does not
     /// re-fetch what a resolve just pulled. See `MetadataCache`.
-    resolved_metadata: Mutex<MetadataCache>,
+    resolved_metadata: StdMutex<MetadataCache>,
     /// The same metadata on disk, so replaying a title the janitor reclaimed
     /// weeks ago still needs no swarm lookup. See `MetadataArchive`.
     metadata_archive: MetadataArchive,
@@ -777,14 +359,10 @@ pub struct TorrentEngine {
     /// Every video response currently in flight. See `register_reader`.
     readers: StdMutex<Vec<ReaderSlot>>,
     next_reader_id: AtomicU64,
-    /// Files whose trailing index has already been warmed, so the warmer runs
-    /// once per file rather than once per seek.
-    tail_warmed: StdMutex<HashSet<(String, usize)>>,
-    seek_supersede: bool,
-    mp4_tail_warm: bool,
-    /// Extra read-ahead to claim past librqbit's own window, in bytes. 0 off.
-    readahead_extra: u64,
-    readahead_settle: Duration,
+    /// Files whose trailing index has already been warmed, by torrent, so the
+    /// warmer runs once per file rather than once per seek -- and the check
+    /// on every later seek allocates nothing.
+    tail_warmed: StdMutex<HashMap<String, HashSet<usize>>>,
     /// Per-torrent peer cap applied at add time, when set.
     cold_start_peer_limit: Option<usize>,
 }
@@ -802,103 +380,6 @@ struct ColdStartPhases {
     from_cached_metadata: bool,
     metadata_ms: u64,
     initialize_ms: u64,
-}
-
-/// What to do with a torrent that is not the one being watched.
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
-pub(crate) enum UnfocusedAction {
-    /// Leave it exactly as it is.
-    Leave,
-    /// Stop downloading and delete the partial file.
-    Discard,
-}
-
-/// What should happen to the title the viewer just switched away from.
-///
-/// Starting a different title means that one has been abandoned — nobody
-/// changes episode intending to come back to a half-downloaded file — so its
-/// partial data is dead weight in a cache that sits permanently at its cap.
-/// It is deleted rather than paused, which is the only thing here that
-/// actually frees space.
-///
-/// This applies to *the previous focus only*, never to the whole session. An
-/// earlier version swept every unfinished torrent on each switch, which wiped
-/// eight queued titles the first time anything was played — the viewer's
-/// backlog is not the same thing as the title they just left.
-///
-/// Three exemptions, and they are not stylistic:
-///
-/// * an **open stream** means some response body is still reading those bytes
-///   (a second device, or this player's own header/index reads). Deleting
-///   underneath it truncates a video someone is watching — see `StreamGuard`.
-/// * **recent activity** means someone was reading it moments ago and has not
-///   had time to come back. An open connection is not the same question as
-///   "is anyone watching this": range requests are stateless, so there is no
-///   connection at all between a seek and the next read, and none while a
-///   player that just timed out prepares its retry. `StreamActivity` says this
-///   outright, and the idle reaper already honours it — this path did not, so
-///   the *irreversible* action was judging liveness more loosely than the
-///   reversible one. That is what made a failed play destructive: a player
-///   giving up on a cold torrent closed its connection, the next stream it
-///   tried took focus, and the torrent it had just spent 15 seconds warming
-///   was deleted along with every byte and every peer it had found. Each
-///   attempt therefore started colder than the last, which is what a viewer
-///   sees as the player cycling through every source and playing none.
-/// * a **finished** torrent is a complete file. It costs no download
-///   bandwidth, and throwing away a fully-downloaded movie because the viewer
-///   started the next episode is destructive in a way nobody asks for. The
-///   cache janitor already reclaims those, oldest-first, once the cap forces
-///   it.
-fn action_for_abandoned(
-    has_open_stream: bool,
-    recently_active: bool,
-    finished: bool,
-) -> UnfocusedAction {
-    if has_open_stream || recently_active || finished {
-        return UnfocusedAction::Leave;
-    }
-    UnfocusedAction::Discard
-}
-
-/// Picks the torrents allowed to download, given the unfinished ones in
-/// admission order (oldest first). Pure, so the priority rules can be tested
-/// without a session; see [`TorrentEngine::download_slots`] for what each rule
-/// is for.
-///
-/// The cap is a target, not a ceiling: readers and the focused title are
-/// admitted first and can push the set past it. Both are cases where pausing
-/// the torrent is either impossible without freezing a live reader or
-/// obviously wrong, so reporting a smaller set would be a lie about what is
-/// using the line rather than a restriction on it.
-fn choose_download_slots(
-    unfinished: &[(usize, String)],
-    focused: Option<&str>,
-    has_open_stream: impl Fn(&str) -> bool,
-    cap: usize,
-) -> HashSet<String> {
-    let mut slots: HashSet<String> = HashSet::new();
-
-    for (_, hash) in unfinished {
-        if has_open_stream(hash) {
-            slots.insert(hash.clone());
-        }
-    }
-    if let Some(focused) = focused {
-        // Only if it is genuinely unfinished. A finished focus needs no slot,
-        // and holding one for it would shrink the queue by one for as long as
-        // the viewer stayed on that episode.
-        if unfinished.iter().any(|(_, hash)| hash == focused) {
-            slots.insert(focused.to_string());
-        }
-    }
-    for (_, hash) in unfinished {
-        if slots.len() >= cap {
-            break;
-        }
-        slots.insert(hash.clone());
-    }
-
-    slots
 }
 
 /// Turns a megabytes-per-second setting into the bytes-per-second rate limiter
@@ -967,31 +448,42 @@ impl TorrentEngine {
         // default is a well-known one that another torrent client may well
         // hold. Falling back to an ephemeral port keeps the listener (and so
         // the incoming peers it exists for) rather than refusing to start.
-        let session = match Session::new_with_opts(config.downloads_dir(), make_opts(config.peer_port))
-            .await
-        {
-            Ok(session) => session,
-            Err(e) if config.peer_port != 0 => {
-                warn!(
-                    port = config.peer_port,
-                    "could not start the torrent session on that peer port ({e:#}); \
-                     retrying on an ephemeral one"
-                );
-                Session::new_with_opts(config.downloads_dir(), make_opts(0))
-                    .await
-                    .context("failed to start torrent session")?
-            }
-            Err(e) => return Err(e).context("failed to start torrent session"),
-        };
+        let session =
+            match Session::new_with_opts(config.downloads_dir(), make_opts(config.peer_port)).await
+            {
+                Ok(session) => session,
+                Err(e) if config.peer_port != 0 => {
+                    warn!(
+                        port = config.peer_port,
+                        "could not start the torrent session on that peer port ({e:#}); \
+                         retrying on an ephemeral one"
+                    );
+                    Session::new_with_opts(config.downloads_dir(), make_opts(0))
+                        .await
+                        .context("failed to start torrent session")?
+                }
+                Err(e) => return Err(e).context("failed to start torrent session"),
+            };
 
         let api = Api::new(session, None);
 
         let advertised_path = config.session_state_dir().join("advertised.json");
-        let remembered_advertised = Self::load_advertised(&advertised_path).await;
+        let remembered_advertised = load_advertised(&advertised_path).await;
         if !remembered_advertised.is_empty() {
             info!(
                 count = remembered_advertised.len(),
                 "restored advertised info hashes, so links already in a client keep working"
+            );
+        }
+
+        let tuning = StreamTuning::from_config(config);
+        let budget = ADD_TORRENT_TIMEOUT + INITIALIZE_TIMEOUT + tuning.prebuffer_timeout;
+        if budget >= crate::REQUEST_TIMEOUT {
+            warn!(
+                budget_secs = budget.as_secs(),
+                request_timeout_secs = crate::REQUEST_TIMEOUT.as_secs(),
+                "PREBUFFER_TIMEOUT_SECS pushes a worst-case cold start past the request \
+                 timeout; a slow first play will end in a 504 instead of a retryable 503"
             );
         }
 
@@ -1002,20 +494,19 @@ impl TorrentEngine {
             // At least one, or nothing could ever download -- including the
             // title on screen, which would look like the gateway hanging.
             max_active_downloads: config.max_active_downloads.max(1),
-            active_streams: Mutex::new(HashMap::new()),
-            advertised: Mutex::new(AdvertisedHashes::seed(
+            active_streams: StdMutex::new(HashMap::new()),
+            advertised: StdMutex::new(AdvertisedHashes::seed(
                 ADVERTISED_HASH_CAPACITY,
                 remembered_advertised,
             )),
+            advertised_save: tokio::sync::Mutex::new(()),
             advertised_path,
             open_streams: StdMutex::new(OpenStreamCounts::default()),
             focused: StdMutex::new(None),
-            prebuffer_bytes: config.prebuffer_bytes,
-            prebuffer_timeout: Duration::from_secs(config.prebuffer_timeout_secs),
-            stall_timeout: Duration::from_secs(config.stall_timeout_secs),
+            tuning,
             browse_prefetch: config.browse_prefetch_count,
-            starts: Mutex::new(HashMap::new()),
-            resolved_metadata: Mutex::new(MetadataCache::default()),
+            starts: StdMutex::new(HashMap::new()),
+            resolved_metadata: StdMutex::new(MetadataCache::default()),
             metadata_archive: MetadataArchive::new(config.session_state_dir().join("metadata")),
             failed_starts: Arc::new(StdMutex::new(HashMap::new())),
             searching: Arc::new(StdMutex::new(HashSet::new())),
@@ -1023,11 +514,7 @@ impl TorrentEngine {
             audit: StdMutex::new(crate::audit::AuditLog::disabled()),
             readers: StdMutex::new(Vec::new()),
             next_reader_id: AtomicU64::new(0),
-            tail_warmed: StdMutex::new(HashSet::new()),
-            seek_supersede: config.seek_supersede,
-            mp4_tail_warm: config.mp4_tail_warm,
-            readahead_extra: config.readahead_extra_mb.saturating_mul(1024 * 1024),
-            readahead_settle: Duration::from_secs(config.readahead_settle_secs),
+            tail_warmed: StdMutex::new(HashMap::new()),
             cold_start_peer_limit: (config.cold_start_peer_limit > 0)
                 .then_some(config.cold_start_peer_limit),
         });
@@ -1038,25 +525,31 @@ impl TorrentEngine {
         // whose replay next month would otherwise need the swarm. Doing it
         // here rather than only on play makes the archive cover the library
         // that already exists, not just what gets watched from now on.
-        engine.archive_session_metadata().await;
+        //
+        // Detached: it is disk work for the future, and the listener should
+        // not wait on it.
+        let archiving = Arc::clone(&engine);
+        tokio::spawn(async move { archiving.archive_session_metadata().await });
 
         Ok(engine)
     }
 
     /// Copies every torrent currently in the session into the metadata
-    /// archive. Best effort, and cheap: the bytes are already resident.
+    /// archive. Best effort, and cheap: the bytes are already resident, and a
+    /// blob an earlier run banked is skipped without being read.
     async fn archive_session_metadata(&self) {
-        let known: Vec<String> = self
-            .api
-            .session()
-            .with_torrents(|iter| iter.map(|(_, h)| h.info_hash().as_string()).collect());
+        let known: Vec<(String, Bytes)> = self.api.session().with_torrents(|iter| {
+            iter.filter_map(|(_, handle)| {
+                let bytes = handle.with_metadata(|m| m.torrent_bytes.clone()).ok()?;
+                Some((handle.info_hash().as_string(), bytes))
+            })
+            .collect()
+        });
         let mut archived = 0;
-        for info_hash in known {
-            if self.metadata_archive.load(&info_hash).await.is_some() {
-                continue; // already banked by an earlier run
+        for (info_hash, bytes) in known {
+            if self.metadata_archive.store(&info_hash, &bytes).await {
+                archived += 1;
             }
-            self.archive_metadata(&info_hash).await;
-            archived += 1;
         }
         if archived > 0 {
             info!(
@@ -1072,20 +565,21 @@ impl TorrentEngine {
     /// of the application state exists. Until this is called the engine logs
     /// nothing, which is what tests and the integration harness want.
     pub fn attach_audit(&self, log: crate::audit::AuditLog) {
-        *self
-            .audit
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = log;
+        *lock(&self.audit) = log;
     }
 
     pub fn audit(&self) -> crate::audit::AuditLog {
-        self.audit
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
+        lock(&self.audit).clone()
     }
 
     /// Fetches torrent metadata only (fast, no data downloaded) and lists its files.
+    ///
+    /// Metadata this gateway already holds -- a running torrent, the memory
+    /// cache, the archive -- is listed from those bytes without touching the
+    /// network. Only a genuinely unknown hash asks the swarm, and that ask is
+    /// bounded by `ADD_TORRENT_TIMEOUT` and refused while a search for the
+    /// same hash is already running or has just come back empty, exactly as
+    /// a start is.
     ///
     /// Goes through `Session::add_torrent` rather than the `Api` wrapper for
     /// one reason: the wrapper discards the assembled `.torrent` bytes, and
@@ -1095,18 +589,32 @@ impl TorrentEngine {
         let magnet = self.source.to_magnet(input)?;
         let info_hash = info_hash_from_magnet(&magnet)?;
 
+        let known = self.known_metadata(&info_hash).await;
+        let fetched = known.is_none();
+        let source = match known {
+            Some(bytes) => AddTorrent::from_bytes(bytes),
+            None => {
+                self.refuse_repeat_search(&info_hash, false)?;
+                AddTorrent::from_url(magnet.clone())
+            }
+        };
+
         let opts = AddTorrentOptions {
             list_only: true,
             ..Default::default()
         };
-        let response = self
-            .api
-            .session()
-            .add_torrent(AddTorrent::from_url(magnet.clone()), Some(opts))
-            .await
-            .context(
-                "failed to fetch torrent metadata (no peers found yet, or invalid torrent?)",
-            )?;
+        let response = tokio::time::timeout(
+            ADD_TORRENT_TIMEOUT,
+            self.api.session().add_torrent(source, Some(opts)),
+        )
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "no metadata after {}s -- no peer holding this release answered yet",
+                ADD_TORRENT_TIMEOUT.as_secs()
+            )
+        })?
+        .context("failed to fetch torrent metadata (no peers found yet, or invalid torrent?)")?;
 
         // `list_only` always takes the `ListOnly` arm; the others would mean
         // librqbit started a download we explicitly asked it not to.
@@ -1135,13 +643,12 @@ impl TorrentEngine {
         // Whoever resolved is about to start this same torrent, so keep what
         // the fetch cost so `start_file` does not pay it again -- and on disk
         // too, so a replay long after this session is over does not either.
-        self.metadata_archive
-            .store(&info_hash, &listed.torrent_bytes)
-            .await;
-        self.resolved_metadata
-            .lock()
-            .await
-            .remember(info_hash.clone(), listed.torrent_bytes);
+        if fetched {
+            self.metadata_archive
+                .store(&info_hash, &listed.torrent_bytes)
+                .await;
+        }
+        lock(&self.resolved_metadata).remember(info_hash.clone(), listed.torrent_bytes);
 
         Ok(ResolvedTorrent {
             info_hash,
@@ -1151,6 +658,28 @@ impl TorrentEngine {
             suggested_file_idx,
             seen_peers: listed.seen_peers,
         })
+    }
+
+    /// Metadata for `info_hash` from anywhere this gateway keeps it: a
+    /// torrent already in the session first, then what `cached_metadata`
+    /// finds.
+    async fn known_metadata(&self, info_hash: &str) -> Option<Bytes> {
+        match session_metadata(&self.api, info_hash) {
+            Some(bytes) => Some(bytes),
+            None => self.cached_metadata(info_hash).await,
+        }
+    }
+
+    /// Metadata this gateway pulled for exactly this hash at some earlier
+    /// point: memory first, then the on-disk archive, which is what covers a
+    /// title whose files the janitor reclaimed days ago. See `MetadataCache`
+    /// and `MetadataArchive`.
+    async fn cached_metadata(&self, info_hash: &str) -> Option<Bytes> {
+        let in_memory = lock(&self.resolved_metadata).get(info_hash);
+        match in_memory {
+            Some(bytes) => Some(bytes),
+            None => self.metadata_archive.load(info_hash).await,
+        }
     }
 
     /// Starts (or resumes) downloading a single file from a torrent, restricted
@@ -1214,7 +743,7 @@ impl TorrentEngine {
         // first: two fetches competing for the same peers, and the head start
         // the prefetch bought thrown away. Waiting here instead means the tap
         // joins the fetch already in flight and returns the moment it lands.
-        let start_lock = self.start_lock(&info_hash).await;
+        let start_lock = self.start_lock(&info_hash);
         let _start_guard = start_lock.lock().await;
 
         // Playing a title is the clearest possible statement that its hand
@@ -1223,63 +752,28 @@ impl TorrentEngine {
         self.forget_hold(&info_hash);
 
         // Whoever held the lock may have finished the job while we waited.
-        let idx = TorrentIdOrHash::parse(&info_hash)
-            .map_err(|e| anyhow::anyhow!("invalid info hash {info_hash}: {e}"))?;
+        let idx = parse_idx(&info_hash)?;
         if let Some(handle) = self.api.session().get(idx) {
-            if handle.is_paused() {
-                let _ = self.api.api_torrent_action_start(idx).await;
+            if let Err(e) = self.resume_if_paused(&handle, idx).await {
+                // Almost always a race with something else resuming it.
+                debug!(%info_hash, "resume before start returned an error: {e:#}");
             }
-            self.wait_until_streamable(&info_hash, INITIALIZE_TIMEOUT)
+            self.wait_handle_streamable(&handle, &info_hash, INITIALIZE_TIMEOUT)
                 .await?;
             return Ok(info_hash);
         }
 
-        // Metadata this gateway already pulled for exactly this hash. Adding
-        // from it resolves nothing over the network, so the slowest step of a
-        // cold start disappears entirely -- which is the whole point of
-        // keeping it. Memory first, then the on-disk archive, which is what
-        // covers a title whose files the janitor reclaimed days ago. See
-        // `MetadataCache` and `MetadataArchive`.
-        let cached_metadata = match self.resolved_metadata.lock().await.get(&info_hash) {
-            Some(bytes) => Some(bytes),
-            None => self.metadata_archive.load(&info_hash).await,
-        };
+        // Adding from metadata already held resolves nothing over the
+        // network, so the slowest step of a cold start disappears entirely --
+        // which is the whole point of keeping it.
+        let cached_metadata = self.cached_metadata(&info_hash).await;
 
         // Past the warm-path return above, so everything from here is a cold
         // start and worth a record however it ends.
         phases.was_cold = true;
         phases.from_cached_metadata = cached_metadata.is_some();
 
-        // A search already running for this hash is joined, not duplicated:
-        // the answer it is about to produce is the same answer this request
-        // wants, and a second concurrent search only splits the same peers
-        // between two lookups. Reported as "still looking", because that is
-        // what is true -- see `search_in_flight`.
-        if self.search_in_flight(&info_hash) {
-            anyhow::bail!(
-                "still searching the swarm for this release -- it keeps looking in the \
-                 background, so try again in a moment"
-            );
-        }
-
-        // A hash whose search just came back empty is not asked again for a
-        // short while, so a client auto-retrying a dead stream (a resumed
-        // "continue watching", or its own error recovery) gets an instant
-        // answer rather than queueing another full search behind the last
-        // one. Skipped when we already hold the metadata, since that cooldown
-        // exists to avoid re-running a search this add does not need to run.
-        // See `START_FAILURE_COOLDOWN`.
-        if let Some(remaining) = self
-            .recent_start_failure(&info_hash)
-            .filter(|_| cached_metadata.is_none())
-        {
-            anyhow::bail!(
-                "found no peers {}s ago; waiting {}s before searching again -- if this \
-                 release stays dead, pick another source for the same episode",
-                (START_FAILURE_COOLDOWN - remaining).as_secs(),
-                remaining.as_secs()
-            );
-        }
+        self.refuse_repeat_search(&info_hash, cached_metadata.is_some())?;
 
         // Throttles how many torrents can be *added* concurrently (each add
         // does a burst of tracker/DHT/peer-handshake work) -- not how many
@@ -1290,23 +784,7 @@ impl TorrentEngine {
             .await
             .context("torrent concurrency limiter closed")?;
 
-        let opts = AddTorrentOptions {
-            only_files: Some(vec![file_idx]),
-            overwrite: true,
-            // Every torrent lands under `downloads/<info_hash>/`, single- or
-            // multi-file alike. This gives the cache janitor (see the `cache`
-            // module) an unambiguous, collision-free way to map a directory
-            // on disk back to the torrent it belongs to.
-            sub_folder: Some(info_hash.clone()),
-            initial_peers: (!initial_peers.is_empty()).then_some(initial_peers),
-            // Overrides the session-wide cap for this torrent only, and only
-            // when asked for. `None` keeps the session default. librqbit reads
-            // this once, here, so it cannot be walked back down after the
-            // start -- see the field docs on `cold_start_peer_limit`.
-            peer_limit: self.cold_start_peer_limit,
-            ..Default::default()
-        };
-
+        let opts = self.start_options(&info_hash, file_idx, initial_peers);
         let source = match cached_metadata {
             Some(torrent_bytes) => {
                 debug!(%info_hash, "starting from metadata already fetched; no second swarm lookup");
@@ -1335,7 +813,7 @@ impl TorrentEngine {
         phases.metadata_ms = metadata_began.elapsed().as_millis() as u64;
 
         match added {
-            // Still going. Deliberately no `record_start_failure`: nothing has
+            // Still going. Deliberately no failure recorded: nothing has
             // failed, and marking it would gag the retry that is about to
             // succeed.
             Err(_elapsed) => anyhow::bail!(
@@ -1370,12 +848,83 @@ impl TorrentEngine {
         Ok(info_hash)
     }
 
+    /// Resumes a torrent the idle reaper, the download queue, or a prefetch
+    /// parked. A no-op for one already running.
+    async fn resume_if_paused(
+        &self,
+        handle: &Arc<ManagedTorrent>,
+        idx: TorrentIdOrHash,
+    ) -> Result<()> {
+        if handle.is_paused() {
+            self.api
+                .api_torrent_action_start(idx)
+                .await
+                .map_err(|e| anyhow::anyhow!("failed to resume torrent: {e}"))?;
+        }
+        Ok(())
+    }
+
+    /// Refuses a swarm search this hash should not run right now. Both
+    /// refusals exist to make a repeated ask cheap and honest instead of a
+    /// second full wait.
+    ///
+    /// * A search already running is joined, not duplicated: the answer it is
+    ///   about to produce is the same answer this request wants, and a second
+    ///   concurrent search only splits the same peers between two lookups.
+    /// * A hash whose search just came back empty is not asked again for a
+    ///   short while, so a client auto-retrying a dead stream gets an instant
+    ///   answer. Skipped when the metadata is already held, since the cooldown
+    ///   exists to avoid re-running a search that such an add does not run.
+    ///   See `START_FAILURE_COOLDOWN`.
+    fn refuse_repeat_search(&self, info_hash: &str, have_metadata: bool) -> Result<()> {
+        if self.search_in_flight(info_hash) {
+            anyhow::bail!(
+                "still searching the swarm for this release -- it keeps looking in the \
+                 background, so try again in a moment"
+            );
+        }
+        if have_metadata {
+            return Ok(());
+        }
+        if let Some(remaining) = self.recent_start_failure(info_hash) {
+            anyhow::bail!(
+                "found no peers {}s ago; waiting {}s before searching again -- if this \
+                 release stays dead, pick another source for the same episode",
+                (START_FAILURE_COOLDOWN - remaining).as_secs(),
+                remaining.as_secs()
+            );
+        }
+        Ok(())
+    }
+
+    /// How a start adds its torrent.
+    fn start_options(
+        &self,
+        info_hash: &str,
+        file_idx: usize,
+        initial_peers: Vec<std::net::SocketAddr>,
+    ) -> AddTorrentOptions {
+        AddTorrentOptions {
+            only_files: Some(vec![file_idx]),
+            overwrite: true,
+            // Every torrent lands under `downloads/<info_hash>/`, single- or
+            // multi-file alike. This gives the cache janitor (see the `cache`
+            // module) an unambiguous, collision-free way to map a directory
+            // on disk back to the torrent it belongs to.
+            sub_folder: Some(info_hash.to_string()),
+            initial_peers: (!initial_peers.is_empty()).then_some(initial_peers),
+            // Overrides the session-wide cap for this torrent only, and only
+            // when asked for. `None` keeps the session default. librqbit reads
+            // this once, here, so it cannot be walked back down after the
+            // start -- see the field docs on `cold_start_peer_limit`.
+            peer_limit: self.cold_start_peer_limit,
+            ..Default::default()
+        }
+    }
+
     /// Whether a background metadata search is already running for this hash.
     fn search_in_flight(&self, info_hash: &str) -> bool {
-        self.searching
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .contains(info_hash)
+        lock(&self.searching).contains(info_hash)
     }
 
     /// Starts the add on a detached task and returns a handle to it.
@@ -1388,6 +937,10 @@ impl TorrentEngine {
     ///
     /// Bounded by `BACKGROUND_SEARCH_TIMEOUT` so a genuinely dead hash cannot
     /// leave a task and a concurrency permit parked forever.
+    ///
+    /// Recording and clearing a start failure happens in here, because this
+    /// task is the only thing that knows how the search actually ended -- the
+    /// request that kicked it off has usually timed out and gone by then.
     fn spawn_search(
         &self,
         info_hash: String,
@@ -1395,10 +948,7 @@ impl TorrentEngine {
         opts: AddTorrentOptions,
         permit: tokio::sync::OwnedSemaphorePermit,
     ) -> tokio::task::JoinHandle<Result<()>> {
-        self.searching
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(info_hash.clone());
+        lock(&self.searching).insert(info_hash.clone());
 
         let api = self.api.clone();
         let searching = Arc::clone(&self.searching);
@@ -1415,16 +965,10 @@ impl TorrentEngine {
             // Released here rather than at the caller's timeout, so a search
             // that outlives its request still counts against the add limit.
             drop(permit);
-            searching
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .remove(&info_hash);
+            lock(&searching).remove(&info_hash);
 
             let failed = |reason: &str| {
-                failed_starts
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .insert(info_hash.clone(), Instant::now());
+                lock(&failed_starts).insert(info_hash.clone(), Instant::now());
                 warn!(info_hash = %info_hash, "swarm search gave up: {reason}");
             };
 
@@ -1445,10 +989,7 @@ impl TorrentEngine {
 
             // Peers answered, so any earlier failure is stale -- a later retry
             // must not be judged by a search that no longer reflects the swarm.
-            failed_starts
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .remove(&info_hash);
+            lock(&failed_starts).remove(&info_hash);
 
             // Bank the metadata this search just paid for, whether or not the
             // request that asked for it is still waiting. A search that landed
@@ -1461,58 +1002,34 @@ impl TorrentEngine {
         })
     }
 
-    /// Copies a live torrent's assembled `.torrent` blob into the archive.
+    /// Copies a live torrent's assembled `.torrent` blob into the archive and
+    /// the memory cache.
     ///
     /// Reads it off the session rather than off the add call because that is
     /// the one place it exists whatever route the torrent took in -- magnet,
     /// cached bytes, or restored from librqbit's own persistence.
     async fn archive_metadata(&self, info_hash: &str) {
-        let Ok(idx) = TorrentIdOrHash::parse(info_hash) else {
+        // `None` while still resolving; the next start banks it instead.
+        let Some(torrent_bytes) = session_metadata(&self.api, info_hash) else {
             return;
         };
-        let Some(handle) = self.api.session().get(idx) else {
-            return;
-        };
-        let Ok(torrent_bytes) = handle.with_metadata(|m| m.torrent_bytes.clone()) else {
-            return; // still resolving; the next start banks it instead
-        };
-        self.metadata_archive
-            .store(info_hash, &torrent_bytes)
-            .await;
-        self.resolved_metadata
-            .lock()
-            .await
-            .remember(info_hash.to_string(), torrent_bytes);
+        self.metadata_archive.store(info_hash, &torrent_bytes).await;
+        lock(&self.resolved_metadata).remember(info_hash.to_string(), torrent_bytes);
     }
 
     /// How much of `START_FAILURE_COOLDOWN` is left for this hash, or `None`
-    /// if it never failed or the cooldown has already elapsed. Also prunes
-    /// every expired entry it passes over, so this map cannot grow for the
-    /// life of the process.
+    /// if it never failed or the cooldown has already elapsed.
     fn recent_start_failure(&self, info_hash: &str) -> Option<Duration> {
         remaining_cooldown(
-            &mut self
-                .failed_starts
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            &mut lock(&self.failed_starts),
             info_hash,
             START_FAILURE_COOLDOWN,
         )
     }
 
-    // Recording and clearing a start failure now happens inside the background
-    // search task (see `spawn_search`), which is the only thing that knows how
-    // the search actually ended -- the request that kicked it off has usually
-    // timed out and gone by then.
-
-    /// The lock guarding starts of one particular torrent, creating it on
-    /// first use.
-    ///
-    /// Entries whose only remaining owner is the map itself are dropped as we
-    /// pass over them, so a long browsing session cannot grow this without
-    /// bound while a lock currently being waited on is never removed.
-    async fn start_lock(&self, info_hash: &str) -> Arc<Mutex<()>> {
-        lock_for(&mut *self.starts.lock().await, info_hash)
+    /// The lock guarding starts of one particular torrent. See `lock_for`.
+    fn start_lock(&self, info_hash: &str) -> StartLock {
+        lock_for(&mut lock(&self.starts), info_hash)
     }
 
     /// Makes sure `info_hash` is present in the session and streamable,
@@ -1527,46 +1044,42 @@ impl TorrentEngine {
     /// this gateway advertised -- the caller turns that into a 404 without
     /// ever touching the network. See `AdvertisedHashes` for why.
     pub async fn ensure_started(&self, info_hash: &str, file_idx: usize) -> Result<bool> {
-        let idx = TorrentIdOrHash::parse(info_hash)
-            .map_err(|e| anyhow::anyhow!("invalid info hash {info_hash}: {e}"))?;
+        let idx = parse_idx(info_hash)?;
 
         if let Some(handle) = self.api.session().get(idx) {
             // Resume anything the idle reaper (or a prefetch that decided
             // this was not the pick) paused. Cheap to check, and without it a
             // torrent you come back to would serve only the bytes already on
             // disk and then stall forever.
+            //
+            // Deliberately does NOT wait for peers to reconnect. An earlier
+            // version did, reasoning that a resumed torrent has zero peers and
+            // would stall the moment playback caught up to what was on disk.
+            // But most resumes are of a torrent that *has* data on disk -- a
+            // part-watched episode, or a finished one -- and those start
+            // playing instantly from that data while peers reconnect in the
+            // background. Blocking here made every one of them wait seconds
+            // for bytes it already had. A genuinely empty resume is handled
+            // where it belongs, by the pre-buffer and the stall/re-open path.
             if handle.is_paused() {
                 debug!(%info_hash, "resuming paused torrent for a new request");
-                self.api
-                    .api_torrent_action_start(idx)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("failed to resume torrent: {e}"))?;
-                // Deliberately does NOT wait for peers to reconnect here. An
-                // earlier version did, reasoning that a resumed torrent has
-                // zero peers and would stall the moment playback caught up to
-                // what was on disk. But most resumes are of a torrent that
-                // *has* data on disk -- a part-watched episode, or a finished
-                // one -- and those start playing instantly from that data
-                // while peers reconnect in the background. Blocking here made
-                // every one of them wait seconds for bytes it already had.
-                // A genuinely empty resume is handled where it belongs, by
-                // the pre-buffer and the stall/re-open path.
             }
+            self.resume_if_paused(&handle, idx).await?;
             // It may still be initializing if a player raced us here, so wait
             // rather than returning immediately.
-            self.wait_until_streamable(info_hash, INITIALIZE_TIMEOUT)
+            self.wait_handle_streamable(&handle, info_hash, INITIALIZE_TIMEOUT)
                 .await?;
             return Ok(true);
         }
 
-        if !self.is_advertised(info_hash).await {
+        // One lookup answers both "was it offered?" and "with which trackers?".
+        let Some(trackers) = self.advertised_trackers(info_hash) else {
             return Ok(false);
-        }
+        };
 
         // The release's own trackers (remembered from the index) travel in
         // the magnet -- a magnet add reads trackers only from the URI itself.
         // The generic defaults are announced session-wide and need no ride.
-        let trackers = self.advertised_trackers(info_hash).await;
         let magnet = resolver::magnet_with_trackers(info_hash, None, &trackers);
         self.start_file(&magnet, file_idx, Vec::new()).await?;
         Ok(true)
@@ -1576,43 +1089,57 @@ impl TorrentEngine {
     /// for lazy start via `ensure_started` -- along with the trackers the
     /// index reported for this specific release, so that lazy start announces
     /// where this torrent's seeders actually are (see `AdvertisedHashes`).
+    pub async fn remember_advertised(&self, info_hash: &str, trackers: &[String]) {
+        self.remember_advertised_many([(info_hash, trackers)]).await;
+    }
+
+    /// Records one browse's worth of offered hashes at once.
     ///
-    /// Persisted immediately. The set used to live only in memory, so every
+    /// Persisted, because the set used to live only in memory and every
     /// restart invalidated every link already sitting in a Stremio client:
     /// the phone kept requesting a perfectly good hash and kept getting
     /// "this gateway has not offered that info hash", with no way to tell
     /// that re-picking the stream would fix it.
-    pub async fn remember_advertised(&self, info_hash: &str, trackers: &[String]) {
-        let snapshot = {
-            let mut advertised = self.advertised.lock().await;
-            advertised.remember(info_hash.to_ascii_lowercase(), trackers.to_vec());
-            advertised.snapshot()
-        };
-        self.save_advertised(snapshot).await;
+    ///
+    /// Written once per batch and only when something changed. A stream list
+    /// is fifteen rows, and it used to rewrite the whole file fifteen times --
+    /// and then fifteen more on every re-browse of the same title, which
+    /// changed nothing.
+    pub async fn remember_advertised_many<'a>(
+        &self,
+        offered: impl IntoIterator<Item = (&'a str, &'a [String])>,
+    ) {
+        let batch: Vec<(String, Vec<String>)> = offered
+            .into_iter()
+            .map(|(hash, trackers)| (hash.to_ascii_lowercase(), trackers.to_vec()))
+            .collect();
+        let changed = lock(&self.advertised).remember_all(batch);
+        if changed {
+            self.save_advertised().await;
+        }
     }
 
     /// The trackers remembered for an advertised hash (empty when none were
-    /// ever reported for it).
-    pub async fn advertised_trackers(&self, info_hash: &str) -> Vec<String> {
-        self.advertised
-            .lock()
-            .await
-            .trackers_for(&info_hash.to_ascii_lowercase())
+    /// ever reported for it), or `None` if the hash was never advertised.
+    fn advertised_trackers(&self, info_hash: &str) -> Option<Vec<String>> {
+        lock(&self.advertised)
+            .trackers_if_advertised(&lowercase(info_hash))
+            .map(<[String]>::to_vec)
     }
 
     /// Writes the advertised set out. Best effort: failing to persist costs a
     /// re-pick after the next restart, which is not worth failing a request.
-    async fn save_advertised(&self, entries: Vec<AdvertisedEntry>) {
-        let path = self.advertised_path.clone();
-        if let Some(parent) = path.parent() {
-            if let Err(e) = tokio::fs::create_dir_all(parent).await {
-                debug!("could not create state dir for advertised hashes: {e}");
-                return;
-            }
-        }
+    ///
+    /// The snapshot is taken while holding the save lock, so whichever write
+    /// lands last also carries the newest state. Atomic, so a crash mid-write
+    /// cannot leave a torn file that parses as an empty set.
+    async fn save_advertised(&self) {
+        let _in_order = self.advertised_save.lock().await;
+        let entries = lock(&self.advertised).snapshot();
         match serde_json::to_vec(&entries) {
             Ok(bytes) => {
-                if let Err(e) = tokio::fs::write(&path, bytes).await {
+                if let Err(e) = crate::util::write_atomic(&self.advertised_path, bytes, false).await
+                {
                     debug!("could not persist advertised hashes: {e}");
                 }
             }
@@ -1620,23 +1147,10 @@ impl TorrentEngine {
         }
     }
 
-    /// Reads the advertised set back, or an empty list if it is absent or
-    /// unreadable — a corrupt file must not stop the gateway from starting.
-    async fn load_advertised(path: &Path) -> Vec<AdvertisedEntry> {
-        let Ok(bytes) = tokio::fs::read(path).await else {
-            return Vec::new();
-        };
-        parse_advertised(&bytes)
-    }
-
     /// Whether `/videos/<hash>/...` is allowed to *start* this torrent.
-    pub async fn is_advertised(&self, info_hash: &str) -> bool {
-        self.advertised
-            .lock()
-            .await
-            .contains(&info_hash.to_ascii_lowercase())
+    pub fn is_advertised(&self, info_hash: &str) -> bool {
+        lock(&self.advertised).contains(&lowercase(info_hash))
     }
-
 
     /// Blocks until the torrent has left `Initializing`, or `timeout` elapses.
     ///
@@ -1644,13 +1158,20 @@ impl TorrentEngine {
     /// keeps initializing, so the caller can still hand out its URL and the
     /// player's own retry will pick it up shortly after.
     pub async fn wait_until_streamable(&self, info_hash: &str, timeout: Duration) -> Result<()> {
-        let idx = TorrentIdOrHash::parse(info_hash)
-            .map_err(|e| anyhow::anyhow!("invalid info hash {info_hash}: {e}"))?;
         let handle = self
             .api
-            .mgr_handle(idx)
+            .mgr_handle(parse_idx(info_hash)?)
             .context("torrent vanished from the session right after being added")?;
+        self.wait_handle_streamable(&handle, info_hash, timeout)
+            .await
+    }
 
+    async fn wait_handle_streamable(
+        &self,
+        handle: &Arc<ManagedTorrent>,
+        info_hash: &str,
+        timeout: Duration,
+    ) -> Result<()> {
         match tokio::time::timeout(timeout, handle.wait_until_initialized()).await {
             Ok(Ok(())) => Ok(()),
             // The torrent itself errored out (bad metadata, storage failure) --
@@ -1671,16 +1192,9 @@ impl TorrentEngine {
         &self.api
     }
 
-    pub fn prebuffer_bytes(&self) -> usize {
-        self.prebuffer_bytes
-    }
-
-    pub fn prebuffer_timeout(&self) -> Duration {
-        self.prebuffer_timeout
-    }
-
-    pub fn stall_timeout(&self) -> Duration {
-        self.stall_timeout
+    /// The stream settings every video response reads.
+    pub fn tuning(&self) -> &StreamTuning {
+        &self.tuning
     }
 
     /// Registers an in-flight video response and, in doing so, retires the
@@ -1717,13 +1231,9 @@ impl TorrentEngine {
         let served = Arc::new(AtomicU64::new(0));
         let cancel = Arc::new(ReaderCancel::new());
 
-        let superseded = {
-            let mut readers = self
-                .readers
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-
-            let superseded: Vec<Arc<ReaderCancel>> = if self.seek_supersede && !tail_probe {
+        let superseded: Vec<Arc<ReaderCancel>> = {
+            let mut readers = lock(&self.readers);
+            let superseded = if self.tuning.seek_supersede && !tail_probe {
                 readers
                     .iter()
                     .filter(|slot| slot.superseded_by(info_hash, file_idx, client))
@@ -1732,7 +1242,6 @@ impl TorrentEngine {
             } else {
                 Vec::new()
             };
-
             readers.push(ReaderSlot {
                 id,
                 info_hash: info_hash.to_string(),
@@ -1803,16 +1312,31 @@ impl TorrentEngine {
         })
     }
 
-    /// The name of one file inside a torrent, for deciding what container it
-    /// is. `None` when the torrent or index is unknown.
-    pub fn file_name(&self, info_hash: &str, file_idx: usize) -> Option<String> {
-        let idx = TorrentIdOrHash::parse(info_hash).ok()?;
-        self.api
-            .api_torrent_details(idx)
-            .ok()?
-            .files?
+    /// Length and name of one file inside a running torrent, read straight
+    /// off its metadata.
+    ///
+    /// This used to go through `api_torrent_details`, which builds a response
+    /// describing every file in the torrent -- names, path components,
+    /// attributes -- to read one length, and a second time for the name, on
+    /// every range request.
+    pub fn stream_file(&self, info_hash: &str, file_idx: usize) -> Result<StreamFile> {
+        let handle = self
+            .api
+            .session()
+            .get(parse_idx(info_hash)?)
+            .context("torrent is not in the session")?;
+        let metadata = handle
+            .metadata
+            .load_full()
+            .context("torrent metadata is not available yet")?;
+        let file = metadata
+            .file_infos
             .get(file_idx)
-            .map(|f| f.name.clone())
+            .context("fileIdx out of range for this torrent")?;
+        Ok(StreamFile {
+            len: file.len,
+            name: file.relative_filename.to_string_lossy().into_owned(),
+        })
     }
 
     /// Fetches the tail of the file in parallel with its opening frames.
@@ -1830,32 +1354,33 @@ impl TorrentEngine {
     ///
     /// The cost when it guesses wrong (the file was faststart after all) is one
     /// piece of bandwidth, once.
-    pub fn warm_mp4_tail(self: &Arc<Self>, info_hash: &str, file_idx: usize, file_len: u64) {
-        if !self.mp4_tail_warm || file_len <= TAIL_WARM_BYTES {
+    pub fn warm_mp4_tail(
+        self: &Arc<Self>,
+        info_hash: &str,
+        file_idx: usize,
+        file_len: u64,
+        file_name: &str,
+    ) {
+        if !self.tuning.tail_warm || file_len <= TAIL_WARM_BYTES || !has_tail_index(file_name) {
             return;
         }
 
-        // Claimed before anything is inspected, and claimed even for files
-        // that turn out to be ineligible. This runs on every range request, so
-        // the eligibility check -- which costs an engine lookup -- must happen
-        // once per file rather than once per seek. Claiming up front also
-        // means a warm that failed is not retried on the next seek, which is
-        // the behaviour this is meant to remove rather than add.
+        // Claimed once per file, and claimed before the read is attempted, so
+        // a warm that failed is not retried on the next seek -- the behaviour
+        // this is meant to remove rather than add. This runs on every range
+        // request, so the already-claimed path allocates nothing.
         {
-            let mut warmed = self
-                .tail_warmed
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if !warmed.insert((info_hash.to_string(), file_idx)) {
-                return;
+            let mut warmed = lock(&self.tail_warmed);
+            match warmed.get_mut(info_hash) {
+                Some(files) => {
+                    if !files.insert(file_idx) {
+                        return;
+                    }
+                }
+                None => {
+                    warmed.insert(info_hash.to_string(), HashSet::from([file_idx]));
+                }
             }
-        }
-
-        let Some(name) = self.file_name(info_hash, file_idx) else {
-            return;
-        };
-        if !has_tail_index(&name) {
-            return;
         }
 
         let engine = Arc::clone(self);
@@ -1866,7 +1391,7 @@ impl TorrentEngine {
                 debug!(%info_hash, "could not open a tail read to warm the mp4 index");
                 return;
             };
-            let mut sink = vec![0u8; 64 * 1024];
+            let mut sink = [0u8; 16 * 1024];
             let warmed = tokio::time::timeout(TAIL_WARM_TIMEOUT, async {
                 use tokio::io::AsyncReadExt;
                 // One read is enough: it returns only once the piece holding
@@ -1897,14 +1422,14 @@ impl TorrentEngine {
         position: Arc<AtomicU64>,
         file_len: u64,
     ) -> Option<ReadaheadHandle> {
-        if self.readahead_extra == 0 {
+        let extra = self.tuning.readahead_extra;
+        if extra == 0 {
             return None;
         }
 
         let engine = Arc::clone(self);
         let info_hash = info_hash.to_string();
-        let settle = self.readahead_settle;
-        let extra = self.readahead_extra;
+        let settle = self.tuning.readahead_settle;
 
         let task = tokio::spawn(async move {
             tokio::time::sleep(settle).await;
@@ -1940,19 +1465,10 @@ impl TorrentEngine {
         Some(ReadaheadHandle(task))
     }
 
-    /// A lock poisoned by a panic elsewhere still holds a perfectly usable
-    /// map -- refusing to serve video over it would be a worse outcome than
-    /// the inconsistency it guards against.
-    fn open_streams(&self) -> std::sync::MutexGuard<'_, OpenStreamCounts> {
-        self.open_streams
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
     /// Registers a live reader on `info_hash`. Hold the returned guard for as
     /// long as the response body exists. See `StreamGuard`.
     pub fn open_stream_guard(self: &Arc<Self>, info_hash: &str) -> StreamGuard {
-        self.open_streams().acquire(info_hash);
+        lock(&self.open_streams).acquire(info_hash);
         StreamGuard {
             engine: Arc::clone(self),
             info_hash: info_hash.to_string(),
@@ -1961,7 +1477,7 @@ impl TorrentEngine {
 
     /// Whether any response body is currently reading this torrent.
     pub fn has_open_stream(&self, info_hash: &str) -> bool {
-        self.open_streams().is_open(info_hash)
+        lock(&self.open_streams).is_open(info_hash)
     }
 
     /// How many torrents are being read right now -- i.e. how many videos this
@@ -1972,229 +1488,20 @@ impl TorrentEngine {
     /// every torrent touched since the last clear and never shrinks, so after
     /// three episodes it claims three streams with one player connected.
     pub fn open_stream_count(&self) -> usize {
-        self.open_streams().torrents_open()
-    }
-
-    /// Declares `info_hash` the thing being watched, discarding what was
-    /// being watched before it.
-    ///
-    /// Called on every stream open, but only does work when the focus
-    /// actually moves — a seek re-opens the reader on the same torrent dozens
-    /// of times and must not re-sweep each time.
-    ///
-    /// The sweep runs detached: it makes one API call per torrent and the
-    /// viewer's first byte should not wait on any of them.
-    pub fn focus_stream(self: &Arc<Self>, info_hash: &str) {
-        let previous = {
-            let mut focused = self
-                .focused
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if focused.as_deref() == Some(info_hash) {
-                return;
-            }
-            focused.replace(info_hash.to_string())
-        };
-
-        let engine = Arc::clone(self);
-        let focus = info_hash.to_string();
-        tokio::spawn(async move {
-            // Nothing was playing before means nothing has been abandoned --
-            // this is what keeps the first play of a session from touching
-            // the backlog. Candidates prefetched for this browse still get
-            // parked below, since those were never watched at all.
-            if let Some(previous) = previous {
-                if engine.discard_abandoned(&previous).await {
-                    info!(
-                        focused = %focus,
-                        abandoned = %previous,
-                        "switched title: dropped the one left behind and freed its partial data"
-                    );
-                }
-            }
-            // The new focus takes a download slot, and the queue is rebuilt
-            // around it: whatever no longer fits is parked, and anything that
-            // now does is resumed.
-            let (started, parked) = engine.enforce_download_slots().await;
-            if started > 0 || parked > 0 {
-                debug!(
-                    focused = %focus,
-                    started,
-                    parked,
-                    "rebuilt the download queue around the stream being watched"
-                );
-            }
-        });
-    }
-
-    /// Deletes the abandoned torrent and its partial data. Returns whether it
-    /// actually went.
-    ///
-    /// Uses librqbit's delete (torrent *and* files) rather than forget: a
-    /// forgotten torrent leaves its partial file on disk with nothing
-    /// tracking it, which is exactly the orphaned bulk the cache cap is
-    /// already fighting.
-    pub async fn discard_abandoned(&self, info_hash: &str) -> bool {
-        let matches: Vec<(TorrentIdOrHash, bool, f64)> =
-            self.api.session().with_torrents(|iter| {
-                iter.filter_map(|(_, handle)| {
-                    if handle.info_hash().as_string() != info_hash {
-                        return None;
-                    }
-                    let stats = handle.stats();
-                    let finished =
-                        stats.total_bytes > 0 && stats.progress_bytes >= stats.total_bytes;
-                    // Captured here, while the torrent still exists, so the
-                    // log can say how much was thrown away.
-                    let progress = if stats.total_bytes > 0 {
-                        stats.progress_bytes as f64 / stats.total_bytes as f64 * 100.0
-                    } else {
-                        0.0
-                    };
-                    Some((handle.info_hash().into(), finished, progress))
-                })
-                .collect()
-            });
-
-        let Some((idx, finished, progress)) = matches.into_iter().next() else {
-            return false;
-        };
-        if action_for_abandoned(
-            self.has_open_stream(info_hash),
-            self.is_recently_active(info_hash, ABANDON_GRACE).await,
-            finished,
-        ) != UnfocusedAction::Discard
-        {
-            return false;
-        }
-
-        match self.api.api_torrent_action_delete(idx).await {
-            Ok(_) => {
-                info!(info_hash = %info_hash, "discarded abandoned torrent and its partial data");
-                // Deleting a viewer's partial download is the most destructive
-                // thing this process does on its own initiative, and it was
-                // invisible until it was caught in the act. It gets a line.
-                self.audit()
-                    .record(crate::audit::Event::TorrentDiscarded {
-                        info_hash: info_hash.to_string(),
-                        progress_percent: progress,
-                    });
-                self.forget_activity(info_hash).await;
-                true
-            }
-            // Racing a state change here is normal and harmless.
-            Err(e) => {
-                debug!(info_hash = %info_hash, "could not discard abandoned torrent: {e}");
-                false
-            }
-        }
-    }
-
-    /// Deletes one torrent and its data because cache retention decided it is
-    /// too old to keep. `Ok(true)` means deleted, `Ok(false)` means the
-    /// session never heard of the hash (an orphaned directory the caller has
-    /// to reclaim itself), and `Err` means the session owns it but the delete
-    /// failed -- the caller must then leave the files alone rather than pull
-    /// them out from under a live handle.
-    ///
-    /// Unlike [`discard_abandoned`](Self::discard_abandoned) this spares
-    /// nothing for being finished: retention exists precisely to throw
-    /// finished backlog away. The caller owns the "is anyone reading this"
-    /// checks.
-    pub async fn discard_cached(&self, info_hash: &str) -> Result<bool> {
-        let matches: Vec<(TorrentIdOrHash, f64)> = self.api.session().with_torrents(|iter| {
-            iter.filter_map(|(_, handle)| {
-                if handle.info_hash().as_string() != info_hash {
-                    return None;
-                }
-                let stats = handle.stats();
-                let progress = if stats.total_bytes > 0 {
-                    stats.progress_bytes as f64 / stats.total_bytes as f64 * 100.0
-                } else {
-                    0.0
-                };
-                Some((handle.info_hash().into(), progress))
-            })
-            .collect()
-        });
-
-        let Some((idx, progress)) = matches.into_iter().next() else {
-            return Ok(false);
-        };
-        self.api
-            .api_torrent_action_delete(idx)
-            .await
-            .map_err(|e| anyhow::anyhow!("retention could not delete torrent: {e}"))?;
-        self.audit().record(crate::audit::Event::TorrentDiscarded {
-            info_hash: info_hash.to_string(),
-            progress_percent: progress,
-        });
-        self.forget_activity(info_hash).await;
-        Ok(true)
-    }
-
-    /// Deletes every torrent and all of its data. Returns how many went.
-    ///
-    /// Unlike the automatic paths this spares nothing — not a finished
-    /// download, not one being streamed right now. It only ever runs from an
-    /// explicit "clear everything" click, where second-guessing the operator
-    /// would be the surprising behaviour. A stream in flight dies with it,
-    /// which is the honest consequence of wiping the file underneath it.
-    pub async fn discard_everything(&self) -> usize {
-        let all: Vec<(TorrentIdOrHash, String)> = self.api.session().with_torrents(|iter| {
-            iter.map(|(_, handle)| {
-                let hash = handle.info_hash().as_string();
-                (handle.info_hash().into(), hash)
-            })
-            .collect()
-        });
-
-        let mut deleted = 0;
-        for (idx, hash) in all {
-            match self.api.api_torrent_action_delete(idx).await {
-                Ok(_) => {
-                    self.forget_activity(&hash).await;
-                    deleted += 1;
-                }
-                Err(e) => warn!(info_hash = %hash, "could not delete torrent: {e}"),
-            }
-        }
-
-        // Nothing is playing any more, so the next stream is a first play and
-        // must not be treated as a switch away from a torrent that is gone.
-        *self
-            .focused
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
-
-        info!(deleted, "cleared every torrent and its data on request");
-        deleted
+        lock(&self.open_streams).torrents_open()
     }
 
     /// Drops the bookkeeping for a torrent that no longer exists, so a later
     /// request for the same title starts clean instead of matching a stale
-    /// activity record.
-    async fn forget_activity(&self, info_hash: &str) {
-        self.active_streams.lock().await.remove(info_hash);
+    /// record.
+    fn forget_activity(&self, info_hash: &str) {
+        lock(&self.active_streams).remove(info_hash);
+        // A re-download of the same title is a new file on disk, and its tail
+        // has not been fetched.
+        lock(&self.tail_warmed).remove(info_hash);
         // A hand pause on a torrent that no longer exists would otherwise
         // silently apply to the next download of the same title.
         self.forget_hold(info_hash);
-    }
-
-    /// Length of one file inside a torrent, without opening a read stream.
-    pub fn file_length(&self, info_hash: &str, file_idx: usize) -> Result<u64> {
-        let idx = TorrentIdOrHash::parse(info_hash)
-            .map_err(|e| anyhow::anyhow!("invalid info hash {info_hash}: {e}"))?;
-        let details = self
-            .api
-            .api_torrent_details(idx)
-            .map_err(|e| anyhow::anyhow!("torrent details unavailable: {e}"))?;
-        details
-            .files
-            .unwrap_or_default()
-            .get(file_idx)
-            .map(|f| f.length)
-            .context("fileIdx out of range for this torrent")
     }
 
     /// Opens a fresh read stream positioned at `pos`, resuming the torrent
@@ -2212,16 +1519,26 @@ impl TorrentEngine {
         file_idx: usize,
         pos: u64,
     ) -> Result<BoxedReader> {
-        let idx = TorrentIdOrHash::parse(info_hash)
-            .map_err(|e| anyhow::anyhow!("invalid info hash {info_hash}: {e}"))?;
-
         if !self.ensure_started(info_hash, file_idx).await? {
             anyhow::bail!("torrent {info_hash} is no longer startable");
         }
+        self.open_started_stream_at(info_hash, file_idx, pos).await
+    }
 
+    /// [`open_stream_at`](Self::open_stream_at) for a caller that has just
+    /// run `ensure_started` itself.
+    ///
+    /// Only for that caller: a paused torrent opens a stream here just fine,
+    /// and then never produces a byte.
+    pub async fn open_started_stream_at(
+        &self,
+        info_hash: &str,
+        file_idx: usize,
+        pos: u64,
+    ) -> Result<BoxedReader> {
         let mut stream = self
             .api
-            .api_stream(idx, file_idx)
+            .api_stream(parse_idx(info_hash)?, file_idx)
             .await
             .map_err(|e| anyhow::anyhow!("could not open torrent stream: {e}"))?;
 
@@ -2235,8 +1552,6 @@ impl TorrentEngine {
         Ok(Box::new(stream))
     }
 
-    /// One row of a stream list, as far as warming is concerned.
-    ///
     /// Prepares the torrents behind a title's stream list while the viewer is
     /// still reading it, so that pressing play is not where the waiting
     /// happens.
@@ -2246,7 +1561,10 @@ impl TorrentEngine {
     /// * **already in the session but paused** -- resume it. Pausing drops
     ///   every peer connection and they have to be rediscovered over
     ///   DHT/trackers, which is most of what "it took 30 seconds to start"
-    ///   actually is.
+    ///   actually is. Only a torrent the download queue would run anyway: a
+    ///   hand pause is the operator's, and resuming anything outside the
+    ///   queue's slots only has the queue park it again a tick later, after
+    ///   it has competed with the stream being watched in between.
     /// * **never seen** -- fetch its metadata and join its swarm now. This is
     ///   the expensive half of a cold start (a magnet carries only an info
     ///   hash; the file list has to be pulled from a peer that has it), and
@@ -2258,16 +1576,25 @@ impl TorrentEngine {
     /// each prefetch joins a swarm the viewer may never pick, and every
     /// running torrent competes for the same line as the one being watched.
     pub async fn warm_for_browse(self: &Arc<Self>, candidates: &[BrowseCandidate]) {
+        let entries = self.queue_snapshot();
+        let held = self.held_snapshot();
+        let slots = self.download_slots(&entries, &held);
+
         let mut resumed = 0usize;
         let mut prefetch: Vec<BrowseCandidate> = Vec::new();
 
         for candidate in candidates {
-            let Ok(idx) = TorrentIdOrHash::parse(&candidate.info_hash) else {
+            let hash = lowercase(&candidate.info_hash);
+            let Ok(idx) = TorrentIdOrHash::parse(&hash) else {
                 continue;
             };
             match self.api.session().get(idx) {
                 Some(handle) => {
-                    if resumed >= MAX_WARM_ON_BROWSE || !handle.is_paused() {
+                    if resumed >= MAX_WARM_ON_BROWSE
+                        || !handle.is_paused()
+                        || held.contains(hash.as_ref())
+                        || !slots.contains(hash.as_ref())
+                    {
                         continue;
                     }
                     let stats = handle.stats();
@@ -2279,12 +1606,10 @@ impl TorrentEngine {
                     }
                     match self.api.api_torrent_action_start(idx).await {
                         Ok(_) => {
-                            debug!(info_hash = %candidate.info_hash, "pre-warming previously watched torrent");
+                            debug!(info_hash = %hash, "pre-warming previously watched torrent");
                             resumed += 1;
                         }
-                        Err(e) => {
-                            debug!(info_hash = %candidate.info_hash, "could not pre-warm: {e}")
-                        }
+                        Err(e) => debug!(info_hash = %hash, "could not pre-warm: {e}"),
                     }
                 }
                 None if prefetch.len() < self.browse_prefetch => {
@@ -2345,231 +1670,57 @@ impl TorrentEngine {
         debug!(info_hash = %candidate.info_hash, "prefetched metadata only");
     }
 
-    /// Which torrents are allowed to download right now, in admission order.
-    ///
-    /// The gateway downloads up to `max_active_downloads` titles at a time
-    /// rather than only the one on screen. That is what lets the next
-    /// episodes of a series arrive while the current one is being watched,
-    /// instead of each one paying a full cold start when it is tapped.
-    ///
-    /// Membership, in priority order:
-    ///
-    /// * **anything with a live reader.** Non-negotiable rather than a
-    ///   preference: a reader parked inside librqbit is woken only by the
-    ///   piece it waits for, so pausing its torrent freezes it permanently
-    ///   with no timeout (see `StreamGuard`). These hold a slot whether the
-    ///   cap likes it or not, which is also the honest accounting -- they are
-    ///   using the line either way.
-    /// * **the focused title**, so the video on screen never queues behind
-    ///   the backlog.
-    /// * **the oldest unfinished torrents**, until the cap is reached.
-    ///
-    /// Ordering is by librqbit's `TorrentId`, which is assigned incrementally
-    /// as torrents are added -- so ascending id *is* the order they were
-    /// asked for, with no second bookkeeping to drift out of sync, and a
-    /// session restored from disk rebuilds it in the same order. That is what
-    /// makes the queue run front-to-back: four episodes finish one after
-    /// another rather than all four crawling at a quarter of the speed and
-    /// none of them becoming watchable.
-    ///
-    /// Finished torrents are never members. They cost no download bandwidth,
-    /// so a slot spent on one is a slot the queue cannot use.
-    fn download_slots(&self) -> HashSet<String> {
-        let focused = self
-            .focused
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone();
-
-        let mut unfinished: Vec<(usize, String)> = self.api.session().with_torrents(|iter| {
-            iter.filter_map(|(id, handle)| {
-                let stats = handle.stats();
-                if stats.total_bytes > 0 && stats.progress_bytes >= stats.total_bytes {
-                    return None;
-                }
-                let hash = handle.info_hash().as_string();
-                // A torrent the operator paused by hand is not a candidate at
-                // all, rather than a candidate the queue keeps resuming. It
-                // also means the hold hands its slot to the next title in
-                // line, which is what someone pausing a download wants: the
-                // bandwidth goes somewhere, not nowhere.
-                if self.is_held(&hash) {
-                    return None;
-                }
-                Some((id, hash))
-            })
-            .collect()
-        });
-        unfinished.sort_by_key(|(id, _)| *id);
-
-        choose_download_slots(
-            &unfinished,
-            focused.as_deref(),
-            |hash| self.has_open_stream(hash),
-            self.max_active_downloads,
-        )
-    }
-
-    /// Whether this torrent currently holds one of the download slots above.
-    pub fn holds_download_slot(&self, info_hash: &str) -> bool {
-        self.download_slots().contains(info_hash)
-    }
-
-    /// Whether the operator paused this torrent by hand.
-    ///
-    /// Distinct from librqbit's own paused flag, which the download queue and
-    /// the idle reaper both set and clear on their own schedule. A hand pause
-    /// has to outlive those: without a separate record the queue's next tick
-    /// (a second later) simply resumes it, and the button looks broken.
-    pub fn is_held(&self, info_hash: &str) -> bool {
-        self.held
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .contains(info_hash)
-    }
-
-    /// Pauses one torrent and holds it paused until something explicitly says
-    /// otherwise -- a resume, a delete, or the viewer playing it again.
-    pub async fn hold_paused(&self, info_hash: &str) -> Result<bool> {
-        let Some(idx) = self.session_idx(info_hash) else {
-            return Ok(false);
-        };
-        self.held
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(info_hash.to_string());
-        // Errors here are almost always "already paused", which is the state
-        // being asked for, so the hold above stands either way.
-        if let Err(e) = self.api.api_torrent_action_pause(idx).await {
-            debug!(info_hash = %info_hash, "pause returned an error, holding anyway: {e}");
-        }
-        info!(info_hash = %info_hash, "paused by hand");
-        Ok(true)
-    }
-
-    /// Releases a hand pause and lets the download queue have the torrent
-    /// back. Whether it actually runs is then the queue's decision, exactly as
-    /// it is for every other torrent -- so resuming a fifth title while four
-    /// are already downloading queues it rather than oversubscribing the link.
-    pub async fn release_hold(&self, info_hash: &str) -> Result<bool> {
-        let removed = self
-            .held
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(info_hash);
-        if self.session_idx(info_hash).is_none() {
-            return Ok(false);
-        }
-        self.enforce_download_slots().await;
-        if removed {
-            info!(info_hash = %info_hash, "resumed by hand");
-        }
-        Ok(true)
-    }
-
-    /// Forgets any hand pause for this hash. Called wherever the torrent stops
-    /// existing, or where playing it makes the hold moot.
-    fn forget_hold(&self, info_hash: &str) {
-        self.held
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(info_hash);
-    }
-
     /// The session's handle for a hash, or `None` if it holds no such torrent.
     fn session_idx(&self, info_hash: &str) -> Option<TorrentIdOrHash> {
         let idx = TorrentIdOrHash::parse(info_hash).ok()?;
         self.api.session().get(idx).map(|_| idx)
     }
 
-    /// Brings the session in line with `download_slots`: resumes every
-    /// unfinished torrent inside the set, pauses every one outside it.
-    /// Returns `(started, paused)`.
+    /// The session's handle for a hash and how far along it is, captured in
+    /// one lookup while the torrent still exists -- so a deletion can still
+    /// say how much it threw away.
+    fn session_progress(&self, info_hash: &str) -> Option<(TorrentIdOrHash, Progress)> {
+        let idx = TorrentIdOrHash::parse(info_hash).ok()?;
+        let handle = self.api.session().get(idx)?;
+        let stats = handle.stats();
+        Some((idx, Progress::of(stats.progress_bytes, stats.total_bytes)))
+    }
+
+    /// Records a request against a torrent, for the cache janitor, the idle
+    /// reaper and the status views.
     ///
-    /// Run both on a focus change and on a timer, because the two things that
-    /// move the set are the viewer picking a different title and a download
-    /// finishing -- and only the first of those is an event this process sees.
-    /// Without the timer a torrent that completed would keep its slot until
-    /// the next time somebody changed episode.
-    pub async fn enforce_download_slots(&self) -> (usize, usize) {
-        let slots = self.download_slots();
+    /// Only for a torrent the gateway advertised or already holds. Called
+    /// before the request is validated any further, and recording anything
+    /// else let a client grow this map without limit by asking for made-up
+    /// hashes -- each one a 404, and each one kept for the life of the
+    /// process. `ACTIVE_STREAMS_CAPACITY` backstops the rest.
+    pub fn touch_stream(&self, info_hash: &str, client: IpAddr) {
+        let now = Instant::now();
+        // A known torrent is updated in place: this runs on every chunk of
+        // every body, so the common case must not allocate.
+        if let Some(activity) = lock(&self.active_streams).get_mut(info_hash) {
+            activity.last_access = now;
+            activity.last_client = client;
+            return;
+        }
+        if !self.is_advertised(info_hash) && self.session_idx(info_hash).is_none() {
+            return;
+        }
 
-        let candidates: Vec<(TorrentIdOrHash, String, bool)> =
-            self.api.session().with_torrents(|iter| {
-                iter.filter_map(|(_, handle)| {
-                    let stats = handle.stats();
-                    // Finished: no download bandwidth being consumed, and
-                    // pausing it would only stop us seeding it back.
-                    if stats.total_bytes > 0 && stats.progress_bytes >= stats.total_bytes {
-                        return None;
-                    }
-                    Some((
-                        handle.info_hash().into(),
-                        handle.info_hash().as_string(),
-                        handle.is_paused(),
-                    ))
-                })
-                .collect()
-            });
-
-        let (mut started, mut paused) = (0, 0);
-        for (idx, hash, is_paused) in candidates {
-            // A hand pause outranks the queue in both directions: never
-            // resumed here, and already paused, so there is nothing to do.
-            if self.is_held(&hash) {
-                continue;
-            }
-            match (slots.contains(&hash), is_paused) {
-                (true, true) => {
-                    if self.api.api_torrent_action_start(idx).await.is_ok() {
-                        debug!(info_hash = %hash, "download queue: took a free slot");
-                        started += 1;
-                    }
-                }
-                (false, false) => {
-                    // Belt and braces: a torrent with a live reader is always
-                    // in the set above, so this should never fire -- but
-                    // pausing one freezes it permanently, and the cost of
-                    // checking twice is a map lookup.
-                    if self.has_open_stream(&hash) {
-                        continue;
-                    }
-                    if self.api.api_torrent_action_pause(idx).await.is_ok() {
-                        debug!(info_hash = %hash, "download queue: parked until a slot frees up");
-                        paused += 1;
-                    }
-                }
-                _ => {}
+        let mut streams = lock(&self.active_streams);
+        if streams.len() >= ACTIVE_STREAMS_CAPACITY && !streams.contains_key(info_hash) {
+            let oldest = streams
+                .iter()
+                .min_by_key(|(_, activity)| activity.last_access)
+                .map(|(hash, _)| hash.clone());
+            if let Some(oldest) = oldest {
+                streams.remove(&oldest);
             }
         }
-        (started, paused)
-    }
-
-    /// Runs `enforce_download_slots` on a timer for the lifetime of the
-    /// process, so a finished download hands its slot to the next in line.
-    pub fn spawn_download_queue(self: &Arc<Self>, interval: Duration) {
-        let engine = Arc::clone(self);
-        tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(interval);
-            // The first tick fires immediately; skip it so a torrent started
-            // moments before startup is not parked before anyone can play it.
-            ticker.tick().await;
-            loop {
-                ticker.tick().await;
-                let (started, paused) = engine.enforce_download_slots().await;
-                if started > 0 || paused > 0 {
-                    debug!(started, paused, "download queue advanced");
-                }
-            }
-        });
-    }
-
-    pub async fn touch_stream(&self, info_hash: &str, client: IpAddr) {
-        let mut guard = self.active_streams.lock().await;
-        guard.insert(
+        streams.insert(
             info_hash.to_string(),
             StreamActivity {
-                last_access: Instant::now(),
+                last_access: now,
                 last_client: client,
             },
         );
@@ -2578,21 +1729,26 @@ impl TorrentEngine {
     /// Whether this torrent has been read from within `within` -- used by the
     /// cache janitor to decide it must not delete the file out from under a
     /// player that is mid-playback (or about to issue its next range request).
-    pub async fn is_recently_active(&self, info_hash: &str, within: Duration) -> bool {
-        self.active_streams
-            .lock()
-            .await
+    pub fn is_recently_active(&self, info_hash: &str, within: Duration) -> bool {
+        lock(&self.active_streams)
             .get(info_hash)
-            .map(|a| a.last_access.elapsed() < within)
-            .unwrap_or(false)
+            .is_some_and(|a| a.last_access.elapsed() < within)
+    }
+
+    /// Every torrent read from within `within`, for a pass that would
+    /// otherwise ask `is_recently_active` once per torrent.
+    pub fn recently_active(&self, within: Duration) -> HashSet<String> {
+        lock(&self.active_streams)
+            .iter()
+            .filter(|(_, a)| a.last_access.elapsed() < within)
+            .map(|(hash, _)| hash.clone())
+            .collect()
     }
 
     /// Snapshot of recently-active streams for the `/health` and terminal
     /// monitoring views: (info_hash, last client IP, seconds since last request).
-    pub async fn recent_streams(&self) -> Vec<(String, IpAddr, u64)> {
-        self.active_streams
-            .lock()
-            .await
+    pub fn recent_streams(&self) -> Vec<(String, IpAddr, u64)> {
+        lock(&self.active_streams)
             .iter()
             .map(|(hash, a)| {
                 (
@@ -2607,6 +1763,8 @@ impl TorrentEngine {
     /// Snapshot of every torrent currently managed by the session, for
     /// terminal monitoring and `/health`.
     pub fn list_active(&self) -> Vec<ActiveTorrentSummary> {
+        // Copied out first: see the lock notes on `TorrentEngine`.
+        let held = self.held_snapshot();
         self.api.session().with_torrents(|iter| {
             iter.map(|(_, handle)| {
                 let stats = handle.stats();
@@ -2621,18 +1779,13 @@ impl TorrentEngine {
                         )
                     })
                     .unwrap_or((0.0, 0.0, 0));
-                let progress_percent = if stats.total_bytes == 0 {
-                    0.0
-                } else {
-                    stats.progress_bytes as f64 / stats.total_bytes as f64 * 100.0
-                };
                 let info_hash = handle.info_hash().as_string();
                 ActiveTorrentSummary {
-                    held: self.is_held(&info_hash),
+                    held: held.contains(&info_hash),
                     info_hash,
                     name: handle.name().unwrap_or_else(|| "unknown".to_string()),
                     state: stats.state.to_string(),
-                    progress_percent,
+                    progress_percent: Progress::of(stats.progress_bytes, stats.total_bytes).percent,
                     progress_bytes: stats.progress_bytes,
                     total_bytes: stats.total_bytes,
                     download_speed_mib_s,
@@ -2693,355 +1846,11 @@ impl TorrentEngine {
             stats.total_bytes == 0 || stats.progress_bytes < stats.total_bytes
         })
     }
-
-    /// Pauses torrents nobody has streamed from in `idle_after`.
-    ///
-    /// Every running torrent competes for the same finite upstream bandwidth.
-    /// A 23 GB 4K release someone opened once and abandoned will happily eat
-    /// most of it, starving the movie actually being watched -- which shows up
-    /// as buffering that looks like a network problem but is really
-    /// self-inflicted. Pausing idle torrents hands that bandwidth back.
-    ///
-    /// Paused torrents keep their data and resume instantly on the next
-    /// request (see `ensure_started`), so this is invisible in normal use.
-    /// Completed torrents are left alone: they cost no download bandwidth and
-    /// seeding them back is good manners.
-    pub async fn pause_idle_torrents(&self, idle_after: Duration) -> usize {
-        // Holding a download slot is itself a reason to keep running: the
-        // queue exists precisely to fetch titles nobody is watching yet, so
-        // judging those by request recency would pause every one of them a
-        // half-hour in and the queue would never finish anything.
-        let slots = self.download_slots();
-
-        let candidates: Vec<(TorrentIdOrHash, String)> = self.api.session().with_torrents(|iter| {
-            iter.filter_map(|(_, handle)| {
-                if handle.is_paused() {
-                    return None;
-                }
-                let stats = handle.stats();
-                // Finished: no download bandwidth being consumed.
-                if stats.total_bytes > 0 && stats.progress_bytes >= stats.total_bytes {
-                    return None;
-                }
-                let hash = handle.info_hash().as_string();
-                Some((handle.info_hash().into(), hash))
-            })
-            .collect()
-        });
-
-        let mut paused = 0;
-        for (idx, hash) in candidates {
-            if slots.contains(&hash) {
-                continue;
-            }
-            // Two independent checks, because request recency alone is not
-            // enough. A live reader is parked inside librqbit waiting for a
-            // piece and issues no HTTP requests at all; pausing it there
-            // freezes it permanently with no timeout. See `StreamGuard`.
-            if self.has_open_stream(&hash) || self.is_recently_active(&hash, idle_after).await {
-                continue;
-            }
-            match self.api.api_torrent_action_pause(idx).await {
-                Ok(_) => {
-                    info!(info_hash = %hash, "paused idle torrent to free bandwidth");
-                    paused += 1;
-                }
-                // Racing a state change here is normal and harmless.
-                Err(e) => debug!(info_hash = %hash, "could not pause idle torrent: {e}"),
-            }
-        }
-        paused
-    }
-
-    /// Runs `pause_idle_torrents` on a timer for the lifetime of the process.
-    pub fn spawn_idle_reaper(self: &Arc<Self>, interval: Duration, idle_after: Duration) {
-        let engine = Arc::clone(self);
-        tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(interval);
-            // The first tick fires immediately; skip it so a torrent started
-            // moments before startup is not paused before anyone can play it.
-            ticker.tick().await;
-            loop {
-                ticker.tick().await;
-                engine.pause_idle_torrents(idle_after).await;
-            }
-        });
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn slot(client: &str, served: u64, tail_probe: bool) -> ReaderSlot {
-        ReaderSlot {
-            id: 0,
-            info_hash: "aaaa".to_string(),
-            file_idx: 0,
-            client: client.parse().unwrap(),
-            tail_probe,
-            served: Arc::new(AtomicU64::new(served)),
-            cancel: Arc::new(ReaderCancel::new()),
-        }
-    }
-
-    fn ip(value: &str) -> IpAddr {
-        value.parse().unwrap()
-    }
-
-    /// A scrub burst is the case this exists for: each abandoned read keeps
-    /// its share of librqbit's round-robin piece requests, so ten of them
-    /// leave the position the viewer landed on getting a tenth of the
-    /// download.
-    #[test]
-    fn a_read_that_showed_nobody_anything_is_superseded() {
-        assert!(slot("192.168.1.5", 0, false).superseded_by("aaaa", 0, ip("192.168.1.5")));
-    }
-
-    /// The one rule that must never be got wrong: a read that has delivered
-    /// bytes is a picture on someone's screen, and cancelling it stops
-    /// playback dead.
-    #[test]
-    fn a_read_that_is_playing_is_never_superseded() {
-        assert!(!slot("192.168.1.5", 1, false).superseded_by("aaaa", 0, ip("192.168.1.5")));
-    }
-
-    /// Two devices on the same title would otherwise cancel each other's cold
-    /// start, and then each other's retry, and neither would ever play.
-    #[test]
-    fn a_second_device_does_not_supersede_the_first() {
-        assert!(!slot("192.168.1.5", 0, false).superseded_by("aaaa", 0, ip("192.168.1.9")));
-    }
-
-    /// An mp4 index read is a second read the same player needs *at the same
-    /// time* as the one at the head, not a superseded seek. Cancelling it
-    /// breaks exactly the players the tail warmer exists to help.
-    #[test]
-    fn an_index_probe_survives_the_playback_request_that_follows_it() {
-        assert!(!slot("192.168.1.5", 0, true).superseded_by("aaaa", 0, ip("192.168.1.5")));
-    }
-
-    /// One player legitimately reads two files of a multi-file torrent (an
-    /// episode and its subtitles), and neither is a seek away from the other.
-    #[test]
-    fn a_read_of_a_different_file_is_left_alone() {
-        assert!(!slot("192.168.1.5", 0, false).superseded_by("aaaa", 1, ip("192.168.1.5")));
-        assert!(!slot("192.168.1.5", 0, false).superseded_by("bbbb", 0, ip("192.168.1.5")));
-    }
-
-    /// mkv is in the list on evidence, not on theory: Matroska's SeekHead is at
-    /// the front, and players probe the tail for the Cues regardless. Leaving it
-    /// out cost a measured 12.2 s on one start — see `TAIL_INDEXED_EXTENSIONS`.
-    /// Pinned as a test because the structural argument for excluding it is
-    /// genuinely persuasive and someone will make it again.
-    #[test]
-    fn only_tail_indexed_containers_are_warmed() {
-        assert!(has_tail_index("The.Movie.2024.1080p.mp4"));
-        assert!(has_tail_index("clip.MP4"), "extensions are not case-sensitive");
-        assert!(has_tail_index("holiday.mov"));
-        assert!(has_tail_index("tires.s03e08.1080p.web.h264-cakes.mkv"));
-        assert!(has_tail_index("stream.webm"));
-        assert!(!has_tail_index("no-extension"));
-        assert!(!has_tail_index("subtitles.srt"));
-    }
-
-    /// Admission order, oldest first -- what `download_slots` builds from
-    /// librqbit's incrementing `TorrentId`.
-    fn queue(hashes: &[&str]) -> Vec<(usize, String)> {
-        hashes
-            .iter()
-            .enumerate()
-            .map(|(id, hash)| (id, (*hash).to_string()))
-            .collect()
-    }
-
-    fn nothing_open(_: &str) -> bool {
-        false
-    }
-
-    /// The feature: four titles download at once instead of one.
-    #[test]
-    fn the_queue_runs_four_titles_at_a_time() {
-        let unfinished = queue(&["e1", "e2", "e3", "e4", "e5", "e6"]);
-        let slots = choose_download_slots(&unfinished, Some("e1"), nothing_open, 4);
-        assert_eq!(slots.len(), 4);
-    }
-
-    /// "In order" is the half that makes it useful. Taking an arbitrary four
-    /// would leave every episode part-downloaded and none of them watchable;
-    /// taking the oldest four finishes them front-to-back.
-    #[test]
-    fn the_queue_admits_in_the_order_titles_were_asked_for() {
-        let unfinished = queue(&["e1", "e2", "e3", "e4", "e5", "e6"]);
-        let slots = choose_download_slots(&unfinished, None, nothing_open, 3);
-        assert!(slots.contains("e1") && slots.contains("e2") && slots.contains("e3"));
-        assert!(
-            !slots.contains("e4") && !slots.contains("e5") && !slots.contains("e6"),
-            "later requests wait for a slot rather than diluting the first three"
-        );
-    }
-
-    /// A viewer who skips ahead to the last episode must not queue behind the
-    /// backlog that was already downloading.
-    #[test]
-    fn the_title_on_screen_always_holds_a_slot() {
-        let unfinished = queue(&["e1", "e2", "e3", "e4", "e5", "e6"]);
-        let slots = choose_download_slots(&unfinished, Some("e6"), nothing_open, 2);
-        assert!(slots.contains("e6"), "the focused title is never queued");
-        assert!(slots.contains("e1"), "and the queue still runs behind it");
-    }
-
-    /// Pausing a torrent whose reader is parked inside librqbit freezes it
-    /// permanently -- the piece it waits for never arrives to wake it. So a
-    /// read in progress is admitted even past the cap; the alternative is not
-    /// "a smaller set", it is a frozen video. See `StreamGuard`.
-    #[test]
-    fn a_torrent_being_read_is_admitted_even_past_the_cap() {
-        let unfinished = queue(&["e1", "e2", "e3"]);
-        let slots = choose_download_slots(&unfinished, Some("e1"), |hash| hash == "e3", 1);
-        assert!(slots.contains("e3"), "a live reader cannot be parked");
-        assert!(slots.contains("e1"), "nor can the title on screen");
-    }
-
-    /// A finished torrent is not in the input at all, so a viewer re-watching
-    /// something already downloaded does not spend a slot on it.
-    #[test]
-    fn a_finished_focus_does_not_hold_a_slot_open() {
-        let unfinished = queue(&["e2", "e3"]);
-        let slots = choose_download_slots(&unfinished, Some("e1-finished"), nothing_open, 2);
-        assert_eq!(slots.len(), 2);
-        assert!(slots.contains("e2") && slots.contains("e3"));
-        assert!(!slots.contains("e1-finished"));
-    }
-
-    /// Setting the cap to 1 must reproduce the old behaviour exactly: only
-    /// the title on screen downloads. That is the escape hatch for a link
-    /// that is only just keeping up with playback.
-    #[test]
-    fn a_cap_of_one_downloads_only_what_is_being_watched() {
-        let unfinished = queue(&["e1", "e2", "e3"]);
-        let slots = choose_download_slots(&unfinished, Some("e2"), nothing_open, 1);
-        assert_eq!(slots.len(), 1);
-        assert!(slots.contains("e2"));
-    }
-
-    #[test]
-    fn an_empty_session_needs_no_slots() {
-        assert!(choose_download_slots(&[], None, nothing_open, 4).is_empty());
-        assert!(choose_download_slots(&[], Some("gone"), nothing_open, 4).is_empty());
-    }
-
-    #[test]
-    fn advertised_set_remembers_and_rejects() {
-        let mut set = AdvertisedHashes::new(4);
-        set.remember("aaaa".into(), Vec::new());
-        assert!(set.contains("aaaa"));
-        assert!(!set.contains("bbbb"));
-    }
-
-    #[test]
-    fn advertised_set_evicts_oldest_beyond_capacity() {
-        let mut set = AdvertisedHashes::new(2);
-        set.remember("one".into(), Vec::new());
-        set.remember("two".into(), Vec::new());
-        set.remember("three".into(), Vec::new());
-
-        assert!(!set.contains("one"), "oldest entry must be evicted");
-        assert!(set.contains("two"));
-        assert!(set.contains("three"));
-        // Bookkeeping must stay consistent, or the set leaks past its cap.
-        assert_eq!(set.order.len(), 2);
-        assert_eq!(set.trackers.len(), 2);
-    }
-
-    #[test]
-    fn metadata_cache_hands_back_what_a_resolve_fetched() {
-        let mut cache = MetadataCache::default();
-        cache.remember("aaaa".into(), bytes::Bytes::from_static(b"d4:infoe"));
-
-        assert_eq!(
-            cache.get("aaaa").as_deref(),
-            Some(&b"d4:infoe"[..]),
-            "a start must be able to reuse the metadata its resolve paid for"
-        );
-        assert!(cache.get("bbbb").is_none());
-    }
-
-    /// One entry is a whole `.torrent` file, so an unbounded map here would
-    /// grow with every title browsed for the life of the process.
-    #[test]
-    fn metadata_cache_evicts_oldest_beyond_capacity() {
-        let mut cache = MetadataCache::default();
-        for i in 0..RESOLVED_METADATA_CAPACITY + 1 {
-            cache.remember(format!("hash{i}"), bytes::Bytes::from_static(b"x"));
-        }
-
-        assert!(cache.get("hash0").is_none(), "oldest entry must be evicted");
-        assert!(cache
-            .get(&format!("hash{RESOLVED_METADATA_CAPACITY}"))
-            .is_some());
-        assert_eq!(cache.order.len(), RESOLVED_METADATA_CAPACITY);
-        assert_eq!(cache.bytes.len(), RESOLVED_METADATA_CAPACITY);
-    }
-
-    /// Re-resolving the same torrent must refresh it in place. Pushing a
-    /// second `order` entry for one hash would let the cache evict the entry
-    /// its own duplicate still points at, dropping metadata it still holds.
-    #[test]
-    fn metadata_cache_does_not_double_count_repeats() {
-        let mut cache = MetadataCache::default();
-        cache.remember("aaaa".into(), bytes::Bytes::from_static(b"first"));
-        cache.remember("aaaa".into(), bytes::Bytes::from_static(b"second"));
-
-        assert_eq!(cache.order.len(), 1);
-        assert_eq!(cache.get("aaaa").as_deref(), Some(&b"second"[..]));
-    }
-
-    /// A torrent with no metadata bytes is not a cache entry, it is a miss --
-    /// storing it would make `start_file` add an empty torrent file instead of
-    /// falling back to the magnet.
-    #[test]
-    fn metadata_cache_ignores_empty_metadata() {
-        let mut cache = MetadataCache::default();
-        cache.remember("aaaa".into(), bytes::Bytes::new());
-
-        assert!(cache.get("aaaa").is_none());
-        assert!(cache.order.is_empty());
-    }
-
-    #[test]
-    fn advertised_set_keeps_trackers_per_hash() {
-        let mut set = AdvertisedHashes::new(4);
-        set.remember(
-            "aaaa".into(),
-            vec!["udp://a.example:1337/announce".into()],
-        );
-        set.remember("bbbb".into(), Vec::new());
-
-        assert_eq!(
-            set.trackers_for("aaaa"),
-            vec!["udp://a.example:1337/announce".to_string()],
-            "a lazy start must announce where this release's seeders are"
-        );
-        assert!(set.trackers_for("bbbb").is_empty());
-        assert!(set.trackers_for("unknown").is_empty());
-    }
-
-    #[test]
-    fn re_advertising_upgrades_a_trackerless_entry_but_never_downgrades() {
-        let mut set = AdvertisedHashes::new(4);
-        set.remember("aaaa".into(), Vec::new());
-        set.remember("aaaa".into(), vec!["udp://a.example:1337/announce".into()]);
-        assert_eq!(
-            set.trackers_for("aaaa"),
-            vec!["udp://a.example:1337/announce".to_string()],
-            "a later sighting that knows trackers must fill in an empty entry"
-        );
-
-        // A later sighting with none must not wipe what is known.
-        set.remember("aaaa".into(), Vec::new());
-        assert!(!set.trackers_for("aaaa").is_empty());
-    }
 
     /// Two callers racing to start the same torrent must contend on one lock,
     /// or the second one launches a duplicate metadata fetch -- which is
@@ -3123,79 +1932,6 @@ mod tests {
         );
     }
 
-    /// A pre-0.9 `advertised.json` is a bare list of hashes. It must load as
-    /// entries (with no trackers) rather than parse-fail into an empty set --
-    /// an empty set silently 404s every link already installed in Stremio.
-    #[test]
-    fn legacy_advertised_file_still_loads() {
-        let legacy = br#"["aaaa","bbbb"]"#;
-        let entries = parse_advertised(legacy);
-        assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].hash, "aaaa");
-        assert!(entries[0].trackers.is_empty());
-
-        let current = br#"[{"hash":"cccc","trackers":["udp://t.example:80/announce"]}]"#;
-        let entries = parse_advertised(current);
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].trackers.len(), 1);
-
-        assert!(parse_advertised(b"not json").is_empty());
-    }
-
-    #[test]
-    fn open_stream_counts_track_a_single_reader() {
-        let mut counts = OpenStreamCounts::default();
-        assert!(!counts.is_open("aaaa"));
-
-        counts.acquire("aaaa");
-        assert!(
-            counts.is_open("aaaa"),
-            "a live reader must protect its torrent"
-        );
-
-        counts.release("aaaa");
-        assert!(!counts.is_open("aaaa"));
-        assert!(counts.0.is_empty(), "released entries must not linger");
-    }
-
-    #[test]
-    fn switching_title_discards_the_one_the_viewer_left() {
-        // The whole point: starting a new episode abandons the old one, so
-        // its half-downloaded file is deleted rather than kept forever in a
-        // cache that is permanently at its cap.
-        assert_eq!(
-            action_for_abandoned(false, false, false),
-            UnfocusedAction::Discard
-        );
-    }
-
-    #[test]
-    fn a_torrent_another_reader_still_holds_is_never_deleted() {
-        // A second device watching something else, or this player's own
-        // header/index reads. Deleting underneath a live reader truncates a
-        // video someone is watching -- see `StreamGuard`.
-        assert_eq!(
-            action_for_abandoned(true, false, false),
-            UnfocusedAction::Leave
-        );
-    }
-
-    #[test]
-    fn a_torrent_read_moments_ago_survives_the_switch() {
-        // The compounding-failure regression. A player that gives up on a cold
-        // torrent has no open connection, so `has_open_stream` alone reads it
-        // as abandoned -- and deleting it there throws away the data and the
-        // warmed-up peers that the player's *own retry*, seconds later, is
-        // about to need. Every attempt then starts colder than the last, which
-        // is what a viewer sees as the player cycling through every source and
-        // playing none. Range requests are stateless; recency, not an open
-        // socket, is what "someone is watching this" means here.
-        assert_eq!(
-            action_for_abandoned(false, true, false),
-            UnfocusedAction::Leave
-        );
-    }
-
     /// The grace window has to outlast a player's retry cycle (~25-30s, the
     /// same figure `START_FAILURE_COOLDOWN` is built on) or it spares nothing
     /// that matters -- the retry arrives after the torrent is already gone.
@@ -3206,79 +1942,6 @@ mod tests {
             "a torrent must not be deleted while the client is still in the \
              retry cycle that would reuse it"
         );
-    }
-
-    #[test]
-    fn a_finished_download_survives_the_switch() {
-        // A complete file costs no download bandwidth, and deleting a movie
-        // that finished downloading because the viewer started the next
-        // episode is destructive. The cache janitor reclaims it under
-        // pressure, oldest-first.
-        assert_eq!(
-            action_for_abandoned(false, false, true),
-            UnfocusedAction::Leave
-        );
-    }
-
-    #[test]
-    fn open_stream_counts_protect_until_the_last_reader_finishes() {
-        // A player opens several reads at once (header, index, playback
-        // position). Releasing one must not expose the torrent to the reaper
-        // while the others are still going -- that is the freeze this whole
-        // mechanism exists to prevent.
-        let mut counts = OpenStreamCounts::default();
-        counts.acquire("aaaa");
-        counts.acquire("aaaa");
-        counts.acquire("aaaa");
-
-        counts.release("aaaa");
-        assert!(counts.is_open("aaaa"));
-        counts.release("aaaa");
-        assert!(counts.is_open("aaaa"));
-
-        counts.release("aaaa");
-        assert!(!counts.is_open("aaaa"));
-    }
-
-    #[test]
-    fn open_stream_counts_ignore_unbalanced_releases() {
-        // Must not underflow into a huge count, which would pin a torrent
-        // as "in use" forever and defeat both the reaper and the janitor.
-        let mut counts = OpenStreamCounts::default();
-        counts.release("never-acquired");
-        assert!(!counts.is_open("never-acquired"));
-
-        counts.acquire("aaaa");
-        counts.release("aaaa");
-        counts.release("aaaa");
-        assert!(!counts.is_open("aaaa"));
-    }
-
-    #[test]
-    fn open_stream_counts_keep_torrents_independent() {
-        let mut counts = OpenStreamCounts::default();
-        counts.acquire("aaaa");
-        counts.acquire("bbbb");
-        counts.release("aaaa");
-
-        assert!(!counts.is_open("aaaa"));
-        assert!(
-            counts.is_open("bbbb"),
-            "one torrent's reader must not release another's"
-        );
-    }
-
-    #[test]
-    fn advertised_set_does_not_double_count_repeats() {
-        // Re-browsing the same title must not push other entries out.
-        let mut set = AdvertisedHashes::new(2);
-        set.remember("one".into(), Vec::new());
-        set.remember("one".into(), Vec::new());
-        set.remember("two".into(), Vec::new());
-
-        assert!(set.contains("one"));
-        assert!(set.contains("two"));
-        assert_eq!(set.order.len(), 2);
     }
 
     /// The background search must outlast the request that started it, or the
@@ -3302,96 +1965,34 @@ mod tests {
         assert!(START_FAILURE_COOLDOWN < BACKGROUND_SEARCH_TIMEOUT);
     }
 
-    fn archive_tempdir() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "streaming-gateway-metadata-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
-    /// A distinct, correctly-shaped info hash per index: 40 hex digits, which
-    /// is exactly what the archive's guard insists on.
-    fn hash_of(nth: usize) -> String {
-        format!("{nth:040x}")
-    }
-
-    /// The regression this archive exists for.
-    ///
-    /// A title played once and reclaimed by the janitor has to be startable
-    /// again without asking the swarm anything, because by then the swarm may
-    /// have no seeders left to ask -- which is a 25-second timeout, a 500, and
-    /// a gateway that appears not to have noticed the tap at all.
-    #[tokio::test]
-    async fn archived_metadata_survives_to_be_read_back() {
-        let dir = archive_tempdir();
-        let archive = MetadataArchive::new(dir.join("metadata"));
-        let hash = hash_of(1);
-
+    /// The cold-start budget at the top of this file, checked rather than
+    /// only written down: with the default pre-buffer timeout, a start that
+    /// uses every one of its allowances still answers before the router's
+    /// timeout turns it into a 504.
+    #[test]
+    fn a_worst_case_cold_start_fits_inside_the_request_timeout() {
+        let tuning = StreamTuning::from_config(&AppConfig::defaults());
         assert!(
-            archive.load(&hash).await.is_none(),
-            "nothing archived yet, so nothing to find"
+            ADD_TORRENT_TIMEOUT + INITIALIZE_TIMEOUT + tuning.prebuffer_timeout
+                < crate::REQUEST_TIMEOUT
         );
-        archive
-            .store(&hash, &bytes::Bytes::from_static(b"torrent-blob"))
-            .await;
-        assert_eq!(
-            archive.load(&hash).await.as_deref(),
-            Some(&b"torrent-blob"[..]),
-            "a stored blob must come back byte for byte -- librqbit parses it"
-        );
-
-        tokio::fs::remove_dir_all(&dir).await.unwrap();
     }
 
-    /// The archive turns a caller-supplied string into a filename, so the
-    /// shape check is a path-traversal guard, not a tidiness rule. `/videos/`
-    /// takes its info hash straight off the wire.
-    #[tokio::test]
-    async fn the_archive_refuses_anything_not_shaped_like_an_info_hash() {
-        let dir = archive_tempdir();
-        let archive = MetadataArchive::new(dir.join("metadata"));
-
-        for bad in ["../../etc/passwd", "short", ""] {
-            archive.store(bad, &bytes::Bytes::from_static(b"x")).await;
-            assert!(
-                archive.load(bad).await.is_none(),
-                "{bad:?} must never reach the filesystem"
-            );
-        }
-
-        tokio::fs::remove_dir_all(&dir).await.unwrap();
-    }
-
-    /// Bounded, or a long-lived install accumulates a `.torrent` per title it
-    /// has ever been shown -- and the browse path resolves far more of those
-    /// than anyone ever plays.
-    #[tokio::test]
-    async fn the_archive_prunes_itself_back_to_its_capacity() {
-        let dir = archive_tempdir();
-        let archive = MetadataArchive::new(dir.join("metadata"));
-
-        for nth in 0..(METADATA_ARCHIVE_CAPACITY + 8) {
-            archive
-                .store(&hash_of(nth), &bytes::Bytes::from_static(b"blob"))
-                .await;
-        }
-
-        let mut kept = 0;
-        let mut entries = tokio::fs::read_dir(dir.join("metadata")).await.unwrap();
-        while let Some(_entry) = entries.next_entry().await.unwrap() {
-            kept += 1;
-        }
+    #[test]
+    fn progress_agrees_on_what_finished_means() {
+        assert!(Progress::of(100, 100).finished);
+        assert!(!Progress::of(99, 100).finished);
         assert!(
-            kept <= METADATA_ARCHIVE_CAPACITY,
-            "archive grew to {kept}, past its {METADATA_ARCHIVE_CAPACITY} cap"
+            !Progress::of(0, 0).finished,
+            "a torrent whose size is not known yet has not finished anything"
         );
+        assert_eq!(Progress::of(0, 0).percent, 0.0);
+        assert_eq!(Progress::of(50, 200).percent, 25.0);
+    }
 
-        tokio::fs::remove_dir_all(&dir).await.unwrap();
+    #[test]
+    fn hashes_are_lowercased_without_copying_when_already_lowercase() {
+        assert!(matches!(lowercase("abcdef0123"), Cow::Borrowed(_)));
+        assert_eq!(lowercase("ABCDEF0123"), "abcdef0123");
     }
 }

@@ -22,30 +22,59 @@
 //! network. That is what makes the tunnel's bandwidth cap irrelevant and
 //! keeps playback at wifi speed instead of upload speed.
 
-use std::sync::Arc;
+use std::fmt::Write as _;
+use std::sync::{Arc, OnceLock};
 
 use axum::extract::{Path, State};
+use axum::http::header;
+use axum::response::{IntoResponse, Response};
 use axum::Json;
+use bytes::Bytes;
 use serde_json::{json, Value};
 use tracing::{debug, warn};
 
-use crate::indexer::{IndexedTorrent, StreamIndexer};
+use crate::indexer::IndexedTorrent;
 use crate::torrent::{resolver, BrowseCandidate};
+use crate::util::human_bytes;
 use crate::AppState;
 
 pub const ADDON_ID: &str = "com.localgateway.streaminggateway";
 
-pub async fn manifest(State(state): State<AppState>) -> Json<Value> {
+/// `GET /manifest.json`
+///
+/// The manifest never changes for the life of the process -- it depends only
+/// on whether discovery is on -- so it is encoded once per variant and served
+/// from those bytes. Stremio re-fetches it constantly.
+pub async fn manifest(State(state): State<AppState>) -> Response {
+    static WITH_DISCOVERY: OnceLock<Bytes> = OnceLock::new();
+    static WITHOUT_DISCOVERY: OnceLock<Bytes> = OnceLock::new();
+    let discovery = state.indexer.is_some();
+    let cell = if discovery {
+        &WITH_DISCOVERY
+    } else {
+        &WITHOUT_DISCOVERY
+    };
+    let body = cell
+        .get_or_init(|| {
+            Bytes::from(
+                serde_json::to_vec(&manifest_json(discovery)).expect("a json! value encodes"),
+            )
+        })
+        .clone();
+    ([(header::CONTENT_TYPE, "application/json")], body).into_response()
+}
+
+fn manifest_json(discovery: bool) -> Value {
     // Only advertise catalog id prefixes when discovery is actually on --
     // otherwise Stremio would query us for every title and always get an
     // empty list, which just looks broken.
-    let id_prefixes: Vec<&str> = if state.indexer.is_some() {
+    let id_prefixes: Vec<&str> = if discovery {
         vec!["tt", "kitsu:", "magnet:"]
     } else {
         vec!["magnet:"]
     };
 
-    let description = if state.indexer.is_some() {
+    let description = if discovery {
         "Streams movies and series through your own local torrent engine: finds \
          candidate torrents for a title, downloads only the file you are watching \
          (in playback order), and serves it over HTTP with seeking."
@@ -55,7 +84,7 @@ pub async fn manifest(State(state): State<AppState>) -> Json<Value> {
          GET /play?magnet=<magnet-link> directly (works in VLC, browsers, and TVs too)."
     };
 
-    Json(json!({
+    json!({
         "id": ADDON_ID,
         "version": env!("CARGO_PKG_VERSION"),
         "name": "Local Streaming Gateway",
@@ -67,7 +96,7 @@ pub async fn manifest(State(state): State<AppState>) -> Json<Value> {
         "types": ["movie", "series", "other"],
         "catalogs": [],
         "behaviorHints": { "configurable": false, "p2p": true }
-    }))
+    })
 }
 
 /// `GET /stream/{type}/{id}.json`
@@ -161,8 +190,19 @@ fn is_catalog_id(id: &str) -> bool {
 
 /// Handles an id that already carries the magnet -- no index involved.
 async fn magnet_streams(state: &AppState, magnet: &str) -> Vec<Value> {
-    let Ok(resolved) = state.engine.resolve(magnet).await else {
-        return Vec::new();
+    let resolved = match state.engine.resolve(magnet).await {
+        Ok(resolved) => resolved,
+        Err(e) => {
+            // Still an empty list to Stremio, which fans this request out to
+            // every addon. But it used to be *only* that, so a magnet that
+            // never resolved left no trace anywhere of why nothing appeared.
+            warn!("could not resolve a magnet for the stream list: {e:#}");
+            state.audit.record(crate::audit::Event::Problem {
+                context: "resolving a magnet stream".to_string(),
+                message: format!("{e:#}"),
+            });
+            return Vec::new();
+        }
     };
     let Some(file_idx) = resolved.suggested_file_idx else {
         return Vec::new();
@@ -185,9 +225,9 @@ async fn magnet_streams(state: &AppState, magnet: &str) -> Vec<Value> {
             "{}\n{} \u{2022} {}",
             resolved.name.clone().unwrap_or_else(|| file.name.clone()),
             file.name,
-            human_size(file.length)
+            human_bytes(file.length, 2)
         ),
-        "url": video_url(state, &resolved.info_hash, file_idx),
+        "url": video_url(&state.stream_base_url, &resolved.info_hash, file_idx),
         "behaviorHints": {
             "notWebReady": false,
             "bingeGroup": "local-streaming-gateway"
@@ -227,12 +267,14 @@ async fn indexed_streams(
     // `/videos/...` refuses hashes the gateway never offered. The trackers
     // ride along so that pick starts against this release's own swarm
     // instead of a bare info hash (see `AdvertisedHashes`).
-    for torrent in &found {
-        state
-            .engine
-            .remember_advertised(&torrent.info_hash, &torrent.trackers)
-            .await;
-    }
+    state
+        .engine
+        .remember_advertised_many(
+            found
+                .iter()
+                .map(|t| (t.info_hash.as_str(), t.trackers.as_slice())),
+        )
+        .await;
 
     // Reaching this list is the earliest reliable sign that someone is about
     // to play one of these, and it is the last moment before the tap when
@@ -265,14 +307,19 @@ async fn indexed_streams(
             let mut entries = vec![json!({
                 "name": stream_label(&torrent.quality),
                 "title": format!("{}\n\u{2705} same wifi as the PC \u{2022} full speed", describe(torrent)),
-                "url": video_url(state, &torrent.info_hash, file_idx),
+                "url": video_url(&state.stream_base_url, &torrent.info_hash, file_idx),
                 "behaviorHints": { "notWebReady": false, "bingeGroup": binge },
             })];
 
             // Reachable-from-anywhere fallback, listed second so the direct
             // LAN route stays the default pick.
-            if let Some(url) = remote_video_url(state, forwarded_host, &torrent.info_hash, file_idx)
-            {
+            if let Some(url) = remote_video_url(
+                &state.stream_base_url,
+                state.tls_host.as_deref(),
+                forwarded_host,
+                &torrent.info_hash,
+                file_idx,
+            ) {
                 entries.push(json!({
                     "name": remote_stream_label(&torrent.quality),
                     "title": format!(
@@ -303,8 +350,8 @@ async fn indexed_streams(
 ///
 /// The host is always `stream_base_url` (the LAN address) -- see this
 /// module's header for why that is deliberate.
-fn video_url(state: &AppState, info_hash: &str, file_idx: usize) -> String {
-    format!("{}/videos/{info_hash}/{file_idx}", state.stream_base_url)
+fn video_url(stream_base_url: &str, info_hash: &str, file_idx: usize) -> String {
+    format!("{stream_base_url}/videos/{info_hash}/{file_idx}")
 }
 
 /// The same video, addressed through whatever host the *addon request* came
@@ -325,13 +372,23 @@ fn video_url(state: &AppState, info_hash: &str, file_idx: usize) -> String {
 /// the video through the tunnel, so it is slower and counts against any
 /// bandwidth quota. Direct-first, fallback-second.
 fn remote_video_url(
-    state: &AppState,
+    stream_base_url: &str,
+    tls_host: Option<&str>,
     forwarded_host: Option<&str>,
     info_hash: &str,
     file_idx: usize,
 ) -> Option<String> {
     let host = forwarded_host?;
-    if host.is_empty() || state.stream_base_url.contains(host) || !is_public_host(host) {
+    // Compared as hostnames, not as substrings of the base URL: a substring
+    // test called `1.2.3.4` "this machine" whenever the LAN address merely
+    // contained it, as `11.2.3.45` does, and dropped the fallback entry.
+    let base_host = url::Url::parse(stream_base_url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned));
+    if host.is_empty()
+        || base_host.is_some_and(|base| host_matches(host, &base))
+        || !is_public_host(host)
+    {
         // Reached directly on this network -- the fast URL already works, and
         // a second entry built from a private address would be a duplicate at
         // best and a broken `https://192.168.x.x` link at worst.
@@ -341,11 +398,7 @@ fn remote_video_url(
     // address, so it passes every check above while still being this machine
     // on this LAN. Offering a "you must be away from home" entry for it would
     // label the local route as the slow one.
-    if state
-        .tls_host
-        .as_deref()
-        .is_some_and(|tls_host| host_matches(host, tls_host))
-    {
+    if tls_host.is_some_and(|tls_host| host_matches(host, tls_host)) {
         return None;
     }
     // Anything reaching us through a public tunnel arrived over https.
@@ -421,34 +474,19 @@ fn remote_stream_label(quality: &str) -> String {
 fn describe(torrent: &IndexedTorrent) -> String {
     let mut line = String::new();
     if let Some(seeders) = torrent.seeders {
-        line.push_str(&format!("\u{1F464} {seeders}"));
+        let _ = write!(line, "\u{1F464} {seeders}");
     }
     if let Some(size) = torrent.size_bytes {
         if !line.is_empty() {
             line.push_str("  ");
         }
-        line.push_str(&format!("\u{1F4BE} {}", human_size(size)));
+        let _ = write!(line, "\u{1F4BE} {}", human_bytes(size, 2));
     }
 
     if line.is_empty() {
         torrent.title.clone()
     } else {
         format!("{}\n{line}", torrent.title)
-    }
-}
-
-fn human_size(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
-    let mut value = bytes as f64;
-    let mut unit = 0;
-    while value >= 1024.0 && unit < UNITS.len() - 1 {
-        value /= 1024.0;
-        unit += 1;
-    }
-    if unit == 0 {
-        format!("{bytes} B")
-    } else {
-        format!("{value:.2} {}", UNITS[unit])
     }
 }
 
@@ -492,8 +530,7 @@ mod tests {
     fn video_url_has_no_query_string_to_survive_an_external_player_handoff() {
         // Stremio hands this to VLC via an Android intent; a bare path
         // survives that, a percent-encoded magnet query string may not.
-        let state_base = "http://192.168.1.67:8080";
-        let url = format!("{state_base}/videos/{}/{}", torrent().info_hash, 0);
+        let url = video_url("http://192.168.1.67:8080", &torrent().info_hash, 0);
         assert_eq!(
             url,
             "http://192.168.1.67:8080/videos/45fa4233ef87c58f5f8b4817e4d50c9f5363caef/0"
@@ -515,9 +552,58 @@ mod tests {
     }
 
     #[test]
-    fn human_size_formats_expected_units() {
-        assert_eq!(human_size(512), "512 B");
-        assert_eq!(human_size(2 * 1024 * 1024 * 1024), "2.00 GB");
+    fn sizes_in_stream_titles_carry_two_decimals() {
+        assert_eq!(human_bytes(512, 2), "512 B");
+        assert_eq!(human_bytes(2 * 1024 * 1024 * 1024, 2), "2.00 GB");
+    }
+
+    const HASH: &str = "45fa4233ef87c58f5f8b4817e4d50c9f5363caef";
+
+    #[test]
+    fn a_tunnel_host_gets_an_away_entry() {
+        assert_eq!(
+            remote_video_url(
+                "http://192.168.1.67:8080",
+                None,
+                Some("abc123.ngrok-free.app"),
+                HASH,
+                2
+            )
+            .as_deref(),
+            Some("https://abc123.ngrok-free.app/videos/45fa4233ef87c58f5f8b4817e4d50c9f5363caef/2")
+        );
+    }
+
+    /// The regression: the old check asked whether the base URL *contained*
+    /// the host, and `http://11.2.3.45:8080` contains `1.2.3.4`.
+    #[test]
+    fn a_host_that_is_a_substring_of_the_lan_address_is_still_remote() {
+        assert!(
+            remote_video_url("http://11.2.3.45:8080", None, Some("1.2.3.4"), HASH, 0).is_some()
+        );
+    }
+
+    #[test]
+    fn this_machine_by_address_or_by_its_https_name_gets_no_away_entry() {
+        assert!(
+            remote_video_url("http://8.8.4.4:8080", None, Some("8.8.4.4:8080"), HASH, 0).is_none()
+        );
+        assert!(remote_video_url(
+            "http://192.168.1.67:8080",
+            Some("192-168-1-67.local-ip.sh"),
+            Some("192-168-1-67.local-ip.sh:8443"),
+            HASH,
+            0
+        )
+        .is_none());
+        assert!(remote_video_url("http://192.168.1.67:8080", None, None, HASH, 0).is_none());
+    }
+
+    #[test]
+    fn the_manifest_only_claims_catalog_ids_when_discovery_is_on() {
+        let prefixes = |discovery| manifest_json(discovery)["resources"][0]["idPrefixes"].clone();
+        assert_eq!(prefixes(true), json!(["tt", "kitsu:", "magnet:"]));
+        assert_eq!(prefixes(false), json!(["magnet:"]));
     }
 
     #[test]

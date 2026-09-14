@@ -15,18 +15,22 @@ use clap::Parser;
 )]
 pub struct AppConfig {
     /// Primary port to bind the HTTP gateway on.
+    #[arg(help_heading = "Network")]
     #[arg(long, env = "GATEWAY_PORT", default_value_t = 8080)]
     pub port: u16,
 
     /// Fallback port used if the primary port is already taken.
+    #[arg(help_heading = "Network")]
     #[arg(long, env = "GATEWAY_FALLBACK_PORT", default_value_t = 11470)]
     pub fallback_port: u16,
 
     /// Address to bind on. 0.0.0.0 exposes the gateway to the whole LAN.
+    #[arg(help_heading = "Network")]
     #[arg(long, env = "GATEWAY_BIND_ADDR", default_value = "0.0.0.0")]
     pub bind_addr: IpAddr,
 
     /// Directory used to store downloaded torrent data and session state.
+    #[arg(help_heading = "Cache")]
     #[arg(long, env = "CACHE_DIRECTORY", default_value = "./cache")]
     pub cache_dir: PathBuf,
 
@@ -37,6 +41,7 @@ pub struct AppConfig {
     /// purpose: the installed binaries are started by a desktop launcher from
     /// whatever directory it happened to be in, and a log nobody can find is
     /// the problem this whole subsystem exists to fix.
+    #[arg(help_heading = "Logging")]
     #[arg(long, env = "LOG_DIRECTORY")]
     pub log_dir: Option<PathBuf>,
 
@@ -47,10 +52,12 @@ pub struct AppConfig {
     /// piece-fetch latency again; disk is by far the cheapest speed available
     /// here. 100 GB is roughly 20-40 films, which is about the horizon over
     /// which someone actually re-watches or resumes something.
+    #[arg(help_heading = "Cache")]
     #[arg(long, env = "MAX_CACHE_SIZE_GB", default_value_t = 100)]
     pub max_cache_size_gb: u64,
 
     /// Whether to automatically evict old cached torrents when over the size cap.
+    #[arg(help_heading = "Cache")]
     #[arg(long, env = "AUTO_CLEANUP", default_value_t = true)]
     pub auto_cleanup: bool,
 
@@ -71,14 +78,17 @@ pub struct AppConfig {
     /// roughly 1.5 GB an episode. It is well clear of the download queue's
     /// four, so nothing the queue fetches ahead is thrown away before it can
     /// be watched.
+    #[arg(help_heading = "Cache")]
     #[arg(long, env = "MAX_CACHED_TORRENTS", default_value_t = 10)]
     pub max_cached_torrents: usize,
 
     /// How often (seconds) the cache janitor checks disk usage.
+    #[arg(help_heading = "Cache")]
     #[arg(long, env = "CACHE_CLEANUP_INTERVAL_SECS", default_value_t = 60)]
     pub cleanup_interval_secs: u64,
 
     /// Maximum number of torrents actively managed (downloading/seeding) at once.
+    #[arg(help_heading = "Torrent engine")]
     #[arg(long, env = "MAX_CONCURRENT_TORRENTS", default_value_t = 8)]
     pub max_concurrent_torrents: usize,
 
@@ -103,6 +113,7 @@ pub struct AppConfig {
     /// shipped value because the common case is a series and the machine is
     /// usually idle between episodes; drop it to 1 or 2 on a link that is
     /// only just keeping up with playback.
+    #[arg(help_heading = "Torrent engine")]
     #[arg(long, env = "MAX_ACTIVE_DOWNLOADS", default_value_t = 4)]
     pub max_active_downloads: usize,
 
@@ -117,6 +128,7 @@ pub struct AppConfig {
     /// buys a stream of connection attempts (measured at ~9 a second at 128)
     /// whose cost in router NAT-table churn and airtime outweighs the few
     /// extra peers it lands. 60 still saturates any home connection.
+    #[arg(help_heading = "Torrent engine")]
     #[arg(long, env = "MAX_PEERS_PER_TORRENT", default_value_t = 60)]
     pub max_peers_per_torrent: usize,
 
@@ -132,6 +144,7 @@ pub struct AppConfig {
     /// half-duplex radio and unlimited seeding is felt directly as buffering.
     /// 2 MB/s is high enough that peers keep reciprocating. Set 0 for
     /// unlimited, which is the right value on ethernet.
+    #[arg(help_heading = "Torrent engine")]
     #[arg(long, env = "MAX_UPLOAD_MB_S", default_value_t = 2)]
     pub max_upload_mb_s: u64,
 
@@ -142,6 +155,7 @@ pub struct AppConfig {
     /// spent on the same airtime the video needs, so capping it to a little
     /// above the file's real bitrate (size in GB / hours, roughly) can make
     /// playback smoother even though the download gets slower.
+    #[arg(help_heading = "Torrent engine")]
     #[arg(long, env = "MAX_DOWNLOAD_MB_S", default_value_t = 0)]
     pub max_download_mb_s: u64,
 
@@ -153,10 +167,12 @@ pub struct AppConfig {
     /// minutes ahead legitimately reads nothing for that long, and a player
     /// that does get dropped simply reconnects. See `network::harden_listener`
     /// for why the default of "probe forever" is actively harmful here.
+    #[arg(help_heading = "Network")]
     #[arg(long, env = "CLIENT_TIMEOUT_SECS", default_value_t = 900)]
     pub client_timeout_secs: u64,
 
     /// Disable BitTorrent DHT (uses trackers/peer exchange only).
+    #[arg(help_heading = "Torrent engine")]
     #[arg(long, env = "DISABLE_DHT", default_value_t = false)]
     pub disable_dht: bool,
 
@@ -168,6 +184,7 @@ pub struct AppConfig {
     /// download that crawls on the first play of a title. If the port cannot
     /// be bound the gateway falls back to an ephemeral one rather than
     /// refusing to start.
+    #[arg(help_heading = "Torrent engine")]
     #[arg(long, env = "PEER_PORT", default_value_t = 6881)]
     pub peer_port: u16,
 
@@ -176,6 +193,7 @@ pub struct AppConfig {
     /// The forward is what lets peers outside this LAN reach the listening
     /// socket above; without it the listener only helps peers on the local
     /// network, which for a public swarm is almost none of them.
+    #[arg(help_heading = "Torrent engine")]
     #[arg(long, env = "DISABLE_UPNP", default_value_t = false)]
     pub disable_upnp: bool,
 
@@ -200,19 +218,23 @@ pub struct AppConfig {
     /// Set it to 1 to try it. The wins that came out of that work and are
     /// unambiguous -- the incoming peer listener, the tracker lists, the
     /// per-hash start lock -- are all still on and are not affected by this.
+    #[arg(help_heading = "Torrent engine")]
     #[arg(long, env = "BROWSE_PREFETCH_COUNT", default_value_t = 0)]
     pub browse_prefetch_count: usize,
 
     /// How often (seconds) to print the terminal monitoring status.
+    #[arg(help_heading = "Logging")]
     #[arg(long, env = "MONITOR_INTERVAL_SECS", default_value_t = 5)]
     pub monitor_interval_secs: u64,
 
     /// Log level filter (passed to `tracing_subscriber::EnvFilter`).
+    #[arg(help_heading = "Logging")]
     #[arg(long, env = "LOG_LEVEL", default_value = "info")]
     pub log_level: String,
 
     /// Torrent index queried to turn an IMDB id into candidate torrents.
     /// Must speak the Stremio stream protocol (`/stream/{type}/{id}.json`).
+    #[arg(help_heading = "Discovery")]
     #[arg(
         long,
         env = "INDEXER_URL",
@@ -222,16 +244,19 @@ pub struct AppConfig {
 
     /// Disable torrent discovery entirely. The addon then only answers for
     /// ids that already carry a magnet link, and never makes outbound calls.
+    #[arg(help_heading = "Discovery")]
     #[arg(long, env = "DISABLE_INDEXER", default_value_t = false)]
     pub disable_indexer: bool,
 
     /// Maximum number of streams shown per title.
+    #[arg(help_heading = "Discovery")]
     #[arg(long, env = "INDEXER_MAX_RESULTS", default_value_t = 15)]
     pub indexer_max_results: usize,
 
     /// Timeout (seconds) for a single index query. Kept well under the
     /// player's own patience so a slow index degrades to "no results"
     /// rather than a spinner that never resolves.
+    #[arg(help_heading = "Discovery")]
     #[arg(long, env = "INDEXER_TIMEOUT_SECS", default_value_t = 10)]
     pub indexer_timeout_secs: u64,
 
@@ -251,6 +276,7 @@ pub struct AppConfig {
     /// a warm seek the top-up is real time spent reading before any byte goes
     /// out, and a player needs enough to parse a container header, not a
     /// multi-megabyte head start it is about to buffer again itself.
+    #[arg(help_heading = "Streaming")]
     #[arg(long, env = "PREBUFFER_BYTES", default_value_t = 1024 * 1024)]
     pub prebuffer_bytes: usize,
 
@@ -261,6 +287,7 @@ pub struct AppConfig {
     /// Kept small enough that metadata fetch + initialization + this stays
     /// under the router's 60s request timeout -- see the cold-start budget in
     /// the `torrent` module.
+    #[arg(help_heading = "Streaming")]
     #[arg(long, env = "PREBUFFER_TIMEOUT_SECS", default_value_t = 15)]
     pub prebuffer_timeout_secs: u64,
 
@@ -276,6 +303,7 @@ pub struct AppConfig {
     ///
     /// Must stay comfortably above the time to fetch one piece (4-16 MB) or
     /// healthy slow downloads get re-opened needlessly. Set to 0 to disable.
+    #[arg(help_heading = "Streaming")]
     #[arg(long, env = "STALL_TIMEOUT_SECS", default_value_t = 20)]
     pub stall_timeout_secs: u64,
 
@@ -297,10 +325,12 @@ pub struct AppConfig {
     /// pausing a film someone paused to make dinner guarantees them a full
     /// DHT/tracker rediscovery when they come back, which is the single
     /// longest wait this gateway ever imposes.
+    #[arg(help_heading = "Torrent engine")]
     #[arg(long, env = "IDLE_PAUSE_SECS", default_value_t = 1800)]
     pub idle_pause_secs: u64,
 
     /// How often (seconds) to look for idle torrents to pause.
+    #[arg(help_heading = "Torrent engine")]
     #[arg(long, env = "IDLE_CHECK_INTERVAL_SECS", default_value_t = 30)]
     pub idle_check_interval_secs: u64,
 
@@ -319,6 +349,7 @@ pub struct AppConfig {
     /// the first one's retry then cancelling the second's, forever).
     /// A reader that has served bytes is never touched: that is someone
     /// watching. Set false to disable.
+    #[arg(help_heading = "Streaming")]
     #[arg(long, env = "SEEK_SUPERSEDE", default_value_t = true)]
     pub seek_supersede: bool,
 
@@ -337,6 +368,7 @@ pub struct AppConfig {
     /// their Cues even though Matroska's index is nominally at the front, and
     /// the measurement that settled it is in `torrent::TAIL_INDEXED_EXTENSIONS`.
     /// The env var keeps its `MP4_` name so an existing config keeps working.
+    #[arg(help_heading = "Streaming")]
     #[arg(long, env = "MP4_TAIL_WARM", default_value_t = true)]
     pub mp4_tail_warm: bool,
 
@@ -351,11 +383,13 @@ pub struct AppConfig {
     /// minutes. On a swarm that is comfortably outrunning playback that is
     /// free insurance against a stall; on one that is barely keeping up it is
     /// actively harmful. Measure before turning it on.
+    #[arg(help_heading = "Streaming")]
     #[arg(long, env = "READAHEAD_EXTRA_MB", default_value_t = 0)]
     pub readahead_extra_mb: u64,
 
     /// How many seconds of uninterrupted playback count as "settled" before
     /// the extra read-ahead above is claimed. No effect at 0 extra MB.
+    #[arg(help_heading = "Streaming")]
     #[arg(long, env = "READAHEAD_SETTLE_SECS", default_value_t = 10)]
     pub readahead_settle_secs: u64,
 
@@ -370,6 +404,7 @@ pub struct AppConfig {
     /// than the first thirty seconds. Off by default for exactly that reason
     /// -- try 100 and measure whether it moves anything on your link before
     /// leaving it on.
+    #[arg(help_heading = "Torrent engine")]
     #[arg(long, env = "COLD_START_PEER_LIMIT", default_value_t = 0)]
     pub cold_start_peer_limit: usize,
 
@@ -379,12 +414,14 @@ pub struct AppConfig {
     /// install an addon from a plain `http://192.168.x.x` URL. The http
     /// listener stays up either way and still serves the video, so turning
     /// this off only costs the ability to add the addon without a tunnel.
+    #[arg(help_heading = "HTTPS")]
     #[arg(long, env = "DISABLE_HTTPS", default_value_t = false)]
     pub disable_https: bool,
 
     /// Port for the https listener. Separate from the http one so everything
     /// that already works over http -- VLC, a browser, the desktop app's own
     /// health checks -- keeps working untouched.
+    #[arg(help_heading = "HTTPS")]
     #[arg(long, env = "HTTPS_PORT", default_value_t = 8443)]
     pub https_port: u16,
 
@@ -393,10 +430,12 @@ pub struct AppConfig {
     /// Must be a service that resolves a dash-encoded address back to itself
     /// (`192-168-1-67.<suffix>` -> `192.168.1.67`) *and* publishes the
     /// matching certificate. See the `tls` module for why this works.
+    #[arg(help_heading = "HTTPS")]
     #[arg(long, env = "TLS_HOST_SUFFIX", default_value = "local-ip.sh")]
     pub tls_host_suffix: String,
 
     /// Where the wildcard certificate and its key are published.
+    #[arg(help_heading = "HTTPS")]
     #[arg(
         long,
         env = "TLS_CERT_URL",
@@ -404,6 +443,7 @@ pub struct AppConfig {
     )]
     pub tls_cert_url: String,
 
+    #[arg(help_heading = "HTTPS")]
     #[arg(
         long,
         env = "TLS_KEY_URL",
@@ -416,9 +456,11 @@ pub struct AppConfig {
     /// This is the option for anyone using a domain they actually control:
     /// the published key is world-readable by design, so it cannot
     /// authenticate this machine to anyone. Both must be given together.
+    #[arg(help_heading = "HTTPS")]
     #[arg(long, env = "TLS_CERT_FILE")]
     pub tls_cert_file: Option<PathBuf>,
 
+    #[arg(help_heading = "HTTPS")]
     #[arg(long, env = "TLS_KEY_FILE")]
     pub tls_key_file: Option<PathBuf>,
 
@@ -426,6 +468,7 @@ pub struct AppConfig {
     /// Defaults to this machine's LAN address, which is what you want: the
     /// manifest may be reached through an https tunnel, but the video itself
     /// should stream straight over the LAN rather than through it.
+    #[arg(help_heading = "Network")]
     #[arg(long, env = "PUBLIC_STREAM_URL")]
     pub public_stream_url: Option<String>,
 }
@@ -536,7 +579,10 @@ mod tests {
         let config = defaults();
         assert_eq!(config.prebuffer_bytes, 1024 * 1024);
         assert_eq!(config.idle_pause_secs, 1800);
-        assert!(config.seek_supersede, "scrub bursts otherwise keep every abandoned reader's piece-priority claim");
+        assert!(
+            config.seek_supersede,
+            "scrub bursts otherwise keep every abandoned reader's piece-priority claim"
+        );
         assert!(config.mp4_tail_warm);
     }
 

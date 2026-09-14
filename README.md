@@ -399,7 +399,7 @@ curl -s http://127.0.0.1:8080/health | grep -o '"version":"[^"]*"'
 # 📦 Release history
 
 <img alt="Latest" src="https://img.shields.io/badge/latest-v1.2.0-2ea043?style=for-the-badge">
-<img alt="Tests" src="https://img.shields.io/badge/tests-175_passing-2ea043?style=for-the-badge">
+<img alt="Tests" src="https://img.shields.io/badge/tests-263_passing-2ea043?style=for-the-badge">
 <img alt="Clippy" src="https://img.shields.io/badge/clippy-clean-2ea043?style=for-the-badge">
 
 </div>
@@ -759,14 +759,20 @@ crates/
   gateway/              the server
     src/
       lib.rs              router, startup, shared state
-      torrent/            librqbit wrapper, file selection, idle pausing
+      torrent/            librqbit wrapper, file selection, download queue,
+                          idle pausing, metadata archive, reader bookkeeping
       streaming/          HTTP Range serving + pre-buffering
       stremio/            /manifest.json + /stream/{type}/{id}.json
       indexer/            torrent discovery by IMDB id
       cache/              size-capped eviction
-      network/  config/  monitoring/  error.rs
-    tests/http_api.rs     integration tests against the real router
+      network/  config/  monitoring/  tls/  audit/  util.rs  error.rs
+    tests/http_api/       integration tests against the real router + engine
   gateway-gui/          desktop launcher (eframe/egui)
+    src/
+      main.rs             the frame loop and the layer order
+      app/                window state, actions, polling, panels
+      health.rs  http.rs  job.rs  text.rs  cli.rs
+      server_process.rs  service.rs  tray.rs  fx.rs  theme.rs  widgets.rs
 setup.sh   Dockerfile
 ```
 
@@ -877,6 +883,17 @@ setup.sh   Dockerfile
   closes, leaving a tiny `--tray` process holding only a D-Bus
   StatusNotifierItem; opening from the tray spawns a fresh window and retires
   the tray. A pid file in `$XDG_RUNTIME_DIR` keeps it to one of each.
+- **Opening the window never restarts a running gateway.** Installing the
+  service ends in `systemctl restart`, and the window used to route a merely
+  missing login tray entry through the install — restarting a gateway that
+  could be mid-stream, for the sake of a tray icon at the next login. Only a
+  missing unit installs now; a missing tray entry is rewritten on its own.
+- **The log panel drops lines rather than slow the gateway down.** The window
+  reads the server's stdout through a pipe. If that reader ever waited for the
+  panel to catch up, the pipe would fill, the server's next log line would
+  block, and so would the stream it was serving — so a line that does not fit
+  is counted and dropped, and the panel shows `[N log lines dropped]` in its
+  place.
 - **Always-on is a systemd *user* unit, not a system one.** It installs with no
   root at all (nothing for the `.deb` to do at install time for a user who may
   never want it), runs as the person who owns the cache, and needs only
@@ -903,7 +920,8 @@ setup.sh   Dockerfile
 
 ```bash
 cargo build --release              # both crates
-cargo test --release               # 175 tests
+cargo build --profile release-fast # same opt-level, thin LTO: links in seconds, for iterating
+cargo test --release               # 263 tests
 cargo clippy --release --all-targets -- -D warnings
 cargo deb -p streaming-gateway-gui                   # .deb package
 cargo generate-rpm -p crates/gateway-gui -o out.rpm  # .rpm package (build first)
@@ -931,6 +949,21 @@ instead of your LAN address.
 | `GET /play?magnet=…` | Resolve a magnet and redirect to the video |
 | `GET /health` | Status, active torrents, cache usage, and `recent_starts` — the last 24 measured waits, broken into phases |
 | `GET /audit/export` | The full event log as JSONL. Loopback only: it records client IPs and titles |
+| `POST /cache/clear` | Delete every torrent and its data. Loopback only (the desktop app's purge button) |
+| `POST /torrents/{hash}/{pause\|resume\|delete}` | Control one torrent. Loopback only (the desktop app's swarm rows) |
+
+Every error is JSON, `{"error": "..."}`, with a status that means something to
+a player:
+
+- `403` — a loopback-only route called from another machine.
+- `416` — the range starts past the end of the file; carries
+  `Content-Range: bytes */<length>` as RFC 7233 asks. A range that merely
+  *ends* past the end is clamped and served as `206`, not refused.
+- `409` — the read was superseded by a newer range request from the same
+  client (a seek), and is answered empty so it releases its piece priority.
+- `503` with `Retry-After: 1` — no data for that offset arrived within the
+  pre-buffer wait; a retry keeps the player asking instead of giving up on a
+  `206` with an empty body.
 
 </details>
 

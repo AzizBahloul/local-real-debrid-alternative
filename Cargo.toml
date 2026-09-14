@@ -10,3 +10,13 @@ lto = true
 codegen-units = 1
 panic = "unwind"
 strip = true
+
+# A throwaway iteration build: same optimisation level, but thin LTO across
+# 16 codegen units links in seconds rather than the release profile's
+# single-threaded 1.5-2 minutes per binary. Output lands in
+# `target/release-fast/`, so it never overwrites a real release build.
+# `cargo build --profile release-fast`
+[profile.release-fast]
+inherits = "release"
+lto = "thin"
+codegen-units = 16

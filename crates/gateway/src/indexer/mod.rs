@@ -10,8 +10,17 @@
 //! be swapped (a self-hosted Jackett bridge, a different public index, or
 //! several merged together), and none of that should touch the streaming path.
 
+use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
 use anyhow::{Context, Result};
 use serde::Deserialize;
+
+use crate::torrent::resolver::is_hex40;
+use crate::util::lock;
 
 /// A torrent the index thinks matches the requested title.
 #[derive(Debug, Clone, PartialEq)]
@@ -33,10 +42,97 @@ pub struct IndexedTorrent {
     pub trackers: Vec<String>,
 }
 
+/// What a search hands back: a boxed future, so the trait can be used as
+/// `dyn StreamIndexer` and an index can be wrapped (see `CachingIndexer`) or
+/// swapped without every holder naming the concrete type.
+pub type SearchFuture<'a> = Pin<Box<dyn Future<Output = Result<Vec<IndexedTorrent>>> + Send + 'a>>;
+
 /// Anything that can turn a content id into candidate torrents.
-#[allow(async_fn_in_trait)]
 pub trait StreamIndexer: Send + Sync {
-    async fn search(&self, content_type: &str, content_id: &str) -> Result<Vec<IndexedTorrent>>;
+    fn search<'a>(&'a self, content_type: &'a str, content_id: &'a str) -> SearchFuture<'a>;
+}
+
+// ---------------------------------------------------------------------------
+// Caching
+// ---------------------------------------------------------------------------
+
+/// How long one title's search result is reused.
+///
+/// Stremio asks for the same stream list over and over while someone browses:
+/// opening a title, backing out, opening it again, and preloading the next
+/// episode. Each ask was a round trip to a public index -- the slowest part of
+/// showing the list, and a load on someone else's service. Five minutes is
+/// short enough that seeder counts are still meaningful for choosing a source.
+const SEARCH_CACHE_TTL: Duration = Duration::from_secs(300);
+
+/// How many distinct titles keep a cached result.
+const SEARCH_CACHE_CAPACITY: usize = 64;
+
+type CacheKey = (String, String);
+
+/// Remembers successful searches for a few minutes.
+///
+/// Failures are never cached: a timeout or an index hiccup has to be retried
+/// by the next ask, not replayed to it.
+pub struct CachingIndexer {
+    inner: Arc<dyn StreamIndexer>,
+    ttl: Duration,
+    capacity: usize,
+    entries: Mutex<HashMap<CacheKey, (Instant, Vec<IndexedTorrent>)>>,
+}
+
+impl CachingIndexer {
+    pub fn new(inner: Arc<dyn StreamIndexer>) -> Self {
+        Self::with_limits(inner, SEARCH_CACHE_TTL, SEARCH_CACHE_CAPACITY)
+    }
+
+    fn with_limits(inner: Arc<dyn StreamIndexer>, ttl: Duration, capacity: usize) -> Self {
+        Self {
+            inner,
+            ttl,
+            capacity: capacity.max(1),
+            entries: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn fresh(&self, key: &CacheKey) -> Option<Vec<IndexedTorrent>> {
+        lock(&self.entries)
+            .get(key)
+            .filter(|(stored_at, _)| stored_at.elapsed() < self.ttl)
+            .map(|(_, found)| found.clone())
+    }
+
+    fn store(&self, key: CacheKey, found: Vec<IndexedTorrent>) {
+        let mut entries = lock(&self.entries);
+        if entries.len() >= self.capacity && !entries.contains_key(&key) {
+            let ttl = self.ttl;
+            entries.retain(|_, (stored_at, _)| stored_at.elapsed() < ttl);
+            if entries.len() >= self.capacity {
+                let oldest = entries
+                    .iter()
+                    .min_by_key(|(_, (stored_at, _))| *stored_at)
+                    .map(|(key, _)| key.clone());
+                if let Some(oldest) = oldest {
+                    entries.remove(&oldest);
+                }
+            }
+        }
+        entries.insert(key, (Instant::now(), found));
+    }
+}
+
+impl StreamIndexer for CachingIndexer {
+    fn search<'a>(&'a self, content_type: &'a str, content_id: &'a str) -> SearchFuture<'a> {
+        Box::pin(async move {
+            let key = (content_type.to_string(), content_id.to_string());
+            if let Some(found) = self.fresh(&key) {
+                return Ok(found);
+            }
+            let found = self.inner.search(content_type, content_id).await?;
+            self.store(key, found.clone());
+            Ok(found)
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -59,6 +155,12 @@ impl TorrentioIndexer {
     pub fn new(base_url: String, max_results: usize, timeout: std::time::Duration) -> Result<Self> {
         let client = reqwest::Client::builder()
             .timeout(timeout)
+            // A dead or unreachable index should fail at the connect, not
+            // after the whole request budget.
+            .connect_timeout(timeout.min(Duration::from_secs(10)))
+            // Browsing asks in bursts; keep the TLS connection between them
+            // rather than paying a fresh handshake for each title.
+            .pool_idle_timeout(Duration::from_secs(90))
             // A default UA gets refused by some public indexes.
             .user_agent(concat!(
                 "streaming-gateway/",
@@ -112,7 +214,13 @@ fn tracker_sources(sources: &[String]) -> Vec<String> {
 }
 
 impl StreamIndexer for TorrentioIndexer {
-    async fn search(&self, content_type: &str, content_id: &str) -> Result<Vec<IndexedTorrent>> {
+    fn search<'a>(&'a self, content_type: &'a str, content_id: &'a str) -> SearchFuture<'a> {
+        Box::pin(self.fetch(content_type, content_id))
+    }
+}
+
+impl TorrentioIndexer {
+    async fn fetch(&self, content_type: &str, content_id: &str) -> Result<Vec<IndexedTorrent>> {
         // Both segments are validated by the caller before we get here, but
         // percent-encode anyway so a stray character can never reshape the URL.
         let url = format!(
@@ -188,10 +296,6 @@ impl StreamIndexer for TorrentioIndexer {
 // ---------------------------------------------------------------------------
 // Parsing helpers for Torrentio's human-formatted stats line
 // ---------------------------------------------------------------------------
-
-fn is_hex40(value: &str) -> bool {
-    value.len() == 40 && value.bytes().all(|b| b.is_ascii_hexdigit())
-}
 
 /// Splits `"Release.Name\n👤 42 💾 2.1 GB"` into its two halves. Torrentio
 /// sometimes omits the stats line entirely, hence the empty-string fallback.
@@ -320,5 +424,96 @@ mod tests {
         assert!(!is_hex40("tooshort"));
         assert!(!is_hex40("../../etc/passwd"));
         assert!(!is_hex40(""));
+    }
+
+    /// Answers with one torrent per call and counts the calls; fails while
+    /// `failing` is set.
+    #[derive(Default)]
+    struct FakeIndex {
+        calls: std::sync::atomic::AtomicUsize,
+        failing: std::sync::atomic::AtomicBool,
+    }
+
+    impl StreamIndexer for FakeIndex {
+        fn search<'a>(&'a self, _: &'a str, content_id: &'a str) -> SearchFuture<'a> {
+            use std::sync::atomic::Ordering;
+            Box::pin(async move {
+                let call = self.calls.fetch_add(1, Ordering::SeqCst);
+                if self.failing.load(Ordering::SeqCst) {
+                    anyhow::bail!("index unavailable");
+                }
+                Ok(vec![IndexedTorrent {
+                    info_hash: format!("{call:040}"),
+                    file_idx: None,
+                    title: content_id.to_string(),
+                    quality: String::new(),
+                    size_bytes: None,
+                    seeders: None,
+                    trackers: Vec::new(),
+                }])
+            })
+        }
+    }
+
+    fn calls(fake: &FakeIndex) -> usize {
+        fake.calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[tokio::test]
+    async fn browsing_the_same_title_again_does_not_ask_the_index_again() {
+        let fake = Arc::new(FakeIndex::default());
+        let cached = CachingIndexer::new(fake.clone());
+
+        let first = cached.search("movie", "tt1").await.unwrap();
+        let second = cached.search("movie", "tt1").await.unwrap();
+        assert_eq!(first, second);
+        assert_eq!(calls(&fake), 1);
+
+        cached.search("series", "tt1").await.unwrap();
+        cached.search("movie", "tt2").await.unwrap();
+        assert_eq!(
+            calls(&fake),
+            3,
+            "a different type or title is a different search"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_search_is_retried_rather_than_replayed() {
+        let fake = Arc::new(FakeIndex::default());
+        let cached = CachingIndexer::new(fake.clone());
+
+        fake.failing
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(cached.search("movie", "tt1").await.is_err());
+        fake.failing
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        assert!(cached.search("movie", "tt1").await.is_ok());
+        assert_eq!(calls(&fake), 2);
+    }
+
+    #[tokio::test]
+    async fn a_cached_result_expires() {
+        let fake = Arc::new(FakeIndex::default());
+        let cached = CachingIndexer::with_limits(fake.clone(), Duration::from_millis(20), 8);
+
+        cached.search("movie", "tt1").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        cached.search("movie", "tt1").await.unwrap();
+        assert_eq!(calls(&fake), 2);
+    }
+
+    #[tokio::test]
+    async fn the_cache_stays_within_its_capacity() {
+        let fake = Arc::new(FakeIndex::default());
+        let cached = CachingIndexer::with_limits(fake.clone(), Duration::from_secs(60), 2);
+
+        for id in ["tt1", "tt2", "tt3"] {
+            cached.search("movie", id).await.unwrap();
+        }
+        assert_eq!(lock(&cached.entries).len(), 2);
+        // The oldest went; the newest two are still served from memory.
+        cached.search("movie", "tt3").await.unwrap();
+        assert_eq!(calls(&fake), 3);
     }
 }

@@ -37,6 +37,9 @@ pub const UNIT: &str = "novastream.service";
 /// Filename of the autostart entry that brings the tray icon back at login.
 const AUTOSTART_FILE: &str = "novastream-tray.desktop";
 
+/// Where logind keeps its per-user linger flags.
+const LINGER_DIR: &str = "/var/lib/systemd/linger";
+
 fn home() -> Result<PathBuf> {
     std::env::var_os("HOME")
         .filter(|h| !h.is_empty())
@@ -73,9 +76,16 @@ pub fn autostart_path() -> Result<PathBuf> {
 /// a live-USB session, inside a container, or on a non-systemd distro, and the
 /// honest thing there is to grey the switch out rather than to write a unit
 /// file nothing will ever read.
+///
+/// The user manager's private socket answers that with one `stat`; only when
+/// it is missing (an unusual runtime layout) is `systemctl` asked, which costs
+/// a process and used to run on the UI thread before the first frame.
 pub fn available() -> bool {
-    if std::env::var_os("XDG_RUNTIME_DIR").is_none() {
+    let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR").filter(|d| !d.is_empty()) else {
         return false;
+    };
+    if Path::new(&runtime).join("systemd/private").exists() {
+        return true;
     }
     Command::new("systemctl")
         .args(["--user", "show", "--property=Version"])
@@ -97,9 +107,11 @@ pub fn available() -> bool {
 pub struct Status {
     /// The unit file exists in the user's systemd directory.
     pub installed: bool,
-    /// `systemctl --user is-enabled` -- starts when the user session starts.
+    /// What `systemctl --user is-enabled` would succeed for -- starts when
+    /// the user session starts.
     pub enabled: bool,
-    /// `systemctl --user is-active` -- running right now.
+    /// What `systemctl --user is-active` would succeed for -- running right
+    /// now.
     pub active: bool,
     /// Lingering is on, so the user session (and this unit) starts at boot
     /// without anyone logging in.
@@ -144,32 +156,90 @@ fn systemctl(args: &[&str]) -> Result<std::process::Output> {
         .context("could not run systemctl --user")
 }
 
-/// `systemctl` uses the exit status, not stdout, to answer is-active/is-enabled,
-/// and returns non-zero for perfectly ordinary answers ("inactive", "disabled").
-fn systemctl_ok(args: &[&str]) -> bool {
-    systemctl(args).map(|o| o.status.success()).unwrap_or(false)
+pub fn status() -> Status {
+    status_reusing_linger(None)
 }
 
-pub fn status() -> Status {
+/// [`status`], with a linger answer the caller already has.
+///
+/// Linger only changes when somebody runs `loginctl`, so a caller polling
+/// forever (the tray) re-reads it on a much slower clock than the
+/// running/stopped state it polls every few seconds.
+pub fn status_reusing_linger(linger: Option<bool>) -> Status {
     let installed = unit_path().map(|p| p.is_file()).unwrap_or(false);
     if !installed {
-        // is-active would still answer for a stale run, but reporting a
-        // service we no longer own is worse than reporting nothing.
+        // A stale run would still answer, but reporting a service we no
+        // longer own is worse than reporting nothing.
         return Status::default();
     }
+    // One process for both answers, where `is-enabled` + `is-active` was two.
+    let (enabled, active) = systemctl(&[
+        "show",
+        UNIT,
+        "--property=UnitFileState",
+        "--property=ActiveState",
+    ])
+    .map(|out| parse_unit_states(&String::from_utf8_lossy(&out.stdout)))
+    .unwrap_or((false, false));
     Status {
         installed,
-        enabled: systemctl_ok(&["is-enabled", UNIT]),
-        active: systemctl_ok(&["is-active", UNIT]),
-        linger: linger_enabled(),
+        enabled,
+        active,
+        linger: linger.unwrap_or_else(linger_enabled),
     }
 }
 
-fn linger_enabled() -> bool {
+/// `(enabled, active)` out of `systemctl show` output.
+///
+/// Read as `Key=Value` lines rather than by position or `--value`, whose
+/// output order is not a documented contract. The value sets are exactly the
+/// ones the dedicated commands exit 0 for, so this reports what `is-enabled`
+/// and `is-active` did: `is-enabled` succeeds for static, indirect, generated,
+/// transient and alias units as well as enabled ones, and `is-active` for a
+/// unit that is reloading (or, on newer systemd, refreshing).
+pub fn parse_unit_states(show: &str) -> (bool, bool) {
+    let mut enabled = false;
+    let mut active = false;
+    for line in show.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        match key.trim() {
+            "UnitFileState" => {
+                enabled = matches!(
+                    value.trim(),
+                    "enabled"
+                        | "enabled-runtime"
+                        | "static"
+                        | "indirect"
+                        | "generated"
+                        | "transient"
+                        | "alias"
+                );
+            }
+            "ActiveState" => {
+                active = matches!(value.trim(), "active" | "reloading" | "refreshing");
+            }
+            _ => {}
+        }
+    }
+    (enabled, active)
+}
+
+/// Whether lingering is on for this user.
+///
+/// logind records it as an empty file per user, so that is one `stat`. The
+/// `loginctl` query is only the fallback for a system where that directory
+/// does not exist at all -- a layout we cannot vouch for.
+pub fn linger_enabled() -> bool {
     let user = match std::env::var("USER") {
         Ok(u) if !u.is_empty() => u,
         _ => return false,
     };
+    let dir = Path::new(LINGER_DIR);
+    if dir.is_dir() {
+        return dir.join(&user).exists();
+    }
     Command::new("loginctl")
         .args(["show-user", &user, "--property=Linger", "--value"])
         .output()
@@ -662,6 +732,57 @@ mod tests {
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
         assert!(args.windows(2).any(|w| w[0] == "-u" && w[1] == UNIT));
+    }
+
+    #[test]
+    fn unit_states_are_read_by_key_not_by_position() {
+        assert_eq!(
+            parse_unit_states("UnitFileState=enabled\nActiveState=active\n"),
+            (true, true)
+        );
+        // Order is not a contract, and neither is the absence of other keys.
+        assert_eq!(
+            parse_unit_states(
+                "ActiveState=inactive\nId=novastream.service\nUnitFileState=disabled\n"
+            ),
+            (false, false)
+        );
+        assert_eq!(parse_unit_states(""), (false, false));
+    }
+
+    /// Exactly the states `is-enabled` and `is-active` exit 0 for -- the
+    /// commands this parser replaced. Drifting from them changes what the
+    /// always-on panel claims.
+    #[test]
+    fn unit_states_match_what_is_enabled_and_is_active_reported() {
+        for (state, enabled) in [
+            ("enabled", true),
+            ("enabled-runtime", true),
+            ("static", true),
+            ("indirect", true),
+            ("generated", true),
+            ("transient", true),
+            ("alias", true),
+            ("disabled", false),
+            ("masked", false),
+            ("linked", false),
+            ("bad", false),
+            ("", false),
+        ] {
+            let show = format!("UnitFileState={state}\nActiveState=inactive\n");
+            assert_eq!(parse_unit_states(&show), (enabled, false), "{state}");
+        }
+        for (state, active) in [
+            ("active", true),
+            ("reloading", true),
+            ("activating", false),
+            ("deactivating", false),
+            ("failed", false),
+            ("inactive", false),
+        ] {
+            let show = format!("UnitFileState=disabled\nActiveState={state}\n");
+            assert_eq!(parse_unit_states(&show), (false, active), "{state}");
+        }
     }
 
     #[test]

@@ -7,10 +7,12 @@
 //! with it, and "stop" is just "make this child process go away", which is
 //! easy to get right.
 
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::mpsc::{self, Receiver};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -30,6 +32,12 @@ impl LogLine {
 
     pub fn is_err(&self) -> bool {
         matches!(self, LogLine::Err(_))
+    }
+
+    pub fn into_text(self) -> String {
+        match self {
+            LogLine::Out(s) | LogLine::Err(s) => s,
+        }
     }
 }
 
@@ -52,35 +60,87 @@ pub fn find_server_binary() -> Option<PathBuf> {
         .find(|candidate| candidate.is_file())
 }
 
-/// Moves a child's stdout and stderr onto a channel, one line at a time.
+/// Lines held between a pipe and the window before new ones are dropped.
+///
+/// Larger than the journal backlog the log panel asks for, so attaching to a
+/// service never loses the startup banner that carries the addon URL.
+pub const LOG_CHANNEL_CAPACITY: usize = 4096;
+
+/// Moves a child's stdout and stderr onto a bounded channel, one line at a
+/// time.
 ///
 /// Two threads rather than one poll loop because there is no portable way to
 /// wait on both pipes at once, and a blocked read on the quiet one must not
 /// hold up the busy one.
+///
+/// **Never blocks on a full channel.** The child is usually the gateway
+/// itself: if these readers stopped reading, its stdout pipe would fill, its
+/// next `println!` would block, and the stream on somebody's phone would
+/// freeze because a log panel fell behind. So a line that does not fit is
+/// counted and dropped, and one `[N log lines dropped]` marker takes its
+/// place once there is room again.
 fn pipe_output(child: &mut Child) -> Receiver<LogLine> {
-    let (tx, rx) = mpsc::channel();
+    let (tx, rx) = mpsc::sync_channel(LOG_CHANNEL_CAPACITY);
+    let dropped = Arc::new(AtomicUsize::new(0));
 
     if let Some(stdout) = child.stdout.take() {
-        let tx = tx.clone();
-        thread::spawn(move || {
-            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-                if tx.send(LogLine::Out(line)).is_err() {
-                    break;
-                }
-            }
-        });
+        let (tx, dropped) = (tx.clone(), dropped.clone());
+        thread::spawn(move || forward_lines(stdout, LogLine::Out, &tx, &dropped));
     }
     if let Some(stderr) = child.stderr.take() {
-        thread::spawn(move || {
-            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                if tx.send(LogLine::Err(line)).is_err() {
-                    break;
-                }
-            }
-        });
+        thread::spawn(move || forward_lines(stderr, LogLine::Err, &tx, &dropped));
     }
 
     rx
+}
+
+fn dropped_marker(count: usize) -> LogLine {
+    LogLine::Out(format!("[{count} log lines dropped]"))
+}
+
+/// One pipe's reader loop. `dropped` is shared by both pipes, so the marker
+/// counts every lost line exactly once whichever reader gets to report it.
+fn forward_lines(
+    pipe: impl Read,
+    wrap: fn(String) -> LogLine,
+    tx: &SyncSender<LogLine>,
+    dropped: &AtomicUsize,
+) {
+    for line in BufReader::new(pipe).lines().map_while(Result::ok) {
+        let owed = dropped.swap(0, Ordering::Relaxed);
+        if owed > 0 {
+            match tx.try_send(dropped_marker(owed)) {
+                Ok(()) => {}
+                Err(TrySendError::Full(_)) => {
+                    // Still no room: the owed count and this line both wait
+                    // for the next chance.
+                    dropped.fetch_add(owed + 1, Ordering::Relaxed);
+                    continue;
+                }
+                Err(TrySendError::Disconnected(_)) => return,
+            }
+        }
+        match tx.try_send(wrap(line)) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {
+                dropped.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(TrySendError::Disconnected(_)) => return,
+        }
+    }
+    // The pipe is closed, so waiting can no longer stall the child: settle
+    // the count with a blocking send rather than lose the marker because no
+    // later line came along to carry it. Fails at once if the window has
+    // already let go of the receiver.
+    let owed = dropped.swap(0, Ordering::Relaxed);
+    if owed > 0 {
+        let _ = tx.send(dropped_marker(owed));
+    }
+}
+
+/// Up to `max` lines that have already arrived. Never blocks.
+fn drain_up_to(rx: &Receiver<LogLine>, max: usize) -> Vec<LogLine> {
+    rx.try_iter().take(max).collect()
 }
 
 /// A read-only follower of somebody else's output -- in practice
@@ -108,12 +168,9 @@ impl LogTail {
         Ok(Self { child, rx })
     }
 
-    pub fn drain(&mut self) -> Vec<LogLine> {
-        let mut out = Vec::new();
-        while let Ok(line) = self.rx.try_recv() {
-            out.push(line);
-        }
-        out
+    /// Up to `max` lines that have arrived since the last call. Never blocks.
+    pub fn drain(&mut self, max: usize) -> Vec<LogLine> {
+        drain_up_to(&self.rx, max)
     }
 
     /// False once the follower itself has exited (journald restarted, unit
@@ -189,16 +246,13 @@ impl ServerProcess {
         Ok(())
     }
 
-    /// Drains whatever log lines have arrived since the last call. Never blocks.
-    pub fn drain_logs(&mut self) -> Vec<LogLine> {
-        let Some(rx) = &self.log_rx else {
-            return Vec::new();
-        };
-        let mut out = Vec::new();
-        while let Ok(line) = rx.try_recv() {
-            out.push(line);
+    /// Up to `max` log lines that have arrived since the last call. Never
+    /// blocks.
+    pub fn drain_logs(&mut self, max: usize) -> Vec<LogLine> {
+        match &self.log_rx {
+            Some(rx) => drain_up_to(rx, max),
+            None => Vec::new(),
         }
-        out
     }
 
     /// Takes ownership of the child (if any) so it can be stopped on a
@@ -266,7 +320,7 @@ mod tests {
         while lines.len() < 2 && Instant::now() < deadline {
             lines.extend(
                 process
-                    .drain_logs()
+                    .drain_logs(usize::MAX)
                     .into_iter()
                     .map(|l| l.text().to_string()),
             );
@@ -320,7 +374,11 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(2);
         let mut seen = Vec::new();
         while seen.is_empty() && Instant::now() < deadline {
-            seen.extend(tail.drain().into_iter().map(|l| l.text().to_string()));
+            seen.extend(
+                tail.drain(usize::MAX)
+                    .into_iter()
+                    .map(|l| l.text().to_string()),
+            );
             thread::sleep(Duration::from_millis(20));
         }
         assert_eq!(seen.first().map(String::as_str), Some("hello"));
@@ -334,6 +392,67 @@ mod tests {
                     .unwrap_or(true),
             "the follower outlived the LogTail that owned it"
         );
+    }
+
+    /// A burst far past the channel's capacity, from a child that is never
+    /// drained while it prints. The child must finish on its own -- a reader
+    /// that blocked would leave it stuck in `write` forever, which for the
+    /// real server is a frozen stream -- and every line must be accounted
+    /// for, either delivered or counted in the marker.
+    #[test]
+    fn a_burst_the_panel_cannot_keep_up_with_is_dropped_not_back_pressured() {
+        const LINES: usize = 10_000;
+        let mut cmd = Command::new("sh");
+        cmd.args([
+            "-c",
+            // Long lines, so the kernel's pipe buffer holds only a few
+            // hundred of them: whether the burst overflows then depends on
+            // the channel, not on how fast this machine's reader thread is.
+            &format!(
+                "pad=$(printf '%0100d' 0); i=0; \
+                 while [ $i -lt {LINES} ]; do echo \"line $i $pad\"; i=$((i+1)); done"
+            ),
+        ]);
+        let mut tail = LogTail::spawn(cmd).expect("spawns");
+
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while tail.is_running() {
+            assert!(
+                Instant::now() < deadline,
+                "the child blocked on a full pipe: the reader applied back-pressure"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        let mut delivered = 0;
+        let mut dropped = 0;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while delivered + dropped < LINES && Instant::now() < deadline {
+            for line in tail.drain(1000) {
+                match line
+                    .text()
+                    .strip_prefix('[')
+                    .and_then(|t| t.strip_suffix(" log lines dropped]"))
+                {
+                    Some(count) => dropped += count.parse::<usize>().expect("a count"),
+                    None => delivered += 1,
+                }
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        assert!(dropped > 0, "10 000 undrained lines cannot all fit");
+        assert_eq!(delivered + dropped, LINES, "a line went missing uncounted");
+    }
+
+    #[test]
+    fn a_drain_is_capped() {
+        let (tx, rx) = mpsc::sync_channel(16);
+        for i in 0..10 {
+            tx.send(LogLine::Out(i.to_string())).unwrap();
+        }
+        assert_eq!(drain_up_to(&rx, 4).len(), 4);
+        assert_eq!(drain_up_to(&rx, 100).len(), 6);
     }
 
     #[test]

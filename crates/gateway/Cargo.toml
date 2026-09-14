@@ -17,7 +17,7 @@ name = "streaming-gateway"
 path = "src/main.rs"
 
 [dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "fs", "io-util", "time", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "fs", "io-util", "time", "sync", "net"] }
 axum = { version = "0.8", features = ["json", "query"] }
 tower-http = { version = "0.6", features = ["cors", "trace", "limit", "timeout"] }
 # default-tls pulls in OpenSSL (via librqbit-core's sha1-crypto-hash feature,
@@ -31,9 +31,11 @@ serde_json = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
-local-ip-address = "0.6"
 clap = { version = "4", features = ["derive", "env"] }
-sysinfo = "0.33"
+# Only the process table is read (the gateway's own RAM and CPU for /health).
+# The default features add disk, network, component and user probing plus a
+# rayon thread pool, none of which is ever called.
+sysinfo = { version = "0.33", default-features = false, features = ["system"] }
 tokio-util = { version = "0.7", features = ["io"] }
 # Lets the video response body be written as ordinary async code. The body has
 # to recover from a stalled torrent read mid-stream (re-opening the underlying
@@ -64,7 +66,11 @@ socket2 = { version = "0.6", features = ["all"] }
 # so naming it directly adds no new compilation and no new TLS surface.
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 
+# No separate `tokio` entry here on purpose. Asking for extra tokio features
+# only in tests gives tokio a different feature set under `cargo test` than
+# under `cargo build`, which rebuilds tokio and everything above it (librqbit,
+# hyper, axum, reqwest) a second time. The normal dependency already carries
+# everything the tests use.
 [dev-dependencies]
-tokio = { version = "1", features = ["full", "test-util"] }
 tower = { version = "0.5", features = ["util"] }
 tempfile = "3"

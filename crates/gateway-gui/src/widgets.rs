@@ -229,7 +229,7 @@ pub fn traffic_graph(ui: &mut Ui, height: f32, traces: &[Trace<'_>], unit: &str)
             egui::pos2(x + 11.0, rect.top() + 2.0),
             egui::Align2::LEFT_TOP,
             trace.label,
-            FontId::monospace(10.0),
+            FontId::monospace(theme::SIZE_CAPTION),
             trace.color,
         );
         x = drawn.right() + 12.0;
@@ -238,7 +238,7 @@ pub fn traffic_graph(ui: &mut Ui, height: f32, traces: &[Trace<'_>], unit: &str)
         egui::pos2(rect.right() - 6.0, rect.top() + 2.0),
         egui::Align2::RIGHT_TOP,
         format!("peak {peak:.2} {unit}"),
-        FontId::monospace(10.0),
+        FontId::monospace(theme::SIZE_CAPTION),
         TEXT_DIM,
     );
 
@@ -260,7 +260,7 @@ pub fn meter(ui: &mut Ui, label: &str, fraction: f32, value: &str, color: Color3
 
     let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 14.0), Sense::hover());
     let painter = ui.painter();
-    let font = FontId::monospace(11.0);
+    let font = FontId::monospace(theme::SIZE_BODY);
 
     painter.text(
         egui::pos2(rect.left(), rect.center().y),
@@ -395,7 +395,7 @@ pub fn command_button(
 
 /// A small ghost button (`[copy]`, `[cancel]`) that keeps the bracket idiom.
 pub fn ghost_button(ui: &mut Ui, label: &str, color: Color32) -> Response {
-    let font = FontId::monospace(10.0);
+    let font = FontId::monospace(theme::SIZE_CAPTION);
     let text = format!("[{label}]");
     let galley = ui.painter().layout_no_wrap(text, font, color);
     let (rect, response) =
@@ -438,13 +438,11 @@ pub fn status_lamp(ui: &mut Ui, label: &str, color: Color32, pulse: bool) {
         egui::pos2(rect.left() + 17.0, rect.center().y),
         egui::Align2::LEFT_CENTER,
         label,
-        FontId::monospace(12.0),
+        FontId::monospace(theme::SIZE_SUBREADOUT),
         color,
     );
 }
 
-/// One torrent in the swarm panel: name, animated progress bar, and the live
-/// numbers underneath.
 /// What the buttons on one swarm row can ask for.
 ///
 /// `Delete` is armed in two steps by the caller rather than here, because the
@@ -457,6 +455,19 @@ pub enum RowAction {
     Delete,
 }
 
+/// One torrent in the swarm panel, as the row draws it.
+pub struct SwarmRow<'a> {
+    pub name: &'a str,
+    /// librqbit's state word, which picks the bar colour.
+    pub state: &'a str,
+    /// What the row prints for the state: the word in capitals, or `HELD`.
+    pub state_label: &'a str,
+    pub held: bool,
+    pub progress: f32,
+    pub stats: &'a str,
+    pub delete_armed: bool,
+}
+
 /// One torrent: name, state, progress bar, stats, and its own controls.
 ///
 /// `held` is the operator's own pause, which is not the same question as
@@ -464,16 +475,8 @@ pub enum RowAction {
 /// and offering Resume for one of those would promise something the queue
 /// immediately undoes. So a queue-parked row offers Pause (make it stay
 /// parked) and a hand-paused one offers Resume.
-pub fn swarm_row(
-    ui: &mut Ui,
-    name: &str,
-    state: &str,
-    held: bool,
-    progress: f32,
-    stats: &str,
-    delete_armed: bool,
-) -> Option<RowAction> {
-    let font = FontId::monospace(11.0);
+pub fn swarm_row(ui: &mut Ui, row: &SwarmRow<'_>) -> Option<RowAction> {
+    let font = FontId::monospace(theme::SIZE_BODY);
     let width = ui.available_width();
     let char_width = ui.fonts(|f| f.glyph_width(&font, 'M')).max(1.0);
     let mut action = None;
@@ -487,70 +490,69 @@ pub fn swarm_row(
         // The reserve grew with the buttons: the state word plus three
         // controls, or the name runs under them.
         let room = ((width - 210.0) / char_width).floor().max(8.0) as usize;
-        let shown = if name.chars().count() > room {
-            let head: String = name.chars().take(room.saturating_sub(1)).collect();
-            format!("{head}~")
-        } else {
-            name.to_string()
+        let shown = match row.name.char_indices().nth(room) {
+            Some(_) => {
+                let head: String = row.name.chars().take(room.saturating_sub(1)).collect();
+                format!("{head}~")
+            }
+            None => row.name.to_string(),
         };
-        ui.label(egui::RichText::new(shown).font(font.clone()).color(TEXT));
+        ui.label(theme::body(shown, TEXT));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             // Right-to-left, so these read delete, pause/resume, STATE from
             // the right edge inward.
-            if delete_armed {
+            if row.delete_armed {
                 if ghost_button(ui, "confirm delete", RED).clicked() {
                     action = Some(RowAction::Delete);
                 }
             } else if ghost_button(ui, "delete", TEXT_DIM).clicked() {
                 action = Some(RowAction::Delete);
             }
-            if held {
+            if row.held {
                 if ghost_button(ui, "resume", PHOSPHOR).clicked() {
                     action = Some(RowAction::Resume);
                 }
             } else if ghost_button(ui, "pause", TEXT_DIM).clicked() {
                 action = Some(RowAction::Pause);
             }
-            ui.label(
-                egui::RichText::new(if held {
-                    "HELD".to_string()
+            ui.label(theme::caption(
+                row.state_label,
+                if row.held {
+                    AMBER
                 } else {
-                    state.to_uppercase()
-                })
-                .font(FontId::monospace(10.0))
-                .color(if held { AMBER } else { state_color(state) }),
-            );
+                    state_color(row.state)
+                },
+            ));
         });
     });
 
-    let id = egui::Id::new(("swarm", name));
+    let id = egui::Id::new(("swarm", row.name));
     let shown = ui
         .ctx()
-        .animate_value_with_time(id, progress.clamp(0.0, 1.0), 0.5);
+        .animate_value_with_time(id, row.progress.clamp(0.0, 1.0), 0.5);
     let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 9.0), Sense::hover());
-    segmented_bar(ui.painter(), rect, shown, state_color(state));
+    segmented_bar(ui.painter(), rect, shown, state_color(row.state));
 
-    ui.label(
-        egui::RichText::new(stats)
-            .font(FontId::monospace(10.0))
-            .color(TEXT_DIM),
-    );
-    if delete_armed {
-        ui.label(
-            egui::RichText::new("!! deletes this title's downloaded data")
-                .font(FontId::monospace(10.0))
-                .color(RED),
-        );
+    ui.label(theme::caption(row.stats, TEXT_DIM));
+    if row.delete_armed {
+        ui.label(theme::caption(
+            "!! deletes this title's downloaded data",
+            RED,
+        ));
     }
     action
 }
 
 fn state_color(state: &str) -> Color32 {
-    match state.to_ascii_lowercase().as_str() {
-        "live" | "seeding" => PHOSPHOR,
-        "initializing" | "paused" => AMBER,
-        "error" => RED,
-        _ => TEXT,
+    let is = |word: &str| state.eq_ignore_ascii_case(word);
+    if is("live") || is("seeding") {
+        PHOSPHOR
+    } else if is("initializing") || is("paused") {
+        AMBER
+    } else if is("error") {
+        RED
+    } else {
+        TEXT
     }
 }
 
@@ -558,7 +560,8 @@ fn state_color(state: &str) -> Color32 {
 ///
 /// Keyed on what the line *is*, not on where it came from: the gateway logs
 /// through `tracing` on stdout and a panic arrives on stderr, so severity has
-/// to be read out of the text either way.
+/// to be read out of the text either way. Called once when a line arrives,
+/// not per frame -- the panel stores the answer next to the text.
 pub fn log_color(line: &str) -> Color32 {
     let lower = line.to_ascii_lowercase();
     if lower.contains("[stderr]")
@@ -618,5 +621,8 @@ mod tests {
         assert_eq!(state_color("live"), PHOSPHOR);
         assert_eq!(state_color("initializing"), AMBER);
         assert_eq!(state_color("error"), RED);
+        // The server's casing is not a contract.
+        assert_eq!(state_color("Paused"), AMBER);
+        assert_eq!(state_color("something new"), TEXT);
     }
 }

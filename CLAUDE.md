@@ -18,6 +18,7 @@ down there.
 ## Commands
 ```
 Build (release, both crates):  cargo build --release
+Build (fast iteration):        cargo build --profile release-fast   # thin LTO, 16 codegen units, lands in target/release-fast/
 Test:                          cargo test --release       # integration tests, real router+engine, temp dir — never touches a live swarm
 Lint:                          cargo clippy --release --all-targets -- -D warnings
 Package .deb:                  cargo deb -p streaming-gateway-gui
@@ -61,8 +62,11 @@ Why this works, and the traps:
 - The release profile is `lto = true` + `codegen-units = 1`, so each of the
   three binaries takes 1.5–2 minutes to *link*, single-threaded, with the
   progress bar apparently frozen at the last crate. That is normal, not a
-  hang. For a throwaway iteration build only:
-  `cargo build --release --config profile.release.lto=false --config profile.release.codegen-units=16`.
+  hang. For a throwaway iteration build only, use
+  `cargo build --profile release-fast` (thin LTO across 16 codegen units,
+  output in `target/release-fast/` so it never overwrites a real release).
+  `setup.sh` installs from `target/release/` only, so a release-fast build is
+  never what gets installed.
 No CI config in this repo — these commands are the only source of truth for
 build/test/lint. Run build+test+clippy before calling any change done.
 
@@ -104,15 +108,19 @@ build/test/lint. Run build+test+clippy before calling any change done.
   own `./cache/` sits stale/empty. Don't assume repo-local `cache/` reflects
   what a running installed instance is actually using — check `/health` or
   the GUI's own "Cache directory" line for the real path.
-- **Port defaults: 8080 primary, 11470 fallback**, pinned in both
-  `crates/gateway/src/config/mod.rs` and hardcoded in `gateway-gui/src/main.rs`
-  — a test pins both. If you change one you must change the other or the GUI
-  binds a port the server doesn't advertise.
+- **Port defaults: 8080 primary, 11470 fallback**, set in
+  `crates/gateway/src/config/mod.rs`. The GUI's `DEFAULT_PORT` in
+  `gateway-gui/src/app/mod.rs` must match the primary, and
+  `app::tests::the_default_port_is_the_one_the_server_uses` reads the server's
+  config source as text to pin it (it looks for the `#[arg(` line with
+  `env = "GATEWAY_PORT"`). The GUI never hardcodes the fallback: it scrapes
+  whatever address the server printed. Change the primary in one place without
+  the other and the GUI polls a port the server doesn't bind.
 - **The GUI draws ASCII text only; everything else is painted.** Bars, frames,
   the wordmark and the status lamp are `egui::Painter` rectangles, not block or
   box-drawing glyphs — eframe's bundled font only guarantees ASCII coverage, so
   a `█` progress bar renders as tofu boxes on someone else's machine. Tests in
-  `gateway-gui/src/{fx,widgets}.rs` pin this. Layer order also matters and is
+  `gateway-gui/src/{fx,widgets,app/ui}.rs` pin this. Layer order also matters and is
   easy to break: rain in the background layer (painted before any panel, which
   is why panel frames are transparent and `clear_color` supplies the black),
   widgets in the panel layer, CRT overlay in the foreground, boot cover above
@@ -121,7 +129,7 @@ build/test/lint. Run build+test+clippy before calling any change done.
   (`librqbit`, `reqwest`, `axum-server`, `rustls`) is pinned to rust-tls/rustls
   features specifically so `cargo build` needs no system `pkg-config`/
   `libssl-dev`. Don't add a dependency that pulls in `default-tls`/OpenSSL.
-- **`torrent/mod.rs` "focused" torrent logic is intentionally narrow**:
+- **`torrent/queue.rs` "focused" torrent logic is intentionally narrow**:
   switching titles discards only the torrent you just left (if it has no open
   stream and isn't finished) — never the whole unfinished backlog. An earlier
   version swept everything on every switch and wiped queued titles; see the
@@ -170,11 +178,18 @@ build/test/lint. Run build+test+clippy before calling any change done.
   undo — offering it for a queue-parked torrent promises something the queue
   immediately reverses.
 - **Always-on has no off switch in the window, by design.** `ensure_always_on`
-  installs the unit and the login tray icon once per session; the off switch is
-  the tray's "Exit NovaStream", and `--disable-always-on` remains the headless
-  escape hatch. Re-adding a disable button in `service_panel` puts back the
-  failure mode where the addon silently stops answering the phone because
-  someone toggled it.
+  acts once per session; the off switch is the tray's "Exit NovaStream", and
+  `--disable-always-on` remains the headless escape hatch. Re-adding a disable
+  button in `service_panel` puts back the failure mode where the addon silently
+  stops answering the phone because someone toggled it.
+- **Only a missing unit is a reason to install.** `service::install` ends in
+  `systemctl restart`, so it must never be the answer to a merely missing
+  login tray entry — that restarted a gateway that could be mid-stream. The
+  decision is the pure `app::always_on_step` (table-tested): no unit → install;
+  unit but no autostart file → rewrite only the file (and start the unit if it
+  is stopped); stopped unit → start; otherwise nothing. Service actions go
+  through a `Job` whose `start` refuses visibly when one is already in flight —
+  never re-add a path that silently drops an action.
 - The GUI has no persistent log file — logs only exist in the GUI's in-memory
   Log panel and the server's stdout (piped, not written to disk). Use
   `GET /health` on the running port for a live sanity check instead of
@@ -193,7 +208,16 @@ build/test/lint. Run build+test+clippy before calling any change done.
   `service.installed` (the systemd user unit exists) means start/stop go
   through `systemctl --user` and logs come from the journal; otherwise the
   server is this window's child as before. Anything that reads `self.running`
-  must go through that split or it reports on the wrong process.
+  must go through that split or it reports on the wrong process. Which owner
+  it is only becomes known when the first-frame probe lands (`service_known`
+  — `systemctl` and the PATH walk run off the UI thread); nothing that starts,
+  stops or installs may act before then.
+- **The log pipe must never back-pressure the gateway.**
+  `server_process::pipe_output` reads the child's stdout/stderr into a bounded
+  channel with `try_send`, dropping and counting lines when it is full. A
+  blocking `send` there looks harmless and freezes streaming: the pipe fills,
+  the server's next `println!` blocks, and so does whatever was serving a
+  phone.
 - The service's `EnvironmentFile` (`~/.config/novastream/server.env`) is also
   what a freshly opened window reads its port and cache directory from — a
   service moved off 8080 is otherwise invisible to the health poll.

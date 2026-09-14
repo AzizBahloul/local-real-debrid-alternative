@@ -8,10 +8,13 @@
 //! for the same reason: one more crate for jitter is not worth it.
 //!
 //! Everything here is decoration and must stay cheap: the window sits open for
-//! hours while a stream runs, so the whole overlay is O(screen height / 3) line
-//! segments and the rain is a few hundred cached single-character galleys.
+//! hours while a stream runs, so the whole overlay is one mesh rebuilt only
+//! when the window changes size, and the rain is a few hundred copies of a
+//! few dozen single-character galleys.
 
-use egui::{Color32, FontId, Pos2, Rect, Rounding, Stroke, Vec2};
+use std::sync::Arc;
+
+use egui::{Color32, FontId, Galley, Pos2, Rect, Rounding, Vec2};
 
 use crate::theme::{self, CELL};
 
@@ -66,7 +69,8 @@ struct RainColumn {
     head: f32,
     /// Points per second.
     speed: f32,
-    /// Per-column glyph ring, re-rolled as it falls so the trail shimmers.
+    /// Per-column glyph ring, as indexes into [`RAIN_GLYPHS`], re-rolled as
+    /// it falls so the trail shimmers.
     glyphs: [u8; RAIN_TRAIL],
     /// Overall brightness of this column; most stay faint, a few burn.
     intensity: f32,
@@ -101,9 +105,9 @@ impl MatrixRain {
             let head = self.rng.range(-size.y, size.y);
             let speed = self.rng.range(28.0, 96.0);
             let intensity = self.rng.range(0.25, 1.0);
-            let mut glyphs = [b' '; RAIN_TRAIL];
+            let mut glyphs = [0; RAIN_TRAIL];
             for slot in glyphs.iter_mut() {
-                *slot = RAIN_GLYPHS[self.rng.below(RAIN_GLYPHS.len())];
+                *slot = self.rng.below(RAIN_GLYPHS.len()) as u8;
             }
             self.columns.push(RainColumn {
                 head,
@@ -132,7 +136,7 @@ impl MatrixRain {
             self.shimmer = 0.0;
         }
 
-        let font = FontId::monospace(12.0);
+        let glyphs = rain_galleys(painter);
         let row = CELL * 4.0;
         // Rolled outside the loop so the borrow of `self.rng` never overlaps
         // the mutable walk over `self.columns`.
@@ -149,7 +153,7 @@ impl MatrixRain {
             }
             if reroll {
                 jitter = (jitter + 1) % RAIN_TRAIL;
-                column.glyphs[jitter] = RAIN_GLYPHS[rolls[index % rolls.len()]];
+                column.glyphs[jitter] = rolls[index % rolls.len()] as u8;
             }
 
             let x = rect.left() + index as f32 * RAIN_COLUMN_SPACING + 3.0;
@@ -175,16 +179,40 @@ impl MatrixRain {
                         alpha,
                     )
                 };
-                painter.text(
+                painter.galley(
                     egui::pos2(x, y),
-                    egui::Align2::LEFT_TOP,
-                    (column.glyphs[step] as char).to_string(),
-                    font.clone(),
+                    glyphs[column.glyphs[step] as usize].clone(),
                     color,
                 );
             }
         }
     }
+}
+
+/// Every rain glyph, laid out uncoloured.
+///
+/// `painter.text` with the rain's colour -- which changes with every glyph's
+/// fade and every frame's flicker -- missed egui's layout cache, whose key
+/// includes the colour, a few hundred times a frame, and allocated a `String`
+/// per glyph on top. Laid out with [`Color32::PLACEHOLDER`] instead, the text
+/// is the same every frame and so is the cache key: each glyph is shaped once
+/// and then only looked up, and the colour is supplied at paint time.
+///
+/// Fetched through egui's cache each frame rather than kept here, because
+/// egui rebuilds its font atlas when the scale changes or the atlas fills,
+/// and a galley held across that would draw with stale texture coordinates.
+fn rain_galleys(painter: &egui::Painter) -> Vec<Arc<Galley>> {
+    let font = FontId::monospace(12.0);
+    RAIN_GLYPHS
+        .iter()
+        .map(|&glyph| {
+            painter.layout_no_wrap(
+                (glyph as char).to_string(),
+                font.clone(),
+                Color32::PLACEHOLDER,
+            )
+        })
+        .collect()
 }
 
 /// Scanlines + vignette, painted over the finished frame.
@@ -200,35 +228,63 @@ impl MatrixRain {
 /// glitch crawling over the text rather than as period detail -- and it did it
 /// over the log panel, where the text is the thing you are trying to read.
 /// Scanlines and vignette carry the look on their own without moving.
-pub fn crt_overlay(ctx: &egui::Context, rect: Rect) {
-    let painter = ctx.layer_painter(egui::LayerId::new(
-        egui::Order::Foreground,
-        egui::Id::new("crt_overlay"),
-    ));
+///
+/// Both are static for a given window size, so they are built once into a
+/// single mesh and only rebuilt on resize, instead of a few hundred line
+/// shapes being pushed and tessellated every frame.
+#[derive(Default)]
+pub struct CrtOverlay {
+    mesh: egui::Mesh,
+    built_for: Option<Rect>,
+}
+
+impl CrtOverlay {
+    pub fn paint(&mut self, ctx: &egui::Context, rect: Rect) {
+        if self.built_for != Some(rect) {
+            self.mesh = crt_mesh(rect);
+            self.built_for = Some(rect);
+        }
+        let painter = ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new("crt_overlay"),
+        ));
+        painter.add(egui::Shape::mesh(self.mesh.clone()));
+    }
+}
+
+fn crt_mesh(rect: Rect) -> egui::Mesh {
+    let mut mesh = egui::Mesh::default();
 
     // Scanlines. One dark line every `CELL` points; the gaps are the "lit"
     // rows. Alpha is low enough to read as texture rather than as blinds.
-    let line = Stroke::new(1.0, Color32::from_rgba_unmultiplied(0, 0, 0, 46));
+    let line = Color32::from_rgba_unmultiplied(0, 0, 0, 46);
     let mut y = rect.top();
     while y < rect.bottom() {
-        painter.line_segment(
-            [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
+        // A 1pt band on the point grid. A stroked segment was anti-aliased
+        // into its neighbours; a plain quad is not, which reads the same at
+        // this alpha and costs no feathering.
+        mesh.add_colored_rect(
+            Rect::from_min_max(
+                egui::pos2(rect.left(), y),
+                egui::pos2(rect.right(), y + 1.0),
+            ),
             line,
         );
         y += CELL;
     }
 
-    vignette(&painter, rect);
+    vignette(&mut mesh, rect);
+    mesh
 }
 
 /// Darkened edges, built as a gradient mesh rather than stacked rectangles so
-/// there is no visible banding on a large window.
-fn vignette(painter: &egui::Painter, rect: Rect) {
+/// there is no visible banding on a large window. Appended after the
+/// scanlines, so it draws over them.
+fn vignette(mesh: &mut egui::Mesh, rect: Rect) {
     let depth = (rect.width().min(rect.height()) * 0.22).clamp(24.0, 110.0);
     let edge = Color32::from_rgba_unmultiplied(0, 0, 0, 120);
     let clear = Color32::TRANSPARENT;
 
-    let mut mesh = egui::Mesh::default();
     let mut band = |outer: [Pos2; 2], inner: [Pos2; 2]| {
         let base = mesh.vertices.len() as u32;
         mesh.colored_vertex(outer[0], edge);
@@ -267,8 +323,6 @@ fn vignette(painter: &egui::Painter, rect: Rect) {
             rect.right_bottom() - Vec2::new(depth, 0.0),
         ],
     );
-
-    painter.add(egui::Shape::mesh(mesh));
 }
 
 /// Mains hum: a sub-percent brightness wobble on two incommensurable
@@ -522,6 +576,19 @@ mod tests {
     #[test]
     fn rain_glyphs_are_ascii() {
         assert!(RAIN_GLYPHS.iter().all(|b| b.is_ascii_graphic()));
+        // Columns store indexes into the table, in a byte.
+        assert!(RAIN_GLYPHS.len() <= u8::MAX as usize);
+    }
+
+    /// The overlay is one mesh for a given size: scanlines every `CELL`
+    /// points, then the four vignette bands on top of them.
+    #[test]
+    fn the_crt_overlay_is_one_mesh_per_window_size() {
+        let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(600.0, 30.0));
+        let mesh = crt_mesh(rect);
+        let scanlines = (30.0 / CELL).ceil() as usize;
+        assert_eq!(mesh.vertices.len(), (scanlines + 4) * 4);
+        assert!(mesh.is_valid());
     }
 
     /// Same rule for the boot log, which is the first thing ever drawn.

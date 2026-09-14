@@ -9,6 +9,7 @@ pub mod streaming;
 pub mod stremio;
 pub mod tls;
 pub mod torrent;
+pub mod util;
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -44,7 +45,7 @@ pub struct AppState {
     pub stream_base_url: String,
     /// Torrent discovery. `None` when `--disable-indexer` is set, in which
     /// case the addon only answers for ids that already carry a magnet.
-    pub indexer: Option<Arc<indexer::TorrentioIndexer>>,
+    pub indexer: Option<Arc<dyn indexer::StreamIndexer>>,
     /// This gateway's own https hostname, when it serves one (e.g.
     /// `192-168-1-67.local-ip.sh`).
     ///
@@ -65,6 +66,14 @@ impl FromRef<AppState> for Arc<TorrentEngine> {
         Arc::clone(&state.engine)
     }
 }
+
+/// How long a request may take to produce its response headers.
+///
+/// Bounds time-to-first-byte (metadata resolution, opening a file stream), not
+/// total playback duration: a streaming response body is handed back to the
+/// client as soon as headers are ready, so a long watch session is never cut
+/// off by this. The torrent engine's cold-start budget is measured against it.
+pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// The liveness endpoint, named because `audit_requests` has to recognise it.
 const HEALTH_PATH: &str = "/health";
@@ -108,13 +117,10 @@ pub fn build_router(state: AppState) -> Router {
         // this is defense in depth against an oversized request body, not a
         // limit anything legitimate should ever hit.
         .layer(RequestBodyLimitLayer::new(16 * 1024))
-        // Bounds time-to-first-byte (metadata resolution, opening a file
-        // stream), not total playback duration: a streaming response body is
-        // handed back to the client as soon as headers are ready, so a long
-        // watch session is never cut off by this.
+        // See `REQUEST_TIMEOUT`.
         .layer(TimeoutLayer::with_status_code(
             axum::http::StatusCode::GATEWAY_TIMEOUT,
-            Duration::from_secs(60),
+            REQUEST_TIMEOUT,
         ))
         .with_state(state)
 }
@@ -132,12 +138,25 @@ async fn audit_requests(
     request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
-    let path = request.uri().path().to_string();
-    let range = request
-        .headers()
-        .get(axum::http::header::RANGE)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_string);
+    // Nothing to record at all when logging is off -- which is every test,
+    // and a gateway started with no writable log directory.
+    if !state.audit.is_enabled() {
+        return next.run(request).await;
+    }
+
+    let is_health_poll = request.uri().path() == HEALTH_PATH;
+    // Copied out before the request is handed on, because the handler takes
+    // it -- but not for a health poll, which is almost never recorded.
+    let details = (!is_health_poll).then(|| {
+        (
+            request.uri().path().to_string(),
+            request
+                .headers()
+                .get(axum::http::header::RANGE)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string),
+        )
+    });
 
     let started = std::time::Instant::now();
     let response = next.run(request).await;
@@ -149,17 +168,17 @@ async fn audit_requests(
     // kept meant the log evicted a real investigation inside two days and made
     // the rest of it something you had to grep past. A *failing* poll still
     // records: that one is a fact about the server.
-    let is_routine_health_poll = path == HEALTH_PATH && status.is_success();
-
-    if !is_routine_health_poll {
-        state.audit.record(audit::Event::Request {
-            client: addr.ip().to_string(),
-            path,
-            status: status.as_u16(),
-            latency_ms: started.elapsed().as_millis() as u64,
-            range,
-        });
+    if is_health_poll && status.is_success() {
+        return response;
     }
+    let (path, range) = details.unwrap_or_else(|| (HEALTH_PATH.to_string(), None));
+    state.audit.record(audit::Event::Request {
+        client: addr.ip().to_string(),
+        path,
+        status: status.as_u16(),
+        latency_ms: started.elapsed().as_millis() as u64,
+        range,
+    });
     response
 }
 
@@ -195,24 +214,30 @@ pub async fn bind_with_fallback(
 
 pub async fn run() -> anyhow::Result<()> {
     let config = AppConfig::load();
-
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::new(config.log_level.clone()))
-        .init();
-
-    // Opened before anything that can fail, so a startup failure is itself
-    // recorded rather than being the one class of problem the log misses.
-    let log_dir = config.resolved_log_dir();
-    let audit = audit::AuditLog::open(&log_dir);
-    audit::install_panic_hook(audit.clone());
-    match audit.path() {
-        Some(path) => info!(path = %path.display(), "audit log"),
-        None => warn!("audit log is disabled; no session record will be kept"),
-    }
+    init_tracing(&config);
+    let audit = open_audit_log(&config);
 
     if let Err(e) = librqbit::try_increase_nofile_limit() {
         warn!("could not raise open-file limit (streaming many torrents may hit OS limits): {e:#}");
     }
+
+    // Bound before the engine starts. Restoring a session can take a while,
+    // and a port conflict found only afterwards wasted all of it -- after
+    // having taken the peer port and started announcing, too. Connections
+    // that arrive in the meantime wait in the backlog rather than being
+    // refused.
+    let lan_ip = network::detect_lan_ip();
+    let (listener, bound_port) = bind_with_fallback(&config).await.inspect_err(|e| {
+        audit.record(audit::Event::Problem {
+            context: "binding the http port".to_string(),
+            message: format!("{e:#}"),
+        });
+    })?;
+    // Applied to the listener, and thereby to every connection accepted on it,
+    // so a viewer who walks away stops holding a torrent open. See
+    // `network::harden_listener`.
+    let client_timeout = Duration::from_secs(config.client_timeout_secs);
+    network::harden_listener(&listener, client_timeout);
 
     info!("starting torrent engine...");
     let engine = TorrentEngine::new(&config).await.inspect_err(|e| {
@@ -230,6 +255,87 @@ pub async fn run() -> anyhow::Result<()> {
         config.auto_cleanup,
         Arc::clone(&engine),
     );
+    spawn_maintenance(&config, &engine, &cache);
+
+    let stream_base_url = config
+        .public_stream_url
+        .clone()
+        .map(|url| url.trim_end_matches('/').to_string())
+        .unwrap_or_else(|| format!("http://{lan_ip}:{bound_port}"));
+
+    // Known before the certificate is: it is derived purely from the LAN
+    // address, and the stream handler needs it to recognise its own https
+    // origin as a local one.
+    let tls_host =
+        (!config.disable_https).then(|| tls::hostname_for(lan_ip, &config.tls_host_suffix));
+
+    audit.record(audit::Event::ServerStart {
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        http_port: bound_port,
+        https_port: (!config.disable_https).then_some(config.https_port),
+        cache_dir: config
+            .cache_dir
+            .canonicalize()
+            .unwrap_or_else(|_| config.cache_dir.clone())
+            .display()
+            .to_string(),
+    });
+
+    let state = AppState {
+        engine: Arc::clone(&engine),
+        cache,
+        stream_base_url,
+        indexer: build_indexer(&config),
+        tls_host,
+        audit: audit.clone(),
+    };
+
+    monitoring::spawn_terminal_monitor(
+        state.clone(),
+        Duration::from_secs(config.monitor_interval_secs),
+    );
+
+    let app = build_router(state);
+
+    // The banner prints *before* the https setup: fetching the certificate
+    // can take up to 15 seconds against a slow provider, and holding the
+    // whole gateway (and the http address everyone copies) hostage to it
+    // made every cold start feel broken. The https task announces the addon
+    // URL itself the moment it is actually servable.
+    if config.disable_https {
+        network::print_banner(lan_ip, bound_port, network::AddonStatus::Disabled);
+    } else {
+        network::print_banner(lan_ip, bound_port, network::AddonStatus::Preparing);
+        spawn_https(&config, lan_ip, client_timeout, app.clone());
+    }
+    info!(%lan_ip, port = bound_port, "streaming gateway listening");
+
+    spawn_ip_change_watchdog(lan_ip, engine);
+
+    serve_until_shutdown(listener, app, &audit).await
+}
+
+fn init_tracing(config: &AppConfig) {
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::new(config.log_level.clone()))
+        .init();
+}
+
+/// Opened before anything that can fail, so a startup failure is itself
+/// recorded rather than being the one class of problem the log misses.
+fn open_audit_log(config: &AppConfig) -> audit::AuditLog {
+    let audit = audit::AuditLog::open(&config.resolved_log_dir());
+    audit::install_panic_hook(audit.clone());
+    match audit.path() {
+        Some(path) => info!(path = %path.display(), "audit log"),
+        None => warn!("audit log is disabled; no session record will be kept"),
+    }
+    audit
+}
+
+/// The timers that keep the session in shape: the cache janitor, the download
+/// queue, and (unless turned off) the idle reaper.
+fn spawn_maintenance(config: &AppConfig, engine: &Arc<TorrentEngine>, cache: &Arc<CacheManager>) {
     cache.spawn_janitor(Duration::from_secs(config.cleanup_interval_secs));
 
     // Unconditional, unlike the idle reaper below: this is what hands a
@@ -251,133 +357,87 @@ pub async fn run() -> anyhow::Result<()> {
             "idle torrents will be paused so bandwidth goes to what is being watched"
         );
     }
+}
 
-    let lan_ip = network::detect_lan_ip();
-    let (listener, bound_port) = bind_with_fallback(&config).await?;
-    // Applied to the listener, and thereby to every connection accepted on it,
-    // so a viewer who walks away stops holding a torrent open. See
-    // `network::harden_listener`.
-    let client_timeout = Duration::from_secs(config.client_timeout_secs);
-    network::harden_listener(&listener, client_timeout);
-    let stream_base_url = config
-        .public_stream_url
-        .clone()
-        .map(|url| url.trim_end_matches('/').to_string())
-        .unwrap_or_else(|| format!("http://{lan_ip}:{bound_port}"));
-
-    let indexer = if config.disable_indexer {
+/// Torrent discovery, or `None` when it is disabled or cannot be set up.
+///
+/// Wrapped in `CachingIndexer`, so browsing back and forth over the same
+/// titles does not ask the public index again each time.
+fn build_indexer(config: &AppConfig) -> Option<Arc<dyn indexer::StreamIndexer>> {
+    if config.disable_indexer {
         info!("torrent discovery disabled; addon will only answer magnet ids");
-        None
-    } else {
-        match indexer::TorrentioIndexer::new(
-            config.indexer_url.clone(),
-            config.indexer_max_results,
-            Duration::from_secs(config.indexer_timeout_secs),
-        ) {
-            Ok(ix) => {
-                info!(url = %config.indexer_url, "torrent discovery enabled");
-                Some(Arc::new(ix))
-            }
-            Err(e) => {
-                // Discovery is an enhancement -- failing to build its client
-                // must not stop the gateway from serving magnets.
-                warn!("could not initialize torrent index, discovery disabled: {e:#}");
-                None
-            }
-        }
-    };
-
-    // Known before the certificate is: it is derived purely from the LAN
-    // address, and the stream handler needs it to recognise its own https
-    // origin as a local one.
-    let tls_host =
-        (!config.disable_https).then(|| tls::hostname_for(lan_ip, &config.tls_host_suffix));
-
-    audit.record(audit::Event::ServerStart {
-        version: env!("CARGO_PKG_VERSION").to_string(),
-        http_port: bound_port,
-        https_port: (!config.disable_https).then_some(config.https_port),
-        cache_dir: config
-            .cache_dir
-            .canonicalize()
-            .unwrap_or_else(|_| config.cache_dir.clone())
-            .display()
-            .to_string(),
-    });
-
-    let state = AppState {
-        engine,
-        cache,
-        stream_base_url,
-        indexer,
-        tls_host: tls_host.clone(),
-        audit: audit.clone(),
-    };
-
-    monitoring::spawn_terminal_monitor(
-        state.clone(),
-        Duration::from_secs(config.monitor_interval_secs),
-    );
-    let ip_check_engine = state.engine.clone();
-
-    let app = build_router(state);
-
-    // The banner prints *before* the https setup: fetching the certificate
-    // can take up to 15 seconds against a slow provider, and holding the
-    // whole gateway (and the http address everyone copies) hostage to it
-    // made every cold start feel broken. The https task announces the addon
-    // URL itself the moment it is actually servable.
-    if config.disable_https {
-        network::print_banner(lan_ip, bound_port, network::AddonStatus::Disabled);
-    } else {
-        network::print_banner(lan_ip, bound_port, network::AddonStatus::Preparing);
-        spawn_https(&config, lan_ip, client_timeout, app.clone());
+        return None;
     }
-    info!(%lan_ip, port = bound_port, "streaming gateway listening");
+    match indexer::TorrentioIndexer::new(
+        config.indexer_url.clone(),
+        config.indexer_max_results,
+        Duration::from_secs(config.indexer_timeout_secs),
+    ) {
+        Ok(ix) => {
+            info!(url = %config.indexer_url, "torrent discovery enabled");
+            Some(Arc::new(indexer::CachingIndexer::new(Arc::new(ix))))
+        }
+        Err(e) => {
+            // Discovery is an enhancement -- failing to build its client
+            // must not stop the gateway from serving magnets.
+            warn!("could not initialize torrent index, discovery disabled: {e:#}");
+            None
+        }
+    }
+}
 
-    // DHCP can hand this machine a new address (most often after sleep/wake),
-    // which leaves the addon URL Stremio already has stale. There is no way to
-    // rebind the https hostname/cert without a fresh process, so this restarts
-    // the gateway to pick it up -- systemd's Restart=always brings it back.
-    //
-    // Two guards against doing that destructively:
-    //   - the new address must be seen on two consecutive checks a minute
-    //     apart, so a one-tick flap (a virtual bridge like virbr0 briefly
-    //     looking preferred) never fires this; and
-    //   - it never fires while a stream is actually open, so a restart never
-    //     cuts off someone mid-episode -- it waits for the next quiet check
-    //     after they stop instead.
-    let ip_check_lan_ip = lan_ip;
+/// Watches for this machine's LAN address changing.
+///
+/// DHCP can hand this machine a new address (most often after sleep/wake),
+/// which leaves the addon URL Stremio already has stale. There is no way to
+/// rebind the https hostname/cert without a fresh process, so this restarts
+/// the gateway to pick it up -- systemd's Restart=always brings it back.
+///
+/// Two guards against doing that destructively:
+///   - the new address must be seen on two consecutive checks a minute
+///     apart, so a one-tick flap (a virtual bridge like virbr0 briefly
+///     looking preferred) never fires this; and
+///   - it never fires while a stream is actually open, so a restart never
+///     cuts off someone mid-episode -- it waits for the next quiet check
+///     after they stop instead.
+fn spawn_ip_change_watchdog(lan_ip: IpAddr, engine: Arc<TorrentEngine>) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(60));
         let mut pending: Option<IpAddr> = None;
         loop {
             interval.tick().await;
             let current_ip = network::detect_lan_ip();
-            if current_ip == ip_check_lan_ip {
+            if current_ip == lan_ip {
                 pending = None;
                 continue;
             }
             if pending != Some(current_ip) {
                 warn!(
-                    from = %ip_check_lan_ip,
+                    from = %lan_ip,
                     to = %current_ip,
                     "lan ip looks changed; confirming on the next check before restarting"
                 );
                 pending = Some(current_ip);
                 continue;
             }
-            if ip_check_engine.open_stream_count() > 0 {
+            if engine.open_stream_count() > 0 {
                 debug!(to = %current_ip, "lan ip change confirmed but a stream is open; deferring restart");
                 continue;
             }
             // Panic instead of process::exit so the panic hook records it in the audit log.
             panic!(
-                "LAN IP changed from {ip_check_lan_ip} to {current_ip} -- exiting to allow systemd to restart and rebind"
+                "LAN IP changed from {lan_ip} to {current_ip} -- exiting to allow systemd to restart and rebind"
             );
         }
     });
+}
 
+/// Serves until a shutdown signal, and records how the session ended.
+async fn serve_until_shutdown(
+    listener: tokio::net::TcpListener,
+    app: Router,
+    audit: &audit::AuditLog,
+) -> anyhow::Result<()> {
     let started = std::time::Instant::now();
     let served = axum::serve(
         listener,
@@ -421,7 +481,7 @@ fn spawn_https(
 ) {
     let config = config.clone();
     tokio::spawn(async move {
-        let tls_config = match tls::load(
+        let (tls_config, origin) = match tls::load(
             config.tls_cert_file.as_deref(),
             config.tls_key_file.as_deref(),
             &config.tls_cert_url,
@@ -430,7 +490,7 @@ fn spawn_https(
         )
         .await
         {
-            Ok(tls_config) => tls_config,
+            Ok(loaded) => loaded,
             Err(e) => {
                 warn!(
                     "could not start https ({e:#}); Stremio's Android app will not be able to \
@@ -440,12 +500,17 @@ fn spawn_https(
             }
         };
 
-        tls::spawn_refresh(
-            tls_config.clone(),
-            config.tls_cert_url.clone(),
-            config.tls_key_url.clone(),
-            config.cache_dir.clone(),
-        );
+        // A certificate the operator supplied is theirs to renew; refreshing
+        // it from the provider would swap in the public wildcard one.
+        if let Some(first_refresh) = origin.first_refresh() {
+            tls::spawn_refresh(
+                tls_config.clone(),
+                config.tls_cert_url.clone(),
+                config.tls_key_url.clone(),
+                config.cache_dir.clone(),
+                first_refresh,
+            );
+        }
 
         let host = tls::hostname_for(lan_ip, &config.tls_host_suffix);
         let addr = SocketAddr::new(config.bind_addr, config.https_port);

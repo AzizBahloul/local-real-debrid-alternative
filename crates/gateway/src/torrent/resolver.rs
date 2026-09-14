@@ -8,6 +8,8 @@
 //! a different provider later (e.g. resolving a `.torrent` file URL) only
 //! means adding another `TorrentSource` impl.
 
+use std::fmt::Write as _;
+
 use anyhow::{bail, Context, Result};
 
 /// Extensions recognized as directly playable video containers.
@@ -50,10 +52,10 @@ pub fn magnet_with_trackers(
 ) -> String {
     let mut magnet = format!("magnet:?xt=urn:btih:{info_hash}");
     if let Some(name) = display_name {
-        magnet.push_str(&format!("&dn={}", urlencoding::encode(name)));
+        let _ = write!(magnet, "&dn={}", urlencoding::encode(name));
     }
     for tracker in trackers {
-        magnet.push_str(&format!("&tr={}", urlencoding::encode(tracker)));
+        let _ = write!(magnet, "&tr={}", urlencoding::encode(tracker));
     }
     magnet
 }
@@ -86,8 +88,11 @@ pub struct ResolvedTorrent {
 }
 
 impl ResolvedTorrent {
+    /// The file at `idx`. `files` is built in index order, so this is a
+    /// lookup rather than a scan; the index check keeps it honest if that
+    /// ever stops being true.
     pub fn file(&self, idx: usize) -> Option<&TorrentFile> {
-        self.files.iter().find(|f| f.index == idx)
+        self.files.get(idx).filter(|f| f.index == idx)
     }
 }
 
@@ -134,13 +139,7 @@ pub fn normalize_to_magnet(input: &str) -> Result<String> {
         return Ok(trimmed.to_string());
     }
 
-    let is_hex40 = is_hex40(trimmed);
-    let is_base32_32 = trimmed.len() == 32
-        && trimmed
-            .bytes()
-            .all(|b| b.is_ascii_uppercase() || (b'2'..=b'7').contains(&b));
-
-    if is_hex40 || is_base32_32 {
+    if is_hex40(trimmed) || base32_info_hash_to_hex(trimmed).is_some() {
         return Ok(format!("magnet:?xt=urn:btih:{trimmed}"));
     }
 
@@ -165,16 +164,58 @@ pub fn trackers_from_magnet(magnet: &str) -> Vec<String> {
         .collect()
 }
 
-/// Extracts the display info-hash straight out of a magnet URI, for cases
-/// where we already normalized but need the bare hash (e.g. building our own
-/// canonical stream URLs).
+/// Extracts the info hash out of a magnet URI, always as 40 lowercase hex
+/// digits.
+///
+/// A magnet may carry its hash in base32 (32 characters) instead of hex, and
+/// that form used to be passed through as-is. Everything downstream assumes
+/// hex -- the `/videos/<hash>` URL a `/play` redirects to, the metadata
+/// archive, the cache janitor's directory scan -- so a base32 magnet started
+/// a torrent that could not be streamed, archived or ever cleaned up.
 pub fn info_hash_from_magnet(magnet: &str) -> Result<String> {
     let query = magnet.split_once('?').map_or(magnet, |(_, q)| q);
     let btih = query
         .split('&')
         .find_map(|part| part.strip_prefix("xt=urn:btih:"))
         .context("magnet link has no btih info hash")?;
-    Ok(btih.to_ascii_lowercase())
+    if is_hex40(btih) {
+        return Ok(btih.to_ascii_lowercase());
+    }
+    base32_info_hash_to_hex(btih).with_context(|| {
+        format!(
+            "magnet link's info hash {btih:?} is neither 40 hex digits nor 32 base32 characters"
+        )
+    })
+}
+
+/// Decodes a 32-character RFC 4648 base32 info hash (either case) into 40
+/// lowercase hex digits. `None` for anything else.
+///
+/// Hand-rolled because it is twenty lines and the only base32 in the program.
+/// 32 characters of 5 bits each are exactly the 160 bits of a SHA-1, so there
+/// is no padding to handle.
+fn base32_info_hash_to_hex(value: &str) -> Option<String> {
+    if value.len() != 32 {
+        return None;
+    }
+    let mut out = String::with_capacity(40);
+    let mut bits: u32 = 0;
+    let mut pending = 0u32;
+    for b in value.bytes() {
+        let digit = match b.to_ascii_uppercase() {
+            c @ b'A'..=b'Z' => c - b'A',
+            c @ b'2'..=b'7' => c - b'2' + 26,
+            _ => return None,
+        };
+        bits = (bits << 5) | u32::from(digit);
+        pending += 5;
+        if pending >= 8 {
+            pending -= 8;
+            let _ = write!(out, "{:02x}", (bits >> pending) & 0xff);
+            bits &= (1 << pending) - 1;
+        }
+    }
+    Some(out)
 }
 
 pub fn is_video_file(name: &str) -> bool {
@@ -203,6 +244,37 @@ mod tests {
         let hash = "0123456789abcdef0123456789abcdef01234567";
         let magnet = normalize_to_magnet(hash).unwrap();
         assert_eq!(magnet, format!("magnet:?xt=urn:btih:{hash}"));
+    }
+
+    /// Both encodings of the same hash, computed independently.
+    const HEX: &str = "0123456789abcdef0123456789abcdef01234567";
+    const BASE32: &str = "AERUKZ4JVPG66AJDIVTYTK6N54ASGRLH";
+
+    #[test]
+    fn a_base32_magnet_yields_the_hex_hash() {
+        let magnet = format!("magnet:?xt=urn:btih:{BASE32}&dn=x");
+        assert_eq!(info_hash_from_magnet(&magnet).unwrap(), HEX);
+        let lowercase = format!("magnet:?xt=urn:btih:{}", BASE32.to_ascii_lowercase());
+        assert_eq!(info_hash_from_magnet(&lowercase).unwrap(), HEX);
+    }
+
+    #[test]
+    fn a_bare_base32_hash_normalizes_and_resolves_to_hex() {
+        let magnet = normalize_to_magnet(&BASE32.to_ascii_lowercase()).unwrap();
+        assert_eq!(info_hash_from_magnet(&magnet).unwrap(), HEX);
+        assert_eq!(
+            base32_info_hash_to_hex("IX5EEM7PQ7CY6X4LJAL6JVIMT5JWHSXP").as_deref(),
+            Some("45fa4233ef87c58f5f8b4817e4d50c9f5363caef")
+        );
+    }
+
+    #[test]
+    fn a_magnet_hash_of_the_wrong_shape_is_refused_up_front() {
+        assert!(info_hash_from_magnet("magnet:?xt=urn:btih:nothash").is_err());
+        assert!(
+            info_hash_from_magnet("magnet:?xt=urn:btih:AERUKZ4JVPG66AJDIVTYTK6N54ASGRL1").is_err()
+        );
+        assert!(base32_info_hash_to_hex("AERUKZ4JVPG66AJDIVTYTK6N54ASGRL").is_none());
     }
 
     #[test]

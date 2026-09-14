@@ -26,7 +26,9 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::time::Duration;
+use std::sync::OnceLock;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use ksni::blocking::TrayMethods;
 
@@ -34,6 +36,10 @@ use crate::service;
 
 /// How often the tray re-reads the service state so its menu is not stale.
 const POLL_INTERVAL: Duration = Duration::from_secs(3);
+
+/// How often lingering is re-read. It only changes when somebody runs
+/// `loginctl`, and the tray polls for as long as the session lasts.
+const LINGER_POLL_INTERVAL: Duration = Duration::from_secs(60);
 
 const PID_FILE: &str = "novastream-tray.pid";
 
@@ -57,18 +63,25 @@ pub enum TrayEvent {
 /// The icon, converted once from the same PNG the window uses.
 ///
 /// StatusNotifierItem wants raw ARGB32, and the bundled helper hands back
-/// RGBA, hence the per-pixel rotate.
-fn icon() -> Option<ksni::Icon> {
-    let data = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon-256.png")).ok()?;
-    let mut rgba = data.rgba;
-    for pixel in rgba.chunks_exact_mut(4) {
-        pixel.rotate_right(1);
-    }
-    Some(ksni::Icon {
-        width: data.width as i32,
-        height: data.height as i32,
-        data: rgba,
+/// RGBA, hence the per-pixel rotate. Kept for the life of the process: the
+/// host asks for the pixmap on every menu update, and decoding a 256x256 PNG
+/// each time is work with one possible answer.
+fn icon() -> Option<&'static ksni::Icon> {
+    static ICON: OnceLock<Option<ksni::Icon>> = OnceLock::new();
+    ICON.get_or_init(|| {
+        let data =
+            eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon-256.png")).ok()?;
+        let mut rgba = data.rgba;
+        for pixel in rgba.chunks_exact_mut(4) {
+            pixel.rotate_right(1);
+        }
+        Some(ksni::Icon {
+            width: data.width as i32,
+            height: data.height as i32,
+            data: rgba,
+        })
     })
+    .as_ref()
 }
 
 struct NovaTray {
@@ -86,7 +99,7 @@ impl ksni::Tray for NovaTray {
     }
 
     fn icon_pixmap(&self) -> Vec<ksni::Icon> {
-        icon().into_iter().collect()
+        icon().cloned().into_iter().collect()
     }
 
     /// Fallback for a host that ignores pixmaps; a generic media icon is
@@ -242,14 +255,19 @@ pub fn running_tray_pid() -> Option<u32> {
 /// Asks any resident tray process to go away.
 ///
 /// Called when the window opens, so the two representations of the app are
-/// never on screen at once.
+/// never on screen at once. The signal is sent from a thread of its own: it
+/// runs before the window exists, and nothing about opening the window has to
+/// wait for `kill` to be spawned and reaped. The pid file goes at once either
+/// way, which is what the next "is a tray already up?" check reads.
 pub fn stop_running_tray() {
     if let Some(pid) = running_tray_pid() {
         if pid != std::process::id() {
-            let _ = Command::new("kill")
-                .arg("-TERM")
-                .arg(pid.to_string())
-                .status();
+            thread::spawn(move || {
+                let _ = Command::new("kill")
+                    .arg("-TERM")
+                    .arg(pid.to_string())
+                    .status();
+            });
         }
     }
     let _ = std::fs::remove_file(pid_file());
@@ -318,6 +336,7 @@ pub fn run_tray_daemon(exe: PathBuf) -> i32 {
     };
 
     let mut last = service::status();
+    let mut next_linger_poll = Instant::now() + LINGER_POLL_INTERVAL;
     loop {
         match rx.recv_timeout(POLL_INTERVAL) {
             Ok(TrayEvent::Open) => {
@@ -363,7 +382,13 @@ pub fn run_tray_daemon(exe: PathBuf) -> i32 {
 
         // Repaint the menu only when something actually changed -- the menu
         // is rebuilt over D-Bus and the host redraws on every update.
-        let current = service::status();
+        let linger = if Instant::now() >= next_linger_poll {
+            next_linger_poll = Instant::now() + LINGER_POLL_INTERVAL;
+            None
+        } else {
+            Some(last.linger)
+        };
+        let current = service::status_reusing_linger(linger);
         if current != last {
             last = current;
             handle.update(move |tray: &mut NovaTray| tray.status = current);
@@ -414,5 +439,7 @@ mod tests {
         assert_eq!(icon.width, 256);
         assert_eq!(icon.height, 256);
         assert_eq!(icon.data.len(), 256 * 256 * 4);
+        // Decoded once: a second ask hands back the same buffer.
+        assert!(std::ptr::eq(icon, super::icon().unwrap()));
     }
 }

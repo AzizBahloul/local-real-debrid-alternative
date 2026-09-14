@@ -102,19 +102,27 @@ pub enum Event {
         from_cached_metadata: bool,
         outcome: String,
     },
-    /// Waiting for the first real bytes before answering. A `timed_out` here
-    /// with `bytes: 0` is a stream that was handed to the player empty.
+    /// Waiting for the first real bytes before answering.
     Prebuffer {
         info_hash: String,
         bytes: usize,
+        /// The pre-buffer ceiling for this request. `bytes` below it is not a
+        /// fault on its own: only the floor is waited for, and the rest is
+        /// whatever was already on disk.
         wanted: usize,
         ms: u64,
+        /// The read did not get even its floor -- the part of the pre-buffer
+        /// that actually waits -- before the timeout. With `bytes: 0` the
+        /// player was answered 503 with `Retry-After` rather than handed an
+        /// empty body. Never set for a superseded read.
         timed_out: bool,
         /// The data was already on disk, so this was a seek into a region
         /// already downloaded rather than a wait on the swarm. The single most
         /// useful field here: a slow *warm* pre-buffer is a gateway problem,
         /// while a slow cold one is the piece-size arithmetic and no amount of
-        /// code will move it.
+        /// code will move it. Inferred from reaching the floor faster than a
+        /// swarm round trip can, so a warm read that happened to be slow is
+        /// recorded as cold, never the reverse.
         warm: bool,
         /// Bytes between the requested offset and the end of the piece it
         /// lands in — the floor this request could not have beaten.
