@@ -20,6 +20,9 @@ const TITLE_TTY: &str = "TTY // GATEWAY STDOUT";
 const LOCAL_VERSION: &str = concat!("v", env!("CARGO_PKG_VERSION"));
 const PROMPT: &str = "root@novastream:~$ ";
 const NO_OUTPUT: &str = "-- no output; the gateway is not running --";
+const ADDON_MOVED: &str = "ADDRESS CHANGED - the addon in Stremio still uses the old one";
+const ADDON_MOVED_WAS: &str = "old: ";
+const ADDON_MOVED_HINT: &str = "reinstall it from the address above; copying it clears this";
 
 impl GatewayApp {
     /// Background layer: the rain, painted before any panel so everything
@@ -371,7 +374,9 @@ impl GatewayApp {
             .as_ref()
             .filter(|(_, at)| time - at < 2.0)
             .map(|(text, _)| text.as_str());
+        let moved_from = self.addon_moved_from.as_deref();
         let mut to_copy = None;
+        let mut copied_manifest = false;
 
         theme::section(ui, TITLE_ENDPOINTS, PHOSPHOR, |ui| {
             // The addon URL goes first and the plain-http one is labelled for
@@ -386,6 +391,17 @@ impl GatewayApp {
                 Some(manifest) => {
                     if copyable_line(ui, manifest, copied == Some(manifest)) {
                         to_copy = Some(manifest.to_string());
+                        copied_manifest = true;
+                    }
+                    // Stremio gives no reason when an installed addon stops
+                    // answering, so the window has to. See `addon_address`.
+                    if let Some(previous) = moved_from {
+                        ui.label(theme::body(ADDON_MOVED, AMBER));
+                        ui.label(theme::caption(
+                            format!("{ADDON_MOVED_WAS}{previous}"),
+                            TEXT_DIM,
+                        ));
+                        ui.label(theme::caption(ADDON_MOVED_HINT, TEXT_DIM));
                     }
                 }
                 None => {
@@ -403,6 +419,10 @@ impl GatewayApp {
             }
         });
 
+        // Copying the new address is taken as reinstalling the addon with it.
+        if copied_manifest && self.addon_moved_from.is_some() {
+            self.remember_addon_address();
+        }
         if let Some(text) = to_copy {
             ui.output_mut(|o| o.copied_text = text.clone());
             self.chrome.copied = Some((text, time));
@@ -613,7 +633,14 @@ mod tests {
             assert!(title.is_ascii(), "{title}");
             assert_eq!(title, title.to_uppercase(), "{title}");
         }
-        for text in [PROMPT, NO_OUTPUT, LOCAL_VERSION] {
+        for text in [
+            PROMPT,
+            NO_OUTPUT,
+            LOCAL_VERSION,
+            ADDON_MOVED,
+            ADDON_MOVED_WAS,
+            ADDON_MOVED_HINT,
+        ] {
             assert!(text.is_ascii());
         }
     }

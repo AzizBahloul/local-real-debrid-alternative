@@ -19,6 +19,7 @@
 //! instruments in [`widgets`]. The window's state, actions and panels are in
 //! [`app`]; the command line is [`cli`]; this file is only the frame loop.
 
+mod addon_address;
 mod app;
 mod cli;
 mod fx;

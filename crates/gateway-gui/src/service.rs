@@ -343,7 +343,7 @@ pub fn render_unit(binary: &Path, env_file: &Path, working_dir: &Path) -> String
     )
 }
 
-fn write_file(path: &Path, contents: &str) -> Result<()> {
+pub fn write_file(path: &Path, contents: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("could not create {}", parent.display()))?;

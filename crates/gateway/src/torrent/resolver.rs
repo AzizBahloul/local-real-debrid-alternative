@@ -235,6 +235,27 @@ pub fn suggest_video_file(files: &[TorrentFile]) -> Option<usize> {
         .map(|f| f.index)
 }
 
+/// The file a stream request for file `requested` should actually play.
+///
+/// An index that does not know which file holds the video leaves the index
+/// out, and the stream URL then says 0. That is only right for a single-file
+/// release. Stremio's own server reads a missing index as "the largest file",
+/// so indexes leave it out freely. A release that lists its subtitles, a
+/// sample or a poster first handed the player that file instead, and the
+/// player sat at `--:--:--` with no error. Reproduced 2026-09-15 in Stremio
+/// with the Big Buck Bunny demo torrent, whose file 0 is a 140-byte `.srt`.
+///
+/// So a request for a file that exists but is not a video, in a torrent that
+/// has a video, plays the suggested video file. Nothing this gateway hands
+/// out points at a non-video file on purpose. An index past the end is left
+/// alone so it still fails loudly rather than quietly playing something else.
+pub fn playable_file_idx(files: &[TorrentFile], requested: usize) -> usize {
+    match files.get(requested) {
+        Some(file) if !file.is_video => suggest_video_file(files).unwrap_or(requested),
+        _ => requested,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -398,5 +419,48 @@ mod tests {
             },
         ];
         assert_eq!(suggest_video_file(&files), Some(1));
+    }
+
+    fn file(index: usize, name: &str, length: u64) -> TorrentFile {
+        TorrentFile {
+            index,
+            is_video: is_video_file(name),
+            name: name.into(),
+            length,
+        }
+    }
+
+    /// The Big Buck Bunny demo torrent's real layout: the subtitles come
+    /// first, so a stream URL built without a file index pointed at them.
+    #[test]
+    fn a_request_for_a_non_video_file_plays_the_video() {
+        let files = vec![
+            file(0, "Big Buck Bunny.en.srt", 140),
+            file(1, "Big Buck Bunny.mp4", 276_134_947),
+            file(2, "poster.jpg", 310_380),
+        ];
+        assert_eq!(playable_file_idx(&files, 0), 1);
+        assert_eq!(playable_file_idx(&files, 2), 1);
+    }
+
+    #[test]
+    fn an_explicit_video_file_is_never_second_guessed() {
+        // A season pack: episode 2 is smaller than episode 1 and must still
+        // be what plays when it is what was asked for.
+        let files = vec![
+            file(0, "Show.S01E01.mkv", 1_200_000_000),
+            file(1, "Show.S01E02.mkv", 900_000_000),
+            file(2, "Show.S01.nfo", 2_000),
+        ];
+        assert_eq!(playable_file_idx(&files, 1), 1);
+        assert_eq!(playable_file_idx(&files, 0), 0);
+    }
+
+    #[test]
+    fn with_no_video_or_an_index_past_the_end_the_request_stands() {
+        let no_video = vec![file(0, "album.flac", 30_000_000), file(1, "cover.jpg", 1)];
+        assert_eq!(playable_file_idx(&no_video, 1), 1);
+        let one = vec![file(0, "Movie.mkv", 1)];
+        assert_eq!(playable_file_idx(&one, 5), 5, "out of range must still 404");
     }
 }

@@ -14,7 +14,7 @@ mod range;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axum::extract::{ConnectInfo, Path, Query, State};
 use axum::http::{header, HeaderMap, HeaderValue, Method};
@@ -24,7 +24,7 @@ use serde::Deserialize;
 use tracing::{debug, warn};
 
 use crate::error::ApiErrorResponse;
-use crate::torrent::{resolver, TorrentEngine};
+use crate::torrent::{resolver, TooManyOpenReads, TorrentEngine};
 use body::{healing_body, BodyContext};
 use prebuffer::{piece_aware_floor, prebuffer};
 use range::{plan_range, Unsatisfiable};
@@ -51,6 +51,31 @@ const TAIL_PROBE_PREBUFFER: usize = 256 * 1024;
 /// smallest wait a swarm round-trip can produce, so the classification does
 /// not hinge on where exactly in that gap the threshold sits.
 const WARM_PREBUFFER_MS: u64 = 50;
+
+/// How long the pre-buffer may wait: the configured cap, cut short by
+/// whatever of `VIDEO_HEADERS_DEADLINE` the request has already spent.
+///
+/// The wait used to be a flat 15 s, sized so a worst-case cold start still
+/// fit under the router's timeout, and every warm read paid that same short
+/// fuse. Ending it with a retryable 503 does not keep libmpv, the player
+/// inside Stremio's desktop apps, asking. Reproduced 2026-09-15 with the Big
+/// Buck Bunny demo file, a faststart mp4 ending in a 58-byte `free` atom:
+/// mpv reads that last atom before it plays, and a 503 there ended playback
+/// with `eof`, both at once and after 15 s. The same read answered after 20 s
+/// played. In the real run the piece arrived 1.8 s after the 503 went out.
+/// mpv waits 60 s for headers, so a read that has not yet cost the viewer a
+/// cold start can wait for most of that instead.
+fn prebuffer_patience(cap: Duration, spent: Duration) -> Duration {
+    cap.min(crate::VIDEO_HEADERS_DEADLINE.saturating_sub(spent))
+}
+
+/// Whether a read runs beside the same client's playback rather than
+/// replacing it: an index probe at the tail, or a range with an end short of
+/// the file's. Players seek with open-ended ranges. See `register_reader`
+/// for what counting a bounded read as a seek broke.
+fn is_side_read(tail_probe: bool, end: u64, file_len: u64) -> bool {
+    tail_probe || end < file_len
+}
 
 #[derive(Deserialize)]
 pub struct PlayQuery {
@@ -152,6 +177,9 @@ pub async fn stream_video(
     }): Path<VideoPathParams>,
     headers: HeaderMap,
 ) -> Result<Response, ApiErrorResponse> {
+    // Everything below, a cold start included, spends one deadline; see
+    // `prebuffer_patience`.
+    let arrived = Instant::now();
     validate_info_hash(&info_hash).map_err(ApiErrorResponse::bad_request)?;
     // Every map in the engine is keyed by the lowercase form; a client that
     // happened to send uppercase must not get its own separate bookkeeping.
@@ -181,6 +209,11 @@ pub async fn stream_video(
             "unknown torrent: this gateway has not offered that info hash",
         ));
     }
+
+    // A URL built without the index's file number says 0, which in a release
+    // that lists its subtitles first is not the video. See
+    // `select_played_file`, which also points the download at this file.
+    let file_idx = engine.select_played_file(&info_hash, file_idx).await;
 
     let file = engine
         .stream_file(&info_hash, file_idx)
@@ -222,7 +255,12 @@ pub async fn stream_video(
     // Registered before the read is opened, so a scrub that arrives while an
     // earlier one is still blocked in the pre-buffer retires it immediately
     // rather than after it finally gives up. See `register_reader`.
-    let ticket = engine.register_reader(&info_hash, file_idx, addr.ip(), tail_probe);
+    let ticket = engine.register_reader(
+        &info_hash,
+        file_idx,
+        addr.ip(),
+        is_side_read(tail_probe, end, file_len),
+    );
     let cancel = ticket.cancel_handle();
 
     // `ensure_started` above has just made sure the torrent is present and
@@ -230,7 +268,15 @@ pub async fn stream_video(
     let reader = engine
         .open_started_stream_at(&info_hash, file_idx, start)
         .await
-        .map_err(|e| ApiErrorResponse::not_found(format!("stream unavailable: {e:#}")))?;
+        .map_err(|e| {
+            // Retryable: reads close all the time, and a 404 would make the
+            // player give up on a title that is fine.
+            if e.is::<TooManyOpenReads>() {
+                ApiErrorResponse::not_ready(format!("{e:#}"))
+            } else {
+                ApiErrorResponse::not_found(format!("stream unavailable: {e:#}"))
+            }
+        })?;
 
     // Held for the entire response body: this is what keeps the idle reaper
     // from pausing the torrent out from under a viewer. See `StreamGuard`.
@@ -240,6 +286,12 @@ pub async fn stream_video(
     // than leaving it to compete for the line until the idle reaper gets to
     // it minutes later. No-op when this is the same torrent (a seek).
     engine.focus_stream(&info_hash);
+
+    // A player asking again is the best sign that a dropped line is back, so
+    // a torrent that stopped receiving rebuilds its peer list now rather than
+    // on its next scheduled try, which can be minutes away. See
+    // `revive_if_silent`.
+    engine.revive_if_silent(&info_hash);
 
     // Fetch the file's trailing index in parallel with its opening frames, so
     // the player's own tail request lands on data that is already here rather
@@ -275,7 +327,7 @@ pub async fn stream_video(
         reader,
         prebuffer_floor,
         prebuffer_target,
-        engine.tuning().prebuffer_timeout,
+        prebuffer_patience(engine.tuning().prebuffer_timeout, arrived.elapsed()),
         &cancel,
     )
     .await;
@@ -386,6 +438,44 @@ pub fn validate_info_hash(value: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const SINTEL_LEN: u64 = 1_180_090_590;
+
+    /// The exact pair from the reproduction. Stremio's server hashes
+    /// `bytes=0-65535` while libmpv's `bytes=6737-` is still waiting for its
+    /// first piece. Only the player's read is playback.
+    #[test]
+    fn stremios_subtitle_hash_read_is_a_side_read_and_the_players_is_not() {
+        assert!(is_side_read(false, 65_536, SINTEL_LEN));
+        assert!(!is_side_read(false, SINTEL_LEN, SINTEL_LEN));
+    }
+
+    #[test]
+    fn an_index_probe_is_a_side_read_however_it_is_bounded() {
+        assert!(is_side_read(true, SINTEL_LEN, SINTEL_LEN));
+    }
+
+    #[test]
+    fn a_warm_read_waits_for_its_full_cap_and_a_cold_one_only_for_what_is_left() {
+        let cap = Duration::from_secs(45);
+        assert_eq!(prebuffer_patience(cap, Duration::ZERO), cap);
+        // A worst-case cold start: metadata, then initialization, both maxed.
+        let cold = Duration::from_secs(40);
+        assert_eq!(
+            prebuffer_patience(cap, cold),
+            crate::VIDEO_HEADERS_DEADLINE - cold
+        );
+        assert_eq!(
+            prebuffer_patience(cap, Duration::from_secs(90)),
+            Duration::ZERO,
+            "an overspent request must not wrap round into a long wait"
+        );
+        assert_eq!(
+            prebuffer_patience(Duration::from_secs(5), Duration::ZERO),
+            Duration::from_secs(5),
+            "an operator's lower cap still wins"
+        );
+    }
 
     #[test]
     fn accepts_valid_info_hash() {

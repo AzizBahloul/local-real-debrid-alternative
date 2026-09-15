@@ -201,6 +201,9 @@ pub fn healing_body(ctx: BodyContext) -> Body {
                     );
                     engine.touch_stream(&info_hash, client);
                     last_touch = Instant::now();
+                    // Released before the replacement is opened, so a re-open
+                    // never needs a second read slot. See `MAX_OPEN_READS`.
+                    drop(std::mem::replace(&mut reader, Box::new(tokio::io::empty())));
                     match engine.open_stream_at(&info_hash, file_idx, position).await {
                         Ok(fresh) => reader = fresh,
                         Err(e) => {

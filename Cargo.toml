@@ -1,6 +1,8 @@
 [workspace]
 resolver = "2"
 members = ["crates/gateway", "crates/gateway-gui"]
+# Patched dependencies, built but never tested or linted as ours.
+exclude = ["vendor"]
 
 # Shared across every workspace member (must live at the workspace root --
 # Cargo ignores a `[profile.*]` table declared in a member's own Cargo.toml).
@@ -20,3 +22,9 @@ strip = true
 inherits = "release"
 lto = "thin"
 codegen-units = 16
+
+# librqbit 9.0.1 with a streaming bug fixed: pieces a player was waiting on
+# were downloaded again and again, costing up to a third of the swarm's speed
+# during seeks. See vendor/librqbit/VENDORED.md, including how to drop this.
+[patch.crates-io]
+librqbit = { path = "vendor/librqbit" }

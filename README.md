@@ -399,7 +399,7 @@ curl -s http://127.0.0.1:8080/health | grep -o '"version":"[^"]*"'
 # 📦 Release history
 
 <img alt="Latest" src="https://img.shields.io/badge/latest-v1.2.0-2ea043?style=for-the-badge">
-<img alt="Tests" src="https://img.shields.io/badge/tests-263_passing-2ea043?style=for-the-badge">
+<img alt="Tests" src="https://img.shields.io/badge/tests-285_passing-2ea043?style=for-the-badge">
 <img alt="Clippy" src="https://img.shields.io/badge/clippy-clean-2ea043?style=for-the-badge">
 
 </div>
@@ -409,6 +409,71 @@ you are here because something is broken, read the symptoms — one of them is
 probably yours, and the fix may already be a version away.
 
 <table>
+<tr>
+<td width="120" align="center"><h3>🟡<br>next</h3><sub><b>unreleased</b></sub></td>
+<td>
+
+### Seeking into a part that isn't downloaded was slower than the internet allowed
+
+**Symptom** — jumping ahead in a movie took 10-20 s even on a fast
+connection, and the swarm's download speed dropped the moment playback
+started.
+
+**Cause** — a bug in librqbit 9.0.1. A piece that had just finished
+downloading, but not yet passed its checksum, was handed out a second time to
+another peer. Every chunk of that second copy was thrown away, and the piece
+was then stolen back and forth between peers every ~6.5 s for as long as the
+player needed it. With a player seeking around, up to **31% of everything the
+swarm sent was wasted**. The fix lives in a patched copy of librqbit under
+`vendor/librqbit` (see `VENDORED.md` there; it is unfixed upstream). Measured in
+the Stremio desktop app: a jump to 45% of a 1080p movie went from 10-13 s to
+7 s.
+
+### Starting several titles at once lost some of them
+
+**Symptom** — pressing play on a title while another was starting (a second
+device, or browsing several titles quickly) sometimes failed with *"torrent
+vanished from the session right after being added"*.
+
+**Cause** — librqbit's session store gave two torrents added at the same moment
+the same id, and silently kept only one. The gateway now assigns the ids
+itself. Before: 5 of 24 simultaneous starts failed. After: 24 of 24.
+
+### After the internet dropped, the movie stayed stuck for up to 14 minutes
+
+**Symptom** — the connection went down for a couple of minutes mid-movie, came
+back, and the player still sat there; pressing play again did nothing for many
+minutes.
+
+**Cause** — librqbit waits 10 s, then 1 min, then 6 min before retrying a lost
+peer, and ignores the same peer when a tracker offers it again. A new swarm
+watch rebuilds the peer list of a torrent that has received nothing for 20 s
+(then less and less often), and immediately when the player asks again. A
+200 s outage used to leave the download stopped for ~8 minutes after the line
+returned. Now it resumes within 15 s, and pressing play is enough.
+
+### Also in the next release
+
+- **Many open reads froze the whole download.** Each open read held one of
+  librqbit's 8 disk permits, so 8 players (or one player plus Stremio's own
+  probes) blocked every piece write. The pool is now 72, and the gateway caps
+  open reads at 64, answering a retryable `503` past that.
+- **Stremio's subtitle-hash read no longer cancels the player's read.** Its
+  `bytes=0-65535` from the same address used to supersede the stream the player
+  was waiting on, and playback never started.
+- **A release whose first file is a subtitle or sample plays its video**, rather
+  than handing the player a 140-byte `.srt`.
+- **`PREBUFFER_TIMEOUT_SECS` defaults to 45** (was 15), so a slow cold start is
+  waited for instead of ending in an empty response.
+- **The window warns when the addon address changes** (new LAN IP or port), since
+  the addon installed on the phone keeps pointing at the old one and just shows
+  no streams.
+- Cold start of a 1080p MKV in Stremio: 5.5 s → 1.4 s, by fetching the file's
+  last 64 KB (its index) up front.
+
+</td>
+</tr>
+
 <tr>
 <td width="120" align="center"><h3>🟢<br>v1.2.0</h3><sub><b>current</b></sub></td>
 <td>
@@ -573,7 +638,7 @@ Everything has a sensible default. Change these only if you need to:
 | `MAX_ACTIVE_DOWNLOADS` | `4` | How many titles download at once, oldest request first. `1` restores "only what you are watching" |
 | `IDLE_PAUSE_SECS` | `1800` | Pause a movie you stopped watching, to free bandwidth |
 | `PREBUFFER_BYTES` | `1 MB` | Data to gather before playback starts |
-| `PREBUFFER_TIMEOUT_SECS` | `15` | Give up gathering it after this long. If nothing at all arrived, the player is asked to retry rather than handed an empty stream |
+| `PREBUFFER_TIMEOUT_SECS` | `45` | Give up gathering it after this long, and never later than 55 s after the request arrived (so a cold start leaves it only what remains). If nothing at all arrived, the player is asked to retry rather than handed an empty stream |
 | `STALL_TIMEOUT_SECS` | `20` | If playback gets no data for this long, quietly reconnect |
 | `CLIENT_TIMEOUT_SECS` | `900` | Hang up on a player that stopped responding, freeing its movie |
 | `MAX_PEERS_PER_TORRENT` | `60` | Peers per movie. Higher is not faster on a home connection |
@@ -708,12 +773,43 @@ MAX_CACHE_SIZE_GB=100 ./target/release/streaming-gateway
 </details>
 
 <details>
+<summary><b>The internet dropped mid-movie, and it stayed stuck after it came back</b></summary>
+
+Press play again once the connection is back. Stremio picks up where you
+left off.
+
+If the line was down for more than a minute or so, the player has usually
+given up by then. It reports the stall as the end of the movie, so Stremio
+may look finished rather than stuck.
+
+While nothing is arriving, the gateway keeps looking for peers. It first
+rebuilds the torrent's peer list 20 s after the data stops, then again after
+30 s, 1 min, 2 min and 4 min, and every 5 min after that. Pressing play
+rebuilds it straight away, so a second play normally starts within seconds
+of the connection coming back.
+
+Before this, the torrent engine's own retries ran on a much slower clock.
+After an outage longer than about two minutes, a torrent could sit with no
+peers for 7 to 14 minutes, however soon the line came back. The log line to
+look for is `nothing downloaded for a while; rebuilt the peer list`.
+</details>
+
+<details>
 <summary><b>Seeking takes a long time</b></summary>
 
 Jumping to a part that hasn't downloaded yet means fetching it first — usually a
 few seconds. Torrents transfer in chunks of 4–16 MB, so even one second of video
 requires a whole chunk. Seeking backwards into what you've already watched is
 instant.
+
+The player also needs more than the second you jumped to. Video can only start
+decoding at a keyframe, and those can be 10 seconds apart. On top of that,
+Stremio's player backs up about 10 more seconds on files with subtitle tracks,
+so it can catch a subtitle that is already on screen. Measured on Sintel
+(1080p): a jump to 6:39 made the player start reading at 6:22, which is 36 MB it
+had to download before showing a frame. So how long a seek takes is mostly that
+amount divided by how fast the swarm is. At 2.5 MB/s it took 20 s; with a
+12 MB/s swarm, 7 s.
 </details>
 
 <details>
@@ -760,7 +856,8 @@ crates/
     src/
       lib.rs              router, startup, shared state
       torrent/            librqbit wrapper, file selection, download queue,
-                          idle pausing, metadata archive, reader bookkeeping
+                          idle pausing, metadata archive, reader bookkeeping,
+                          swarm watch (peer list rebuild after an outage)
       streaming/          HTTP Range serving + pre-buffering
       stremio/            /manifest.json + /stream/{type}/{id}.json
       indexer/            torrent discovery by IMDB id
@@ -771,8 +868,12 @@ crates/
     src/
       main.rs             the frame loop and the layer order
       app/                window state, actions, polling, panels
+      addon_address.rs    warns when the installed addon URL went stale
       health.rs  http.rs  job.rs  text.rs  cli.rs
       server_process.rs  service.rs  tray.rs  fx.rs  theme.rs  widgets.rs
+vendor/
+  librqbit/             librqbit 9.0.1 with a streaming bug fixed, used via
+                        [patch.crates-io]; VENDORED.md says why and how to drop it
 setup.sh   Dockerfile
 ```
 
@@ -921,7 +1022,7 @@ setup.sh   Dockerfile
 ```bash
 cargo build --release              # both crates
 cargo build --profile release-fast # same opt-level, thin LTO: links in seconds, for iterating
-cargo test --release               # 263 tests
+cargo test --release               # 285 tests
 cargo clippy --release --all-targets -- -D warnings
 cargo deb -p streaming-gateway-gui                   # .deb package
 cargo generate-rpm -p crates/gateway-gui -o out.rpm  # .rpm package (build first)
@@ -963,7 +1064,9 @@ a player:
   client (a seek), and is answered empty so it releases its piece priority.
 - `503` with `Retry-After: 1` — no data for that offset arrived within the
   pre-buffer wait; a retry keeps the player asking instead of giving up on a
-  `206` with an empty body.
+  `206` with an empty body. Also sent when 64 torrent reads are already open
+  across all players. Past that, librqbit could not write downloaded pieces,
+  and every stream would freeze at once.
 
 </details>
 

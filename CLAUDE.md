@@ -152,6 +152,56 @@ build/test/lint. Run build+test+clippy before calling any change done.
   narrower than `is_running` on purpose: a *finished* torrent sits unpaused
   forever, so sparing everything running would exempt the watched-and-done
   backlog retention exists to reclaim.
+- **librqbit is vendored and patched (`vendor/librqbit`, wired in by
+  `[patch.crates-io]` in the root `Cargo.toml`).** Stock 9.0.1 re-reserved a
+  streaming-priority piece during the gap between its last chunk and its hash
+  check. It then threw every chunk of it away and stole it back and forth
+  every ~6.5 s for as long as a player kept it in its window: up to 31% of the
+  swarm's bytes wasted during seeks, measured 2026-09-15. A version bump in
+  `crates/gateway/Cargo.toml` alone silently keeps building the vendored
+  copy; follow "Upgrading librqbit" in `vendor/librqbit/VENDORED.md`. The
+  directory is `exclude`d from the workspace so `cargo test`/`clippy` never
+  run over upstream code, and it is trimmed of librqbit's npm `webui/`
+  (this repo has no Node). The Dockerfile copies `vendor/` before the
+  dependency pre-build.
+- **Every open librqbit read holds a blocking permit, and so does every
+  disk write.** librqbit 9.0.1's `FileStream` keeps one permit of the
+  session's blocking semaphore for its whole life (`_blocking_permit`), and
+  piece writes and uploads take permits from the same pool. At librqbit's
+  default of 8, eight open reads froze the entire session: no piece could be
+  written, so no read ever returned. Measured 2026-09-15 with 12 readers: the
+  download sat at 3 MB and 0 MiB/s. Two things prevent that and must stay
+  in step. `SessionOptions::runtime_worker_threads` sizes the pool (despite
+  the name, that is all it does), set to `SESSION_BLOCKING_PERMITS`. And
+  `open_started_stream_at` takes one of `MAX_OPEN_READS` gateway slots
+  before opening a read, refusing with a retryable 503 when they are gone.
+  Any new code that holds a librqbit stream must go through
+  `open_started_stream_at`, never `api_stream` directly, or it bypasses the
+  cap.
+- **Every torrent add passes `preferred_id` from `allocate_torrent_id`.**
+  librqbit 9.0.1's JSON session store numbers an add "highest saved id
+  plus one" without reserving it, and answers a clashing add with
+  `AlreadyManaged` and the *other* torrent's handle. Titles started
+  together (a browse prefetch, two devices) then silently never joined the
+  session: 5 of 24 starts, four at a time, failed with "torrent vanished
+  from the session right after being added". `streaming::titles_started_
+  at_the_same_moment_all_join_the_session` pins it. An add that leaves
+  `preferred_id` unset brings the race back.
+- **The swarm watch pauses a torrent that has open readers, on purpose,
+  and starts it again in the same breath** (`torrent/swarm.rs`). librqbit
+  waits 10 s, then 1 min, then 6, then 36 before retrying a dropped peer
+  (jittered up to double), and ignores the same address coming back from
+  a tracker or the DHT. So after the line is down for more than about two
+  minutes, a torrent stays at zero peers for 7 to 14 minutes after the
+  drop, however soon the line returns. A pause and start is the only reset
+  the public API has. It is safe for readers *only because nothing waits
+  between the two calls*: librqbit carries their wakers across the pause
+  (`TorrentStatePaused::streams`). Leaving a torrent with a reader paused
+  still freezes that reader for good, so never put anything between the
+  pause and the start, and never copy the pause somewhere that lacks the
+  start. The trigger is `fetched_bytes` standing still, never the peer
+  count: DHT peers that handshake and send nothing kept a peer-count
+  trigger's backoff stuck at its shortest wait in the lab.
 - **A live reader blocks the idle reaper regardless of recency** — players
   buffer ahead and go quiet, and librqbit's reader has no timeout of its own,
   so treating "quiet" as "idle" freezes an actively-watched stream.

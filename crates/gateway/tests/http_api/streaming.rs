@@ -3,7 +3,7 @@
 
 use axum::http::{header, Method, StatusCode};
 
-use crate::{request, seed_torrent, send, Gateway, SeededTorrent};
+use crate::{request, seed_torrent, seed_torrent_variant, send, Gateway, SeededTorrent};
 
 fn videos(seeded: &SeededTorrent) -> String {
     format!("/videos/{}/0", seeded.info_hash)
@@ -141,6 +141,57 @@ async fn play_resolves_from_the_archive_and_redirects_to_the_stream() {
         reply.header(header::LOCATION),
         Some(videos(&seeded).as_str())
     );
+}
+
+/// librqbit 9.0.1's JSON session store numbers a new torrent "highest saved
+/// id plus one" without reserving the number, and answers an add whose number
+/// is taken with the torrent that already holds it. Titles starting at the
+/// same moment -- a browse prefetching several, or two devices -- got the
+/// same number, and all but one never joined the session: their `/play`
+/// failed with "torrent vanished from the session right after being added".
+/// Reproduced 2026-09-15 in 5 of 24 starts made four at a time.
+#[tokio::test]
+async fn titles_started_at_the_same_moment_all_join_the_session() {
+    let gateway = Gateway::start().await;
+    let mut seeded = Vec::new();
+    for variant in 0..8 {
+        seeded.push(seed_torrent_variant(&gateway, variant).await);
+    }
+
+    let mut plays = tokio::task::JoinSet::new();
+    for torrent in &seeded {
+        let app = gateway.router();
+        let uri = format!(
+            "/play?magnet={}",
+            urlencoding::encode(&format!("magnet:?xt=urn:btih:{}", torrent.info_hash))
+        );
+        let hash = torrent.info_hash.clone();
+        plays.spawn(async move { (hash, send(app, request(Method::GET, &uri)).await) });
+    }
+    while let Some(joined) = plays.join_next().await {
+        let (hash, reply) = joined.unwrap();
+        assert_eq!(
+            reply.status,
+            StatusCode::TEMPORARY_REDIRECT,
+            "{hash}: {:?}",
+            reply.json()
+        );
+    }
+
+    let in_session: Vec<String> = gateway
+        .state
+        .engine
+        .list_active()
+        .into_iter()
+        .map(|torrent| torrent.info_hash)
+        .collect();
+    for torrent in &seeded {
+        assert!(
+            in_session.contains(&torrent.info_hash),
+            "{} is missing from the session",
+            torrent.info_hash
+        );
+    }
 }
 
 /// A magnet may carry its hash in base32. The redirect must still name the

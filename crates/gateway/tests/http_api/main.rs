@@ -203,6 +203,12 @@ pub struct SeededTorrent {
 /// archive, librqbit's add and hash-check -- and finds every piece already on
 /// disk, so it serves bytes without a single peer.
 pub async fn seed_torrent(gateway: &Gateway) -> SeededTorrent {
+    seed_torrent_variant(gateway, 0).await
+}
+
+/// Like [`seed_torrent`], but `variant` changes every byte, so each variant
+/// is a different torrent with its own info hash.
+pub async fn seed_torrent_variant(gateway: &Gateway, variant: u8) -> SeededTorrent {
     use librqbit::spawn_utils::BlockingSpawner;
     use librqbit::{create_torrent, CreateTorrentOptions};
 
@@ -210,7 +216,7 @@ pub async fn seed_torrent(gateway: &Gateway) -> SeededTorrent {
     // Several pieces, and a length that is not a multiple of the piece size,
     // so the last piece is a short one.
     let content: Vec<u8> = (0..300_001u32)
-        .map(|i| (i.wrapping_mul(2_654_435_761) >> 11) as u8)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 11) as u8 ^ variant)
         .collect();
 
     let staging = tempfile::tempdir().unwrap();

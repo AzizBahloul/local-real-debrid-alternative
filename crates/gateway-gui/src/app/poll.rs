@@ -7,6 +7,7 @@ use super::{
     always_on_step, AlwaysOnStep, GatewayApp, LogPanel, Pending, Probe, HEALTH_POLL_INTERVAL,
     LIVENESS_CHECK_INTERVAL, LOG_DRAIN_PER_FRAME, MAX_LOG_LINES, SERVICE_POLL_INTERVAL,
 };
+use crate::addon_address::{self, AddressCheck};
 use crate::health::HealthView;
 use crate::http::{self, Lane};
 use crate::server_process::LogLine;
@@ -21,8 +22,42 @@ impl GatewayApp {
         self.ensure_always_on();
         self.track_server(now);
         self.ingest_logs();
+        self.check_addon_address();
         self.poll_requests();
         self.poll_health(now);
+    }
+
+    /// Compares the addon address the log shows against the remembered one,
+    /// once per address rather than once per frame.
+    fn check_addon_address(&mut self) {
+        let Some(current) = self.log.addon_manifest.as_deref() else {
+            return;
+        };
+        if self.addon_checked.as_deref() == Some(current) {
+            return;
+        }
+        self.addon_checked = Some(current.to_string());
+        match addon_address::check(self.addon_remembered.as_deref(), current) {
+            AddressCheck::First => self.remember_addon_address(),
+            AddressCheck::Unchanged => self.addon_moved_from = None,
+            AddressCheck::Changed { previous } => self.addon_moved_from = Some(previous),
+        }
+    }
+
+    /// Makes the address on screen the remembered one, which clears the
+    /// warning. Called on first sight, and when the viewer copies the new
+    /// address to reinstall the addon.
+    pub(super) fn remember_addon_address(&mut self) {
+        let Some(current) = self.addon_checked.clone() else {
+            return;
+        };
+        if let Err(e) = addon_address::remember(&current) {
+            // The warning comes back next launch, which is a nuisance, not a
+            // fault. Said anyway, so it is not a mystery.
+            self.notice = Some(format!("could not remember the addon address: {e:#}"));
+        }
+        self.addon_remembered = Some(current);
+        self.addon_moved_from = None;
     }
 
     /// The environment probe: kicked off on the first frame, adopted when it

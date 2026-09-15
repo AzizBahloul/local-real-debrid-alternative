@@ -16,19 +16,21 @@
 //!   pauses, and discarding the title the viewer walked away from;
 //! * `metadata` -- `.torrent` metadata in memory and on disk, and the set of
 //!   hashes this gateway has offered;
-//! * `readers` -- bookkeeping for the video responses reading right now.
+//! * `readers` -- bookkeeping for the video responses reading right now;
+//! * `swarm` -- rebuilding the peer list of a torrent whose bytes stopped.
 
 mod metadata;
 mod queue;
 mod readers;
 pub mod resolver;
+mod swarm;
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::io::SeekFrom;
 use std::net::IpAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
@@ -51,13 +53,16 @@ use metadata::{
     ADVERTISED_HASH_CAPACITY,
 };
 use readers::{
-    has_tail_index, OpenStreamCounts, ReaderSlot, LIBRQBIT_STREAM_WINDOW, READAHEAD_ADVANCE_BYTES,
-    READAHEAD_REFRESH, TAIL_WARM_BYTES, TAIL_WARM_TIMEOUT,
+    has_tail_index, OpenStreamCounts, ReaderSlot, SlottedRead, LIBRQBIT_STREAM_WINDOW,
+    MAX_OPEN_READS, READAHEAD_ADVANCE_BYTES, READAHEAD_REFRESH, SESSION_BLOCKING_PERMITS,
+    TAIL_WARM_BYTES, TAIL_WARM_TIMEOUT,
 };
-pub use readers::{PieceGeometry, ReadaheadHandle, ReaderCancel, ReaderTicket, StreamGuard};
+pub use readers::{
+    PieceGeometry, ReadaheadHandle, ReaderCancel, ReaderTicket, StreamGuard, TooManyOpenReads,
+};
 use resolver::{
-    info_hash_from_magnet, is_video_file, suggest_video_file, MagnetSource, ResolvedTorrent,
-    TorrentFile, TorrentSource,
+    info_hash_from_magnet, is_video_file, playable_file_idx, suggest_video_file, MagnetSource,
+    ResolvedTorrent, TorrentFile, TorrentSource,
 };
 
 /// A boxed read side of a torrent file. `librqbit::FileStream` lives in a
@@ -66,18 +71,20 @@ use resolver::{
 pub type BoxedReader = Box<dyn AsyncRead + Send + Unpin>;
 
 // Cold-start budget. A first request for a torrent that is not running yet
-// does three things in sequence, and their sum must stay under the router's
+// does three things in sequence, and they must finish before the router's
 // request timeout (`crate::REQUEST_TIMEOUT`, 60s) -- otherwise the client
 // gets a 504 having waited the full minute for nothing, which is strictly
 // worse than a fast failure:
 //
 //     ADD_TORRENT_TIMEOUT (25s)  fetch metadata from DHT/trackers
 //   + INITIALIZE_TIMEOUT  (15s)  leave `Initializing` (hash-check on disk)
-//   + prebuffer timeout   (15s)  wait for real bytes (see `streaming`)
-//   = 55s worst case
+//   + pre-buffer                 wait for real bytes (see `streaming`)
 //
-// The prebuffer timeout is configurable, so `TorrentEngine::new` warns when a
-// configuration breaks the budget, and a test pins the defaults.
+// The pre-buffer is not a fixed term. It waits until
+// `crate::VIDEO_HEADERS_DEADLINE` (55s after the request arrived), capped by
+// PREBUFFER_TIMEOUT_SECS, so a maxed-out cold start still leaves it 15s and a
+// warm read gets the whole cap. A test pins that the two fixed terms leave
+// room for it.
 //
 /// Bounds the metadata fetch. Unbounded, a torrent with no reachable peers
 /// hangs here until the router gives up.
@@ -359,12 +366,19 @@ pub struct TorrentEngine {
     /// Every video response currently in flight. See `register_reader`.
     readers: StdMutex<Vec<ReaderSlot>>,
     next_reader_id: AtomicU64,
+    /// One permit per open torrent read. See `MAX_OPEN_READS`.
+    read_slots: Arc<Semaphore>,
     /// Files whose trailing index has already been warmed, by torrent, so the
     /// warmer runs once per file rather than once per seek -- and the check
     /// on every later seek allocates nothing.
     tail_warmed: StdMutex<HashMap<String, HashSet<usize>>>,
+    /// How long each running torrent has received nothing. See
+    /// `revive_lost_swarms`.
+    download_silence: StdMutex<HashMap<String, swarm::Silence>>,
     /// Per-torrent peer cap applied at add time, when set.
     cold_start_peer_limit: Option<usize>,
+    /// The id the next added torrent gets. See `allocate_torrent_id`.
+    next_torrent_id: AtomicUsize,
 }
 
 /// Where the time went during one cold start, filled in as it proceeds so the
@@ -441,6 +455,10 @@ impl TorrentEngine {
                 .iter()
                 .filter_map(|t| url::Url::parse(t).ok())
                 .collect(),
+            // Every open read holds one of these permits, and so does every
+            // disk write. At librqbit's default of 8, eight open reads
+            // freeze the whole session. See `MAX_OPEN_READS`.
+            runtime_worker_threads: Some(SESSION_BLOCKING_PERMITS),
             ..Default::default()
         };
 
@@ -466,6 +484,11 @@ impl TorrentEngine {
             };
 
         let api = Api::new(session, None);
+        // Above everything librqbit just restored. See `allocate_torrent_id`.
+        let first_free_torrent_id = api
+            .session()
+            .with_torrents(|iter| iter.map(|(id, _)| id + 1).max())
+            .unwrap_or(0);
 
         let advertised_path = config.session_state_dir().join("advertised.json");
         let remembered_advertised = load_advertised(&advertised_path).await;
@@ -477,15 +500,6 @@ impl TorrentEngine {
         }
 
         let tuning = StreamTuning::from_config(config);
-        let budget = ADD_TORRENT_TIMEOUT + INITIALIZE_TIMEOUT + tuning.prebuffer_timeout;
-        if budget >= crate::REQUEST_TIMEOUT {
-            warn!(
-                budget_secs = budget.as_secs(),
-                request_timeout_secs = crate::REQUEST_TIMEOUT.as_secs(),
-                "PREBUFFER_TIMEOUT_SECS pushes a worst-case cold start past the request \
-                 timeout; a slow first play will end in a 504 instead of a retryable 503"
-            );
-        }
 
         let engine = Arc::new(Self {
             api,
@@ -514,9 +528,12 @@ impl TorrentEngine {
             audit: StdMutex::new(crate::audit::AuditLog::disabled()),
             readers: StdMutex::new(Vec::new()),
             next_reader_id: AtomicU64::new(0),
+            read_slots: Arc::new(Semaphore::new(MAX_OPEN_READS)),
             tail_warmed: StdMutex::new(HashMap::new()),
+            download_silence: StdMutex::new(HashMap::new()),
             cold_start_peer_limit: (config.cold_start_peer_limit > 0)
                 .then_some(config.cold_start_peer_limit),
+            next_torrent_id: AtomicUsize::new(first_free_torrent_id),
         });
 
         // Bank what librqbit just restored. These blobs are already in memory
@@ -918,8 +935,28 @@ impl TorrentEngine {
             // this once, here, so it cannot be walked back down after the
             // start -- see the field docs on `cold_start_peer_limit`.
             peer_limit: self.cold_start_peer_limit,
+            preferred_id: Some(self.allocate_torrent_id()),
             ..Default::default()
         }
+    }
+
+    /// A session id no other torrent has, handed to librqbit with each add.
+    ///
+    /// Left to itself, librqbit 9.0.1's JSON session store numbers a new
+    /// torrent "highest saved id plus one" and reserves nothing
+    /// (`JsonSessionPersistenceStore::next_id`). Two adds finishing at the
+    /// same moment get the same number, and librqbit answers the second with
+    /// `AlreadyManaged` and the *first* torrent's handle. The second title
+    /// never joins the session, and its start fails with "torrent vanished
+    /// from the session right after being added". Titles start together
+    /// whenever a browse prefetches several, or two devices press play at
+    /// once. Reproduced 2026-09-15 in 5 of 24 starts made four at a time.
+    ///
+    /// Counting up here keeps ids in the order starts were asked for, which
+    /// is the order the download queue admits them in. An add that fails
+    /// leaves a gap, which nothing minds.
+    fn allocate_torrent_id(&self) -> usize {
+        self.next_torrent_id.fetch_add(1, Ordering::Relaxed)
     }
 
     /// Whether a background metadata search is already running for this hash.
@@ -1209,7 +1246,7 @@ impl TorrentEngine {
     ///
     /// What gets retired is deliberately narrow. Only reads that have not
     /// delivered a single byte, only from the same client address, and never
-    /// an index probe:
+    /// a side read:
     ///
     /// * **Zero bytes served** is the proof that nobody is watching it. A read
     ///   that has produced output is feeding a picture on a screen and is left
@@ -1217,15 +1254,22 @@ impl TorrentEngine {
     /// * **Same client** keeps two devices playing the same title from
     ///   cancelling each other's cold start — and then each other's retry, in
     ///   a loop where neither ever starts.
-    /// * **Not a tail probe** because an mp4's index read is a second read the
-    ///   same player needs *concurrently*, not a superseded seek. Cancelling
-    ///   it would break exactly the players §4.3 exists to help.
+    /// * **Not a side read**, in either direction. A side read is an index probe
+    ///   at the tail, or any range with an end short of the file's. An mp4's
+    ///   index read is a second read the same player needs *concurrently*, not
+    ///   a superseded seek, and cancelling it would break exactly the players
+    ///   §4.3 exists to help. Bounded ranges are here because Stremio's own
+    ///   server reads `bytes=0-65535` from the player's address, to hash the
+    ///   file for subtitles, while the player starts. When that read counted as
+    ///   a seek, it cancelled libmpv's `bytes=6737-` read (reproduced
+    ///   2026-09-15), the player got a 409 and playback never began. Players
+    ///   seek with open-ended ranges.
     pub fn register_reader(
         self: &Arc<Self>,
         info_hash: &str,
         file_idx: usize,
         client: IpAddr,
-        tail_probe: bool,
+        side_read: bool,
     ) -> ReaderTicket {
         let id = self.next_reader_id.fetch_add(1, Ordering::Relaxed);
         let served = Arc::new(AtomicU64::new(0));
@@ -1233,7 +1277,7 @@ impl TorrentEngine {
 
         let superseded: Vec<Arc<ReaderCancel>> = {
             let mut readers = lock(&self.readers);
-            let superseded = if self.tuning.seek_supersede && !tail_probe {
+            let superseded = if self.tuning.seek_supersede && !side_read {
                 readers
                     .iter()
                     .filter(|slot| slot.superseded_by(info_hash, file_idx, client))
@@ -1247,7 +1291,7 @@ impl TorrentEngine {
                 info_hash: info_hash.to_string(),
                 file_idx,
                 client,
-                tail_probe,
+                side_read,
                 served: Arc::clone(&served),
                 cancel: Arc::clone(&cancel),
             });
@@ -1312,6 +1356,102 @@ impl TorrentEngine {
         })
     }
 
+    /// The file a request for `requested` should serve (see
+    /// `resolver::playable_file_idx`), made sure to be one the torrent is
+    /// downloading.
+    ///
+    /// The selection matters as much as the choice. A torrent starts with only
+    /// its first requested file selected, and librqbit fetches an unselected
+    /// file only inside a playing stream's 32 MB look-ahead window, with no
+    /// background download behind it. That is what the remapped subtitle
+    /// request above would get, and so would episode 2 of a season pack that
+    /// was started for episode 1. So a file being played that is not selected
+    /// becomes the selection, together with any other file a viewer is
+    /// reading right now, so two devices on two episodes of one pack do not
+    /// keep taking the download away from each other.
+    ///
+    /// Best-effort: without metadata, or when the selection cannot be
+    /// changed, the request is served as asked and the stream's own window
+    /// still fetches what it reads.
+    pub async fn select_played_file(&self, info_hash: &str, requested: usize) -> usize {
+        let Ok(idx) = parse_idx(info_hash) else {
+            return requested;
+        };
+        let Some(handle) = self.api.session().get(idx) else {
+            return requested;
+        };
+        let Some(metadata) = handle.metadata.load_full() else {
+            return requested;
+        };
+
+        // The common case costs one extension check and nothing else: every
+        // range request of every seek comes through here.
+        let requested_is_video = metadata
+            .file_infos
+            .get(requested)
+            .is_none_or(|f| is_video_file(&f.relative_filename.to_string_lossy()));
+        let file_idx = if requested_is_video {
+            requested
+        } else {
+            let files: Vec<TorrentFile> = metadata
+                .file_infos
+                .iter()
+                .enumerate()
+                .map(|(index, f)| {
+                    let name = f.relative_filename.to_string_lossy().into_owned();
+                    TorrentFile {
+                        index,
+                        is_video: is_video_file(&name),
+                        name,
+                        length: f.len,
+                    }
+                })
+                .collect();
+            let playable = playable_file_idx(&files, requested);
+            if playable != requested {
+                info!(
+                    %info_hash,
+                    requested,
+                    playing = playable,
+                    "the requested file is not a video; playing the torrent's main video instead"
+                );
+            }
+            playable
+        };
+
+        let Some(selected) = handle.only_files() else {
+            // No selection means every file is already being downloaded.
+            return file_idx;
+        };
+        if selected.contains(&file_idx) || file_idx >= metadata.file_infos.len() {
+            return file_idx;
+        }
+        let mut wanted: HashSet<usize> = lock(&self.readers)
+            .iter()
+            .filter(|slot| slot.info_hash == info_hash && !slot.side_read)
+            .map(|slot| slot.file_idx)
+            .collect();
+        wanted.insert(file_idx);
+        match self
+            .api
+            .api_torrent_action_update_only_files(idx, &wanted)
+            .await
+        {
+            Ok(_) => info!(
+                %info_hash,
+                file_idx,
+                ?selected,
+                "now downloading the file being played"
+            ),
+            Err(e) => warn!(
+                %info_hash,
+                file_idx,
+                "could not select the file being played; its stream window still fetches it: {e:#}"
+            ),
+        }
+        file_idx
+    }
+
     /// Length and name of one file inside a running torrent, read straight
     /// off its metadata.
     ///
@@ -1353,7 +1493,7 @@ impl TorrentEngine {
     /// it is an optimisation, and nothing downstream may wait on it.
     ///
     /// The cost when it guesses wrong (the file was faststart after all) is one
-    /// piece of bandwidth, once.
+    /// or two pieces of bandwidth, once. See `TAIL_WARM_BYTES` for which bytes.
     pub fn warm_mp4_tail(
         self: &Arc<Self>,
         info_hash: &str,
@@ -1391,13 +1531,13 @@ impl TorrentEngine {
                 debug!(%info_hash, "could not open a tail read to warm the mp4 index");
                 return;
             };
-            let mut sink = [0u8; 16 * 1024];
-            let warmed = tokio::time::timeout(TAIL_WARM_TIMEOUT, async {
-                use tokio::io::AsyncReadExt;
-                // One read is enough: it returns only once the piece holding
-                // the tail has arrived, which is the entire point.
-                reader.read(&mut sink).await
-            })
+            // Read to the end, not just once. A single read returns as soon as
+            // the first of the tail's pieces arrives, and closing the read
+            // then would take the last piece back out of the priority set.
+            let warmed = tokio::time::timeout(
+                TAIL_WARM_TIMEOUT,
+                tokio::io::copy(&mut reader, &mut tokio::io::sink()),
+            )
             .await;
             match warmed {
                 Ok(Ok(n)) if n > 0 => {
@@ -1536,6 +1676,15 @@ impl TorrentEngine {
         file_idx: usize,
         pos: u64,
     ) -> Result<BoxedReader> {
+        // Taken before the stream is opened: librqbit's own open waits on a
+        // permit with no timeout, and the slot cap is what guarantees one is
+        // free. Refused at once rather than queued. A queued seek would wait
+        // on the read it is replacing, and the player closes that read only
+        // once this one answers.
+        let slot = Arc::clone(&self.read_slots)
+            .try_acquire_owned()
+            .map_err(|_| anyhow::Error::new(TooManyOpenReads))?;
+
         let mut stream = self
             .api
             .api_stream(parse_idx(info_hash)?, file_idx)
@@ -1549,7 +1698,10 @@ impl TorrentEngine {
                 .with_context(|| format!("seeking to byte {pos}"))?;
         }
 
-        Ok(Box::new(stream))
+        Ok(Box::new(SlottedRead {
+            read: stream,
+            _slot: slot,
+        }))
     }
 
     /// Prepares the torrents behind a title's stream list while the viewer is
@@ -1966,15 +2118,21 @@ mod tests {
     }
 
     /// The cold-start budget at the top of this file, checked rather than
-    /// only written down: with the default pre-buffer timeout, a start that
-    /// uses every one of its allowances still answers before the router's
-    /// timeout turns it into a 504.
+    /// only written down: a start that uses every one of its fixed allowances
+    /// still leaves the pre-buffer real time before the headers deadline, and
+    /// that deadline answers before the router's timeout turns it into a 504.
     #[test]
     fn a_worst_case_cold_start_fits_inside_the_request_timeout() {
+        let fixed = ADD_TORRENT_TIMEOUT + INITIALIZE_TIMEOUT;
+        assert!(crate::VIDEO_HEADERS_DEADLINE < crate::REQUEST_TIMEOUT);
+        assert!(
+            crate::VIDEO_HEADERS_DEADLINE.saturating_sub(fixed) >= Duration::from_secs(10),
+            "a maxed-out cold start must still leave the pre-buffer time to get a piece"
+        );
         let tuning = StreamTuning::from_config(&AppConfig::defaults());
         assert!(
-            ADD_TORRENT_TIMEOUT + INITIALIZE_TIMEOUT + tuning.prebuffer_timeout
-                < crate::REQUEST_TIMEOUT
+            tuning.prebuffer_timeout <= crate::VIDEO_HEADERS_DEADLINE,
+            "a cap past the deadline would be dead configuration"
         );
     }
 

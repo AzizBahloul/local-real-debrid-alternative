@@ -21,7 +21,7 @@ use crate::http::HttpWorker;
 use crate::job::{Confirm, Job};
 use crate::server_process::{find_server_binary, LogTail, ServerProcess};
 use crate::theme::{AMBER, PHOSPHOR, TEXT_DIM};
-use crate::{fx, service, widgets};
+use crate::{addon_address, fx, service, widgets};
 
 /// The gateway's own `--port` default. Pinned against the server's config by
 /// `the_default_port_is_the_one_the_server_uses`: a window polling a port the
@@ -356,6 +356,16 @@ pub struct GatewayApp {
     /// a tray icon behind.
     quitting: bool,
     chrome: Chrome,
+
+    // The addon address, against the one installed addons were given. See
+    // `addon_address`.
+    /// The address remembered from an earlier run.
+    addon_remembered: Option<String>,
+    /// The address the log last showed, once it has been compared.
+    addon_checked: Option<String>,
+    /// Set while the shown address differs from the remembered one: the old
+    /// address, which the addon installed in Stremio still uses.
+    addon_moved_from: Option<String>,
 }
 
 impl Default for GatewayApp {
@@ -409,6 +419,10 @@ impl Default for GatewayApp {
                 glitch_until: 0.0,
                 copied: None,
             },
+            // One small file read, like `read_settings` above.
+            addon_remembered: addon_address::load(),
+            addon_checked: None,
+            addon_moved_from: None,
         }
     }
 }

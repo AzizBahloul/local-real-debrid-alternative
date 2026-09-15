@@ -282,13 +282,15 @@ pub struct AppConfig {
 
     /// Cap on how long that pre-buffer wait may take. On timeout the response
     /// is sent with whatever arrived, so a slow torrent still plays rather
-    /// than hanging forever.
+    /// than hanging forever; if nothing arrived, the player gets a 503.
     ///
-    /// Kept small enough that metadata fetch + initialization + this stays
-    /// under the router's 60s request timeout -- see the cold-start budget in
-    /// the `torrent` module.
+    /// The wait also stops at `VIDEO_HEADERS_DEADLINE` (55 s after the request
+    /// arrived), so after a cold start it only gets what that start left over.
+    /// A larger value never pushes a response past the router's timeout. It
+    /// was 15 s, which ended playback in Stremio's desktop player whenever the
+    /// swarm took longer: see `streaming::prebuffer_patience`.
     #[arg(help_heading = "Streaming")]
-    #[arg(long, env = "PREBUFFER_TIMEOUT_SECS", default_value_t = 15)]
+    #[arg(long, env = "PREBUFFER_TIMEOUT_SECS", default_value_t = 45)]
     pub prebuffer_timeout_secs: u64,
 
     /// How long a video response may produce no bytes at all before the

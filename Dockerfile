@@ -25,6 +25,8 @@ WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY crates/gateway/Cargo.toml crates/gateway/Cargo.toml
 COPY crates/gateway-gui/Cargo.toml crates/gateway-gui/Cargo.toml
+# The patched librqbit the root manifest points at (vendor/librqbit/VENDORED.md).
+COPY vendor ./vendor
 
 # Cache dependency compilation separately from source changes.
 RUN mkdir -p crates/gateway/src crates/gateway-gui/src \

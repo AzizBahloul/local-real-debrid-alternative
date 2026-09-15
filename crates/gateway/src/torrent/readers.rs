@@ -4,14 +4,90 @@
 
 use std::collections::HashMap;
 use std::net::IpAddr;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
-use tokio::sync::Semaphore;
+use tokio::io::{AsyncRead, ReadBuf};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use super::TorrentEngine;
 use crate::util::lock;
+
+/// The most torrent reads the gateway holds open at once, across every
+/// torrent and every client.
+///
+/// This bound exists because of a librqbit detail that fails very badly:
+/// every open `FileStream` holds one permit of the session's blocking
+/// semaphore for as long as it exists. Writing each downloaded piece to disk,
+/// and reading each chunk it uploads, needs a permit from that same
+/// semaphore. librqbit's default is 8 permits. So once 8 reads are open,
+/// nothing can be written, no piece completes, and no read ever returns.
+/// Every title freezes at once, and any new read waits forever for a permit.
+///
+/// Reproduced 2026-09-15: 12 readers of one title, from 12 addresses, froze
+/// its download at 3 MB and 0 MiB/s for 40 s. It recovered only when curl
+/// timeouts closed some of the readers. A household does not need 12 readers
+/// to get there: each player holds its playback read, an index probe and the
+/// read it is seeking away from, plus the tail warmer, so two devices can
+/// already reach 8.
+///
+/// The session is given `SESSION_BLOCKING_PERMITS`, and the gateway never
+/// opens more reads than this, so disk writes always keep permits of their
+/// own. A read past the cap is refused as retryable, which leaves the
+/// session running.
+pub(super) const MAX_OPEN_READS: usize = 64;
+
+/// Permits left for librqbit's own disk writes and uploads. This is its
+/// default pool size, which is what it was tuned with.
+const DISK_IO_PERMITS: usize = 8;
+
+/// The size of librqbit's blocking semaphore. It is set through
+/// `SessionOptions::runtime_worker_threads`, which despite its name sizes only
+/// that semaphore (librqbit 9.0.1).
+///
+/// Tokio's default blocking-thread limit is 512, so this many concurrent
+/// `block_in_place` calls still fit.
+pub(super) const SESSION_BLOCKING_PERMITS: usize = MAX_OPEN_READS + DISK_IO_PERMITS;
+const _: () = assert!(
+    SESSION_BLOCKING_PERMITS <= 512,
+    "each permit can become a block_in_place thread, and tokio stops at 512"
+);
+
+/// A read was refused because `MAX_OPEN_READS` are already open.
+#[derive(Debug)]
+pub struct TooManyOpenReads;
+
+impl std::fmt::Display for TooManyOpenReads {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{MAX_OPEN_READS} torrent reads are already open; refusing another \
+             so the downloads they are waiting on can keep writing"
+        )
+    }
+}
+
+impl std::error::Error for TooManyOpenReads {}
+
+/// A torrent read that holds one of the gateway's read slots for as long as it
+/// exists. See `MAX_OPEN_READS`.
+pub(super) struct SlottedRead<R> {
+    pub(super) read: R,
+    pub(super) _slot: OwnedSemaphorePermit,
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for SlottedRead<R> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.read).poll_read(cx, buf)
+    }
+}
 
 /// librqbit's per-stream look-ahead window, from
 /// `torrent_state::streaming::PER_STREAM_BUF_DEFAULT`.
@@ -21,10 +97,21 @@ use crate::util::lock;
 /// this is to hold a second read positioned there.
 pub(super) const LIBRQBIT_STREAM_WINDOW: u64 = 32 * 1024 * 1024;
 
-/// How much of an mp4's tail the warmer pulls. One piece is enough to make
-/// the range request the player is about to issue land on data already here;
-/// this is comfortably over the largest piece size in practice.
-pub(super) const TAIL_WARM_BYTES: u64 = 24 * 1024 * 1024;
+/// How much of a file's tail the warmer pulls: the last 64 KB, read to the
+/// end of the file.
+///
+/// These are the bytes every tail read touches. mpv reads the last few KB of
+/// an mkv before it plays. Stremio's server reads the last 64 KB, from the
+/// same address, to hash the file for subtitle matching. An mp4's `moov` ends
+/// at the end of the file. That is one piece, or two when the last piece is
+/// shorter than 64 KB.
+///
+/// This used to be 24 MB, read once. That fetched the single piece 24 MB
+/// before the end, and nobody reads that piece first. Measured 2026-09-15 on
+/// a cold Stremio start of a 1.18 GB mkv: both tail reads then waited 2.9 s
+/// for the last piece. They queued behind the head read's requests, which
+/// librqbit pipelines 2 MB deep per peer.
+pub(super) const TAIL_WARM_BYTES: u64 = 64 * 1024;
 
 /// How long the tail warmer waits for those bytes before giving up. Generous
 /// because it costs nothing to wait -- it is a background read nobody is
@@ -171,9 +258,10 @@ pub(super) struct ReaderSlot {
     /// same title cannot cancel the first device's cold start (and be
     /// cancelled in turn by its retry, forever).
     pub(super) client: IpAddr,
-    /// An index/tail probe. Exempt, because it is a second read the same
-    /// player genuinely needs at the same time, not a superseded seek.
-    pub(super) tail_probe: bool,
+    /// An index probe, or any other range with an end short of the file's.
+    /// Exempt, because the same client runs these alongside its playback
+    /// read, not instead of it. See `register_reader`.
+    pub(super) side_read: bool,
     pub(super) served: Arc<AtomicU64>,
     pub(super) cancel: Arc<ReaderCancel>,
 }
@@ -188,7 +276,7 @@ impl ReaderSlot {
         self.info_hash == info_hash
             && self.file_idx == file_idx
             && self.client == client
-            && !self.tail_probe
+            && !self.side_read
             && self.served.load(Ordering::Relaxed) == 0
     }
 }
@@ -264,13 +352,13 @@ pub struct PieceGeometry {
 mod tests {
     use super::*;
 
-    fn slot(client: &str, served: u64, tail_probe: bool) -> ReaderSlot {
+    fn slot(client: &str, served: u64, side_read: bool) -> ReaderSlot {
         ReaderSlot {
             id: 0,
             info_hash: "aaaa".to_string(),
             file_idx: 0,
             client: client.parse().unwrap(),
-            tail_probe,
+            side_read,
             served: Arc::new(AtomicU64::new(served)),
             cancel: Arc::new(ReaderCancel::new()),
         }
@@ -310,6 +398,15 @@ mod tests {
     #[test]
     fn an_index_probe_survives_the_playback_request_that_follows_it() {
         assert!(!slot("192.168.1.5", 0, true).superseded_by("aaaa", 0, ip("192.168.1.5")));
+    }
+
+    /// Stremio's server hashes the first and last 64 KB of the file from the
+    /// player's own address while the player starts. If a seek cancelled that
+    /// read, subtitle matching would fail for no reason.
+    #[test]
+    fn a_bounded_read_survives_the_playback_request_that_follows_it() {
+        let hash_read = slot("192.168.1.128", 0, true);
+        assert!(!hash_read.superseded_by("aaaa", 0, ip("192.168.1.128")));
     }
 
     /// One player legitimately reads two files of a multi-file torrent (an
@@ -402,5 +499,26 @@ mod tests {
             "one torrent's reader must not release another's"
         );
         assert_eq!(counts.torrents_open(), 1);
+    }
+
+    /// The slot has to go when the read does. If it leaked, the cap would
+    /// fill up over a day of seeking and then refuse every read.
+    #[tokio::test]
+    async fn a_read_gives_its_slot_back_when_dropped() {
+        use tokio::io::AsyncReadExt;
+
+        let slots = Arc::new(Semaphore::new(1));
+        let mut read = SlottedRead {
+            read: &b"abc"[..],
+            _slot: Arc::clone(&slots).try_acquire_owned().unwrap(),
+        };
+        assert!(Arc::clone(&slots).try_acquire_owned().is_err());
+
+        let mut out = String::new();
+        read.read_to_string(&mut out).await.unwrap();
+        assert_eq!(out, "abc");
+
+        drop(read);
+        assert!(Arc::clone(&slots).try_acquire_owned().is_ok());
     }
 }

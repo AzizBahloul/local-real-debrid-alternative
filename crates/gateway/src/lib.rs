@@ -75,6 +75,16 @@ impl FromRef<AppState> for Arc<TorrentEngine> {
 /// off by this. The torrent engine's cold-start budget is measured against it.
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// When a video response must have its headers out, counted from the moment
+/// the request arrived.
+///
+/// Five seconds inside `REQUEST_TIMEOUT`, which is also libmpv's default
+/// `network-timeout`, and libmpv is the player inside Stremio's desktop apps.
+/// Everything a video request waits on (a cold start, then the pre-buffer)
+/// is fitted under it, so a slow start answers late rather than as a 504, and
+/// before mpv stops listening.
+pub const VIDEO_HEADERS_DEADLINE: Duration = Duration::from_secs(55);
+
 /// The liveness endpoint, named because `audit_requests` has to recognise it.
 const HEALTH_PATH: &str = "/health";
 
@@ -334,7 +344,7 @@ fn open_audit_log(config: &AppConfig) -> audit::AuditLog {
 }
 
 /// The timers that keep the session in shape: the cache janitor, the download
-/// queue, and (unless turned off) the idle reaper.
+/// queue, the swarm watch, and (unless turned off) the idle reaper.
 fn spawn_maintenance(config: &AppConfig, engine: &Arc<TorrentEngine>, cache: &Arc<CacheManager>) {
     cache.spawn_janitor(Duration::from_secs(config.cleanup_interval_secs));
 
@@ -346,6 +356,10 @@ fn spawn_maintenance(config: &AppConfig, engine: &Arc<TorrentEngine>, cache: &Ar
         max_active_downloads = config.max_active_downloads,
         "downloading titles in request order, this many at a time"
     );
+
+    // Unconditional too: after the network drops, librqbit on its own leaves a
+    // torrent without peers for minutes after the line is back.
+    engine.spawn_swarm_watch();
 
     if config.idle_pause_secs > 0 {
         engine.spawn_idle_reaper(
