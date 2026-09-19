@@ -16,10 +16,26 @@ use crate::torrent::{BoxedReader, ReaderCancel, ReaderTicket, StreamGuard, Torre
 /// Size of each chunk handed to the HTTP layer while streaming.
 pub const STREAM_CHUNK_BYTES: usize = 64 * 1024;
 
-/// How many times in a row a stalled stream may be re-opened before the body
-/// gives up. Past this the swarm is genuinely dead, and ending the response
-/// lets the player surface a real error instead of spinning forever.
-const MAX_CONSECUTIVE_REOPENS: u32 = 5;
+/// How long a stream may keep re-opening a stalled read before the body gives
+/// up entirely. Past this the swarm is treated as genuinely dead, and ending
+/// the response lets the player surface a real error instead of spinning
+/// forever.
+///
+/// This has to outlast `torrent::swarm`'s own recovery, not race it: a real
+/// outage (router reboot, Wi-Fi drop, an ISP blink) can leave a torrent
+/// silent for minutes even with that module's pause-and-restart fix, because
+/// the fix shortens how long peers take to reconnect *once the line is back*,
+/// not how long the line itself is down -- `torrent::swarm` measured 475s of
+/// silence surviving a 200s outage. A fixed attempt count tuned against a
+/// healthy swarm's occasional hiccup does not track that: at the old 5
+/// attempts / `stall_timeout` (20s) each, this loop gave up around 100-120s
+/// in, well before `torrent::swarm`'s own escalating schedule (revives at
+/// roughly 20s, 50s, 110s, 230s, ...) had a real chance to rebuild the peer
+/// table -- so the response ended and the viewer's only way back in was
+/// closing and reopening the video, which starts a fresh request and so a
+/// fresh `revive_if_silent` fast path. Five minutes covers that measured case
+/// with room to spare while still ending a torrent that is truly gone.
+const MAX_STALL_RECOVERY: Duration = Duration::from_secs(300);
 
 /// How often a long-running response refreshes its "still being watched"
 /// timestamp, so the cache janitor's own grace period stays accurate during
@@ -100,6 +116,10 @@ pub fn healing_body(ctx: BodyContext) -> Body {
             file_len,
         );
         let mut stalls = 0u32;
+        // When the current stall streak began, so give-up is judged against
+        // wall-clock time rather than a raw attempt count. See
+        // `MAX_STALL_RECOVERY`.
+        let mut stalled_since: Option<Instant> = None;
         let mut last_touch = Instant::now();
 
         // Records how this response ended, whatever ends it.
@@ -177,6 +197,7 @@ pub fn healing_body(ctx: BodyContext) -> Body {
                     ticket.record_served(n as u64);
                     live_position.store(position, Ordering::Relaxed);
                     stalls = 0;
+                    stalled_since = None;
                     if last_touch.elapsed() >= TOUCH_INTERVAL {
                         engine.touch_stream(&info_hash, client);
                         last_touch = Instant::now();
@@ -185,11 +206,13 @@ pub fn healing_body(ctx: BodyContext) -> Body {
                 }
                 None => {
                     stalls += 1;
-                    if stalls > MAX_CONSECUTIVE_REOPENS {
+                    let since = *stalled_since.get_or_insert(Instant::now());
+                    if since.elapsed() >= MAX_STALL_RECOVERY {
                         warn!(
-                            %info_hash, position,
-                            "stream stalled and did not recover after {MAX_CONSECUTIVE_REOPENS} \
-                             re-opens; ending the response so the player can retry"
+                            %info_hash, position, attempts = stalls,
+                            "stream stalled and did not recover within {}s; ending the \
+                             response so the player can retry",
+                            MAX_STALL_RECOVERY.as_secs()
                         );
                         closer.reason = "stalled, gave up re-opening";
                         break;

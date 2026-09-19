@@ -664,7 +664,7 @@ reasoning behind every one of them, with measurements, is in
 | `READAHEAD_SETTLE_SECS` | `10` | Seconds of uninterrupted playback before that extra buffer is claimed |
 | `MP4_TAIL_WARM` | `true` | Fetch the end of the file alongside the beginning. Many players read the tail before they will play anything, and doing it in sequence costs a whole second start — this was **12.2 s of one measured 20 s start** |
 | `SEEK_SUPERSEDE` | `true` | When you skip again before the last skip finished, drop the abandoned one instead of letting it compete |
-| `COLD_START_PEER_LIMIT` | `0` (off) | Raise the peer cap for a movie as it starts. Only helps if you are actually hitting `MAX_PEERS_PER_TORRENT`; check `/health` before bothering |
+| `COLD_START_PEER_LIMIT` | `100` | Peer cap for a movie as it starts, overriding `MAX_PEERS_PER_TORRENT` for that torrent's whole life (librqbit cannot lower it again after the add). Raised from `0` after a cold torrent sat at 12-14 peers and delivered nothing inside the pre-buffer timeout — Stremio got an empty response and the first play failed outright |
 
 Set them like this:
 

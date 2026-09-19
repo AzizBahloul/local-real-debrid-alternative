@@ -403,11 +403,20 @@ pub struct AppConfig {
     /// default. The two cannot be fully reconciled here: librqbit reads
     /// `peer_limit` when the torrent is added and there is no way to lower it
     /// afterwards, so a raised limit lasts that torrent's whole life rather
-    /// than the first thirty seconds. Off by default for exactly that reason
-    /// -- try 100 and measure whether it moves anything on your link before
-    /// leaving it on.
+    /// than the first thirty seconds.
+    ///
+    /// Raised from 0 (off) after a first play was watched fail outright:
+    /// `PREBUFFER_TIMEOUT_SECS` (45) elapsed with 0 bytes delivered while the
+    /// torrent sat at only 12-14 connected peers, so Stremio got an empty
+    /// response and never started -- measured 2026-09-19, the swarm did not
+    /// cross 25 peers and real throughput until well after the pre-buffer had
+    /// already given up. 100 gives a fresh torrent more simultaneous connect
+    /// attempts to find the handful of peers that actually answer inside that
+    /// window, at the cost of every torrent this gateway ever adds keeping a
+    /// 100-peer ceiling for its whole life instead of settling to
+    /// `MAX_PEERS_PER_TORRENT`'s 60. Re-measure before raising it further.
     #[arg(help_heading = "Torrent engine")]
-    #[arg(long, env = "COLD_START_PEER_LIMIT", default_value_t = 0)]
+    #[arg(long, env = "COLD_START_PEER_LIMIT", default_value_t = 100)]
     pub cold_start_peer_limit: usize,
 
     /// Disable the https listener.
@@ -567,10 +576,20 @@ mod tests {
     fn speculative_levers_stay_off_by_default() {
         let config = defaults();
         assert_eq!(config.readahead_extra_mb, 0);
+    }
+
+    /// A raised cold-start peer cap sticks for a torrent's whole life --
+    /// librqbit cannot lower `peer_limit` again after the add -- so this pins
+    /// the shipped value rather than letting a "looks more conservative"
+    /// default drift back to 0 and reintroduce the failed-first-play bug the
+    /// field docs measure.
+    #[test]
+    fn cold_start_peer_limit_stays_raised_by_default() {
         assert_eq!(
-            config.cold_start_peer_limit, 0,
-            "librqbit cannot lower a peer limit again after the add, so raising \
-             it is a whole-session decision and must be taken deliberately"
+            defaults().cold_start_peer_limit,
+            100,
+            "0 brought back a first play failing outright: a cold torrent sat at \
+             12-14 peers and delivered nothing inside the pre-buffer timeout"
         );
     }
 

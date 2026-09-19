@@ -374,7 +374,7 @@ seconds and the bytes needed in two minutes. On a swarm comfortably outrunning
 playback that is free insurance against a stall; on one that is barely keeping
 up it is actively harmful. Measure before turning it on.
 
-### 4.6 Raise the peer cap for cold start — **implemented, off by default**
+### 4.6 Raise the peer cap for cold start — **implemented, on by default**
 
 `COLD_START_PEER_LIMIT` sets a per-torrent `peer_limit` at add time, overriding
 the session-wide `MAX_PEERS_PER_TORRENT=60`.
@@ -384,8 +384,15 @@ librqbit 9**: `peer_limit` is read once, when the torrent is added, and stored
 in an immutable `ManagedTorrentShared`. There is no way to walk it back down
 once the stream is flowing. So a raised limit lasts that torrent's whole life,
 which is exactly the steady-state NAT-churn cost the low default exists to
-avoid — hence off by default. Try `100` and measure whether it moves anything on
-your link before leaving it on.
+avoid.
+
+Shipped at `100` anyway, measured 2026-09-19: a cold torrent sat at 12-14
+connected peers and delivered **0 bytes** inside `PREBUFFER_TIMEOUT_SECS`,
+so the very first play attempt got an empty response and never started —
+the swarm did not reach real throughput (25 peers, several MiB/s) until
+well after the pre-buffer had already given up. That failure mode is worse
+than the steady-state NAT-churn cost, so the trade now goes the other way
+by default. Re-measure on your own link before raising it past `100`.
 
 ---
 
@@ -424,6 +431,7 @@ MAX_CACHE_SIZE_GB=100          # don't evict what you might seek back into
 # --- reachability ---
 PEER_PORT=6881                 # forward this TCP port on the router if UPnP is off
 DISABLE_UPNP=false
+COLD_START_PEER_LIMIT=100      # lasts the torrent's whole life, not 30s (§4.6)
 
 # --- wifi: stop seeding stealing the radio (set 0 on ethernet) ---
 MAX_UPLOAD_MB_S=2
@@ -439,7 +447,6 @@ measured on:
 ```bash
 READAHEAD_EXTRA_MB=0           # >0 splits piece priority rather than adding it (§4.5)
 READAHEAD_SETTLE_SECS=10       # only matters when the above is non-zero
-COLD_START_PEER_LIMIT=0        # >0 lasts the torrent's whole life, not 30s (§4.6)
 BROWSE_PREFETCH_COUNT=0        # made real playback worse three ways (§3.9)
 ```
 
