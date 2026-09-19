@@ -1492,8 +1492,10 @@ impl TorrentEngine {
     /// fetched together. Runs once per file, detached, and gives up quietly:
     /// it is an optimisation, and nothing downstream may wait on it.
     ///
-    /// The cost when it guesses wrong (the file was faststart after all) is one
-    /// or two pieces of bandwidth, once. See `TAIL_WARM_BYTES` for which bytes.
+    /// The cost when it guesses wrong (the file was faststart after all, or
+    /// the real index sits outside this window) is a handful of pieces of
+    /// bandwidth, once. See `TAIL_WARM_BYTES` for which bytes and why that is
+    /// a range rather than a single confident guess.
     pub fn warm_mp4_tail(
         self: &Arc<Self>,
         info_hash: &str,

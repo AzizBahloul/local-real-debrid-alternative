@@ -97,21 +97,31 @@ impl<R: AsyncRead + Unpin> AsyncRead for SlottedRead<R> {
 /// this is to hold a second read positioned there.
 pub(super) const LIBRQBIT_STREAM_WINDOW: u64 = 32 * 1024 * 1024;
 
-/// How much of a file's tail the warmer pulls: the last 64 KB, read to the
-/// end of the file.
+/// How much of a file's tail the warmer pulls, read to the end of the file.
 ///
-/// These are the bytes every tail read touches. mpv reads the last few KB of
-/// an mkv before it plays. Stremio's server reads the last 64 KB, from the
-/// same address, to hash the file for subtitle matching. An mp4's `moov` ends
-/// at the end of the file. That is one piece, or two when the last piece is
-/// shorter than 64 KB.
+/// mpv reads the last few KB of an mkv before it plays. Stremio's server
+/// reads the last 64 KB, from the same address, to hash the file for
+/// subtitle matching. An mp4's `moov` ends at the end of the file. Those are
+/// fixed-size, fixed-offset reads, and 64 KB used to be enough for all of
+/// them.
 ///
-/// This used to be 24 MB, read once. That fetched the single piece 24 MB
-/// before the end, and nobody reads that piece first. Measured 2026-09-15 on
-/// a cold Stremio start of a 1.18 GB mkv: both tail reads then waited 2.9 s
-/// for the last piece. They queued behind the head read's requests, which
-/// librqbit pipelines 2 MB deep per peer.
-pub(super) const TAIL_WARM_BYTES: u64 = 64 * 1024;
+/// It was 24 MB once, read as a single piece, and that was reverted: measured
+/// 2026-09-15, the single piece 24 MB before the end was one nobody actually
+/// read, so the wait for it was pure waste. 64 KB replaced it on the strength
+/// of that measurement.
+///
+/// Raised again, measured 2026-09-19: a player's own read for an mkv's Cues
+/// element landed at `bytes=593624204-` in a 595591168-byte file -- about
+/// **1.9 MB** before the end, well outside the 64 KB window -- and cold-
+/// started against a piece the sequential download hadn't reached yet, 35 s
+/// with the torrent otherwise healthy (peers connected, several MiB/s
+/// elsewhere in the file). Unlike the fixed-offset hash reads, a muxer's Cues
+/// placement scales with the file's keyframe count and is not at a fixed
+/// distance from the end, so no single constant here is *correct* -- this is
+/// a wider net, not a precise one. The complete fix is parsing the container
+/// to find the real offset (an EBML `SeekHead` for Matroska); this remains a
+/// guess, just one measured to be wrong less often.
+pub(super) const TAIL_WARM_BYTES: u64 = 4 * 1024 * 1024;
 
 /// How long the tail warmer waits for those bytes before giving up. Generous
 /// because it costs nothing to wait -- it is a background read nobody is
