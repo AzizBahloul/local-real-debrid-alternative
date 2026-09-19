@@ -20,7 +20,18 @@ use crate::torrent::{BoxedReader, ReaderCancel};
 /// worth more than ten seconds of staring at a spinner, for no benefit -- a
 /// player needs enough bytes to start parsing the container, not half a
 /// megabyte of it.
-pub const PREBUFFER_MIN_BYTES: usize = 128 * 1024;
+///
+/// Lowered again from 128 KB, measured 2026-09-19: on a cold torrent that
+/// only reached real throughput after tens of seconds, `recent_starts` showed
+/// a `prebuffer` phase that spent the overwhelming majority of a ~50s total
+/// wait blocked in this exact phase reaching (what was then) 128 KB, even
+/// with `COLD_START_PEER_LIMIT` already getting peers connected. This is a
+/// pure latency knob with no floor for correctness below it -- only
+/// `PREBUFFER_FLOOR_BYTES` guards against a response that looks broken --
+/// so there is no reason for it to be any bigger than "enough to start
+/// parsing a container," and a slow swarm pays for every extra byte here in
+/// wall-clock seconds, not milliseconds.
+pub const PREBUFFER_MIN_BYTES: usize = 32 * 1024;
 
 /// Never block for less than this, whatever the piece arithmetic says.
 ///
@@ -28,7 +39,11 @@ pub const PREBUFFER_MIN_BYTES: usize = 128 * 1024;
 /// reintroduces the bug the pre-buffer exists to prevent: a response with
 /// headers and almost no body reads to a player as a broken stream, not a slow
 /// one. Small enough to cost nothing, large enough to be a body.
-const PREBUFFER_FLOOR_BYTES: usize = 64 * 1024;
+///
+/// Kept below `PREBUFFER_MIN_BYTES` on purpose -- above it, `piece_aware_floor`
+/// could never return anything smaller than this floor at all, silently
+/// undoing the point of lowering the min in the first place.
+const PREBUFFER_FLOOR_BYTES: usize = 16 * 1024;
 
 /// How long "is more data already available?" is allowed to take before the
 /// pre-buffer stops topping up and sends what it has.
@@ -365,9 +380,10 @@ mod tests {
             PREBUFFER_MIN_BYTES
         );
 
-        // Landing 100 KB before a boundary: block for the 100 KB rather than
-        // the usual 128 KB, and a second piece is never involved.
-        assert_eq!(piece_aware_floor(100 * 1024, 1024 * 1024), 100 * 1024);
+        // Landing 20 KB before a boundary: block for the 20 KB rather than
+        // the usual `PREBUFFER_MIN_BYTES`, and a second piece is never
+        // involved.
+        assert_eq!(piece_aware_floor(20 * 1024, 1024 * 1024), 20 * 1024);
 
         // Landing almost exactly on a boundary. Crossing it is unavoidable
         // here, and returning a near-empty body is the worse failure -- so the

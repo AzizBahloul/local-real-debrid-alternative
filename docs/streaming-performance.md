@@ -116,7 +116,7 @@ It is the single most expensive thing you can do to a torrent:
 3. It re-points the piece-priority set
    ([`open_stream_at`, torrent/mod.rs:1195-1228](../crates/gateway/src/torrent/mod.rs#L1195-L1228))
    and re-runs peer discovery for the new region.
-4. Each skip pays a **fresh pre-buffer wait** (up to 15 s, min 128 KB) before
+4. Each skip pays a **fresh pre-buffer wait** (up to 15 s, min 32 KB) before
    the player sees a byte.
 
 Ten quick scrubs is ten cold starts, each cancelling the last one's work. The
@@ -157,7 +157,7 @@ PREBUFFER_BYTES=1048576        # 1 MB — now the default, was 4 MB
 ```
 
 This is a pure *latency* setting: the viewer waits for it before a single byte
-goes out. The blocking floor is `PREBUFFER_MIN_BYTES = 128 KB`, now further
+goes out. The blocking floor is `PREBUFFER_MIN_BYTES = 32 KB`, now further
 capped by the piece arithmetic in §4.2 — phase 1 of `prebuffer()` blocks for
 that much, then phase 2 only tops up with data that is *already* on disk, which
 is exactly what keeps a warm seek fast.
