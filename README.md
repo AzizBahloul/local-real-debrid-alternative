@@ -398,8 +398,8 @@ curl -s http://127.0.0.1:8080/health | grep -o '"version":"[^"]*"'
 
 # 📦 Release history
 
-<img alt="Latest" src="https://img.shields.io/badge/latest-v1.2.0-2ea043?style=for-the-badge">
-<img alt="Tests" src="https://img.shields.io/badge/tests-285_passing-2ea043?style=for-the-badge">
+<img alt="Latest" src="https://img.shields.io/badge/latest-v1.3.0-2ea043?style=for-the-badge">
+<img alt="Tests" src="https://img.shields.io/badge/tests-300_passing-2ea043?style=for-the-badge">
 <img alt="Clippy" src="https://img.shields.io/badge/clippy-clean-2ea043?style=for-the-badge">
 
 </div>
@@ -475,7 +475,42 @@ returned. Now it resumes within 15 s, and pressing play is enough.
 </tr>
 
 <tr>
-<td width="120" align="center"><h3>🟢<br>v1.2.0</h3><sub><b>current</b></sub></td>
+<td width="120" align="center"><h3>🟢<br>v1.3.0</h3><sub><b>current</b></sub></td>
+<td>
+
+### A new release's best copy is buried, or missing from the list
+
+**Symptom** — a film or episode that just dropped in 4K is on the indexer, but
+the list Stremio shows leads with an older 720p re-encode, or never shows the
+4K copy at all.
+
+**Cause** — the list was ordered by seeders alone, then cut to 15 rows. A fresh
+4K WEB-DL with 40 seeders sat under a 720p copy with 1,600, and the cut threw
+away the rest: on a new episode, 12 of 13 4K rows were dropped while Torrentio
+itself had listed them first. Stremio has no stream filters, so the order the
+addon sends *is* the filter.
+
+**Fix** — the list is now ordered by what will play best:
+
+1. a swarm of at least 10 seeders, so a thin swarm never outranks a healthy one;
+2. resolution, then a clean source (WEB-DL / BluRay) over WEBRip over HDTV;
+3. seeders, then the smaller file.
+
+Releases with fewer than 2 seeders and camera / telesync rips are hidden, and
+the same file listed twice takes one row. No single resolution fills more than
+half the list, so a title with dozens of 25 GB 4K copies still shows its 9 GB
+1080p ones. Three new settings narrow it further: `INDEXER_MIN_SEEDERS`,
+`INDEXER_MAX_RESOLUTION` (`1080` hides 4K) and `INDEXER_MAX_SIZE_GB`.
+
+Torrentio's own CDN caches each answer for an hour (and may serve a stale one
+for four more), so a release uploaded minutes ago can still be missing at the
+source. That is theirs, not the gateway's.
+
+</td>
+</tr>
+
+<tr>
+<td width="120" align="center"><h3>🔵<br>v1.2.0</h3></td>
 <td>
 
 ### The phone loads forever on a movie that is already downloaded
@@ -649,6 +684,9 @@ Everything has a sensible default. Change these only if you need to:
 | `MAX_UPLOAD_MB_S` | `2` | Cap upload/seeding speed |
 | `INDEXER_URL` | Torrentio | Where movies are searched for |
 | `DISABLE_INDEXER` | `false` | Turn off search entirely |
+| `INDEXER_MIN_SEEDERS` | `2` | Hide releases with fewer seeders than this. Above it, **quality** orders the list (resolution, then WEB-DL/BluRay over WEBRip over HDTV, then seeders); a swarm under 10 seeders is listed below every healthier one. Camera/telesync rips are always hidden |
+| `INDEXER_MAX_RESOLUTION` | `0` (off) | `1080` hides 4K rows. Stremio has no stream filters of its own, so this is the filter |
+| `INDEXER_MAX_SIZE_GB` | `0` (off) | Hide releases bigger than this |
 | `LOG_DIRECTORY` | — | Where the event log is written. Defaults to your XDG state directory |
 | `LOG_LEVEL` | `info` | Set to `debug` for troubleshooting |
 
@@ -1022,7 +1060,7 @@ setup.sh   Dockerfile
 ```bash
 cargo build --release              # both crates
 cargo build --profile release-fast # same opt-level, thin LTO: links in seconds, for iterating
-cargo test --release               # 285 tests
+cargo test --release               # 300 tests
 cargo clippy --release --all-targets -- -D warnings
 cargo deb -p streaming-gateway-gui                   # .deb package
 cargo generate-rpm -p crates/gateway-gui -o out.rpm  # .rpm package (build first)

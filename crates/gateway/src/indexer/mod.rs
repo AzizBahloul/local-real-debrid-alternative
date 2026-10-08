@@ -22,6 +22,9 @@ use serde::Deserialize;
 use crate::torrent::resolver::is_hex40;
 use crate::util::lock;
 
+mod rank;
+pub use rank::RankPrefs;
+
 /// A torrent the index thinks matches the requested title.
 #[derive(Debug, Clone, PartialEq)]
 pub struct IndexedTorrent {
@@ -149,6 +152,7 @@ pub struct TorrentioIndexer {
     client: reqwest::Client,
     base_url: String,
     max_results: usize,
+    ranking: RankPrefs,
 }
 
 impl TorrentioIndexer {
@@ -174,7 +178,14 @@ impl TorrentioIndexer {
             client,
             base_url: base_url.trim_end_matches('/').to_string(),
             max_results,
+            ranking: RankPrefs::default(),
         })
+    }
+
+    /// Which releases to hide and how to order the rest.
+    pub fn with_ranking(mut self, ranking: RankPrefs) -> Self {
+        self.ranking = ranking;
+        self
     }
 }
 
@@ -247,7 +258,7 @@ impl TorrentioIndexer {
             .await
             .context("indexer returned a body that is not the expected JSON shape")?;
 
-        let mut out: Vec<IndexedTorrent> = body
+        let out: Vec<IndexedTorrent> = body
             .streams
             .into_iter()
             .filter_map(|s| {
@@ -275,21 +286,12 @@ impl TorrentioIndexer {
             })
             .collect();
 
-        // Seeders are the single best predictor of whether a stream will
-        // actually start, so lead with them; size breaks ties downward
-        // (a 2 GB 1080p rip starts far sooner than a 50 GB remux).
-        out.sort_by(|a, b| {
-            b.seeders
-                .unwrap_or(0)
-                .cmp(&a.seeders.unwrap_or(0))
-                .then_with(|| {
-                    a.size_bytes
-                        .unwrap_or(u64::MAX)
-                        .cmp(&b.size_bytes.unwrap_or(u64::MAX))
-                })
-        });
-        out.truncate(self.max_results);
-        Ok(out)
+        // Rank before cutting, never after: cutting a seeders-ordered list
+        // is what used to drop every 4K row. See `rank` for the order.
+        Ok(rank::shortlist(
+            rank::rank(out, &self.ranking),
+            self.max_results,
+        ))
     }
 }
 

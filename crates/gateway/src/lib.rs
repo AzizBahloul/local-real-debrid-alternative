@@ -388,6 +388,13 @@ fn build_indexer(config: &AppConfig) -> Option<Arc<dyn indexer::StreamIndexer>> 
         Duration::from_secs(config.indexer_timeout_secs),
     ) {
         Ok(ix) => {
+            let ix = ix.with_ranking(indexer::RankPrefs {
+                min_seeders: config.indexer_min_seeders,
+                max_resolution: config.indexer_max_resolution,
+                max_size_bytes: config
+                    .indexer_max_size_gb
+                    .saturating_mul(1024 * 1024 * 1024),
+            });
             info!(url = %config.indexer_url, "torrent discovery enabled");
             Some(Arc::new(indexer::CachingIndexer::new(Arc::new(ix))))
         }

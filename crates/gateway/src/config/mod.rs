@@ -253,6 +253,24 @@ pub struct AppConfig {
     #[arg(long, env = "INDEXER_MAX_RESULTS", default_value_t = 15)]
     pub indexer_max_results: usize,
 
+    /// Hide releases the index reports with fewer seeders than this. Above
+    /// it, seeders no longer decide the order -- quality does -- so a fresh
+    /// 4K release with a small swarm is not buried under an old 720p one.
+    #[arg(help_heading = "Discovery")]
+    #[arg(long, env = "INDEXER_MIN_SEEDERS", default_value_t = 2)]
+    pub indexer_min_seeders: u32,
+
+    /// Hide releases above this vertical resolution (e.g. 1080 to skip 4K on
+    /// a phone). 0 shows everything, best first.
+    #[arg(help_heading = "Discovery")]
+    #[arg(long, env = "INDEXER_MAX_RESOLUTION", default_value_t = 0)]
+    pub indexer_max_resolution: u32,
+
+    /// Hide releases larger than this many GB. 0 shows everything.
+    #[arg(help_heading = "Discovery")]
+    #[arg(long, env = "INDEXER_MAX_SIZE_GB", default_value_t = 0)]
+    pub indexer_max_size_gb: u64,
+
     /// Timeout (seconds) for a single index query. Kept well under the
     /// player's own patience so a slow index degrades to "no results"
     /// rather than a spinner that never resolves.
@@ -649,6 +667,11 @@ mod tests {
     fn defaults_are_usable_without_any_configuration() {
         let config = defaults();
         assert!(!config.disable_indexer, "search is on out of the box");
+        assert_eq!(
+            (config.indexer_max_resolution, config.indexer_max_size_gb),
+            (0, 0),
+            "nothing is hidden for size or resolution unless asked"
+        );
         assert!(config.prebuffer_bytes > 0);
         // Stall recovery and idle pausing both stop working silently at 0, and
         // 0 is a legitimate value to set by hand -- so pin the shipped ones.
